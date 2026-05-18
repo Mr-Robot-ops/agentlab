@@ -13,16 +13,17 @@ class OllamaConfig(BaseModel):
     base_url: str = "http://localhost:11434"
     models: dict[str, str] = Field(
         default_factory=lambda: {
-            "planner": "llama3.1",
-            "implementer": "codellama",
-            "mr_agent": "llama3.1",
-            "review_quality": "llama3.1",
-            "review_security": "llama3.1",
+            "default": "qwen3.6:35b",
+            "planner": "qwen3.6:35b",
+            "implementer": "qwen3.6:35b",
+            "mr_agent": "qwen3.6:35b",
+            "review_quality": "qwen3.6:35b",
+            "review_security": "qwen3.6:35b",
         }
     )
 
     def model_for(self, agent_name: str) -> str:
-        return self.models.get(agent_name, self.models.get("default", "llama3.1"))
+        return self.models.get(agent_name, self.models.get("default", "qwen3.6:35b"))
 
 
 class AppConfig(BaseModel):
