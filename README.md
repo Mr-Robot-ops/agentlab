@@ -50,7 +50,7 @@ sudo apt install -y docker.io
 Windows PowerShell:
 
 ```powershell
-cd C:\Users\Fabi\IdeaProjects\agent\agentlab
+cd C:\Users\Fabi\IdeaProjects\agent
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install -e ".[dev]"
@@ -59,7 +59,7 @@ python -m pip install -e ".[dev]"
 Linux:
 
 ```bash
-cd /pfad/zu/agent/agentlab
+cd /pfad/zu/agent
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e ".[dev]"
