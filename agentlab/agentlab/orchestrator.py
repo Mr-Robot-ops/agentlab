@@ -1,0 +1,188 @@
+from __future__ import annotations
+
+import uuid
+from pathlib import Path
+
+from agentlab.agents.gatekeeper import Gatekeeper
+from agentlab.agents.implementer import ImplementationAgent
+from agentlab.agents.mr_agent import MergeRequestAgent
+from agentlab.agents.planner import PlanningAgent
+from agentlab.agents.review_quality import CodeQualityReviewAgent
+from agentlab.agents.review_security_architecture import SecurityArchitectureReviewAgent
+from agentlab.agents.rollback import RollbackRecoveryAgent
+from agentlab.agents.test_build_security import BuildSecurityTestAgent
+from agentlab.agents.test_functional import FunctionalTestAgent
+from agentlab.audit import AuditLogger
+from agentlab.config import AppConfig
+from agentlab.models import AgentTask, GateDecision, ImplementationReport, ReportStatus, TaskPlan
+from agentlab.policies.policy_engine import PolicyEngine
+from agentlab.policies.risk import assess_risk
+from agentlab.tools.docker_tool import DockerTool
+from agentlab.tools.file_tool import FileTool
+from agentlab.tools.git_tool import GitTool
+from agentlab.tools.gitlab_tool import GitLabTool
+from agentlab.tools.ollama_client import OllamaClient
+from agentlab.tools.test_tool import TestTool
+from agentlab.workspace import WorkspaceManager
+
+
+class Orchestrator:
+    def __init__(self, config: AppConfig, *, dry_run: bool = False, run_id: str | None = None) -> None:
+        self.config = config
+        self.dry_run = dry_run
+        self.run_id = run_id or uuid.uuid4().hex
+        self.run_dir = Path(config.workspace_root) / self.run_id
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.audit = AuditLogger(self.run_dir / config.audit_file, self.run_id)
+        with self.audit.span(agent="workspace", action="prepare"):
+            self.workspace_info = WorkspaceManager(config, self.audit).prepare()
+        self.ollama = OllamaClient(config.ollama, timeout_seconds=config.command_timeout_seconds)
+
+    def _tools(self) -> tuple[GitTool, FileTool, TestTool, DockerTool]:
+        repo = self.config.target_repo_path
+        git_tool = GitTool(
+            repo,
+            default_branch=self.config.default_branch,
+            timeout_seconds=self.config.command_timeout_seconds,
+            audit=self.audit,
+            dry_run=self.dry_run,
+        )
+        file_tool = FileTool(repo, self.config, dry_run=self.dry_run)
+        test_tool = TestTool(repo, self.config)
+        docker_tool = DockerTool(repo, self.config)
+        return git_tool, file_tool, test_tool, docker_tool
+
+    def plan(self) -> TaskPlan:
+        _, file_tool, _, _ = self._tools()
+        with self.audit.span(agent="planner", action="plan"):
+            return PlanningAgent(self.config, file_tool, self.ollama).plan()
+
+    def run_task(self, task: AgentTask) -> ImplementationReport:
+        git_tool, file_tool, _, _ = self._tools()
+        with self.audit.span(agent="implementer", action="implement", input_payload=task.model_dump(mode="json")):
+            return ImplementationAgent(self.config, git_tool, file_tool, self.ollama, dry_run=self.dry_run).implement(task)
+
+    def full_flow(self) -> dict[str, object]:
+        self.audit.emit(agent="orchestrator", action="full_flow", status="started")
+        try:
+            plan = self.plan()
+            approved_tasks = [task for task in plan.tasks if task.approved]
+            if not approved_tasks:
+                result = {
+                    "run_id": self.run_id,
+                    "status": "blocked",
+                    "reason": "no approved task available for implementation",
+                    "plan": plan.model_dump(mode="json"),
+                }
+                self.audit.emit(
+                    agent="orchestrator",
+                    action="full_flow",
+                    status="blocked",
+                    metadata={"reason": result["reason"]},
+                    output_payload=result,
+                )
+                return result
+            task = approved_tasks[0]
+            implementation = self.run_task(task)
+            if implementation.status != ReportStatus.PASSED:
+                result = {"run_id": self.run_id, "status": "failed", "implementation": implementation.model_dump(mode="json")}
+                self.audit.emit(
+                    agent="orchestrator",
+                    action="full_flow",
+                    status="failed",
+                    metadata={"reason": "implementation failed"},
+                    output_payload=result,
+                )
+                return result
+            mr_result: dict[str, object]
+            if self.config.push_agent_branches_enabled and not self.dry_run:
+                try:
+                    with self.audit.span(agent="mr_agent", action="create_or_update_mr"):
+                        mr = MergeRequestAgent(self.config, GitLabTool(self.config)).create_or_update(
+                            task=task,
+                            implementation=implementation,
+                        )
+                    mr_result = {"status": "created", "mr": mr.model_dump(mode="json")}
+                except Exception as exc:
+                    mr_result = {"status": "failed", "error": str(exc)}
+            else:
+                self.audit.emit(
+                    agent="mr_agent",
+                    action="create_or_update_mr",
+                    status="skipped",
+                    metadata={"reason": "push_agent_branches_enabled is false or dry-run is active"},
+                )
+                mr_result = {"status": "skipped", "reason": "push_agent_branches_enabled is false or dry-run is active"}
+            decision = self.review_and_gate(task)
+            result = {
+                "run_id": self.run_id,
+                "status": "passed" if decision.allowed else "blocked",
+                "implementation": implementation.model_dump(mode="json"),
+                "merge_request": mr_result,
+                "gate": decision.model_dump(mode="json"),
+            }
+            self.audit.emit(
+                agent="orchestrator",
+                action="full_flow",
+                status="succeeded" if decision.allowed else "blocked",
+                metadata={"gate_verdict": decision.verdict, "blockers": decision.blockers},
+                output_payload=result,
+            )
+            return result
+        except Exception as exc:
+            self.audit.emit(agent="orchestrator", action="full_flow", status="failed", error=str(exc))
+            raise
+
+    def review_and_gate(self, task: AgentTask, *, direct_main_push: bool = False) -> GateDecision:
+        git_tool, file_tool, test_tool, docker_tool = self._tools()
+        base_ref = self.config.default_branch
+        diff_text = git_tool.diff(base_ref)
+        diff_stats = git_tool.diff_stats(base_ref, self.config.protected_paths)
+        risk = assess_risk(task, diff_stats.changed_files, diff_text)
+        with self.audit.span(agent="functional_test", action="run_tests"):
+            functional = FunctionalTestAgent(file_tool, test_tool).run()
+        with self.audit.span(agent="build_security_test", action="run_build_and_security_checks"):
+            build_security = BuildSecurityTestAgent(
+                file_tool,
+                docker_tool,
+                test_tool,
+                docker_build_enabled=self.config.docker_build_enabled,
+                docker_compose_enabled=self.config.docker_compose_enabled,
+            ).run()
+        with self.audit.span(agent="review_quality", action="review_diff"):
+            quality_review = CodeQualityReviewAgent(self.config, self.ollama).review(diff_text)
+        with self.audit.span(agent="review_security_architecture", action="review_diff"):
+            security_review = SecurityArchitectureReviewAgent(self.config, self.ollama).review(diff_text)
+        rollback_plan = f"Revert the agent branch commit for task {task.id} or close the MR before merge."
+        gatekeeper = Gatekeeper(PolicyEngine(self.config))
+        with self.audit.span(agent="gatekeeper", action="decide"):
+            return gatekeeper.decide(
+                task=task,
+                risk=risk,
+                diff_stats=diff_stats,
+                functional_tests=functional,
+                build_security=build_security,
+                quality_review=quality_review,
+                security_review=security_review,
+                rollback_plan=rollback_plan,
+                direct_main_push=direct_main_push,
+            )
+
+    def review_existing_mr(self, mr_id: int) -> dict[str, object]:
+        gitlab_tool = GitLabTool(self.config)
+        mr = gitlab_tool.project.mergerequests.get(mr_id)
+        changes = mr.changes()
+        diff_text = "\n".join(change.get("diff", "") for change in changes.get("changes", []))
+        quality_review = CodeQualityReviewAgent(self.config, self.ollama).review(diff_text)
+        security_review = SecurityArchitectureReviewAgent(self.config, self.ollama).review(diff_text)
+        return {
+            "mr_id": mr_id,
+            "quality_review": quality_review.model_dump(mode="json"),
+            "security_review": security_review.model_dump(mode="json"),
+        }
+
+    def recover(self, *, ref: str | None = None, commit_sha: str | None = None) -> dict[str, object]:
+        git_tool, _, _, _ = self._tools()
+        gitlab_tool = GitLabTool(self.config)
+        report = RollbackRecoveryAgent(self.config, git_tool, gitlab_tool).recover(ref=ref, commit_sha=commit_sha)
+        return {"run_id": self.run_id, "recovery": report.model_dump(mode="json")}

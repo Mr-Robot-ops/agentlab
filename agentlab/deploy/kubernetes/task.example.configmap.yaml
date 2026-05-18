@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentlab-task
+  namespace: agentlab
+data:
+  task.json: |
+    {
+      "id": "example-task",
+      "title": "Example approved task",
+      "task_type": "docs",
+      "risk_level": "low",
+      "risk_score": 1,
+      "description": "Replace this task with a Planning Agent output before running.",
+      "acceptance_criteria": ["A small scoped change is proposed."],
+      "affected_files": ["README.md"],
+      "forbidden_actions": ["Do not change protected paths."],
+      "test_requirements": ["No tests required for docs-only task."],
+      "approved": true,
+      "metadata": {}
+    }

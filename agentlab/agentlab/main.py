@@ -1,0 +1,115 @@
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+import typer
+
+from agentlab.config import load_config
+from agentlab.models import AgentTask
+from agentlab.orchestrator import Orchestrator
+from agentlab.status import TERMINAL_STATES, format_status, list_run_statuses, read_run_status
+
+app = typer.Typer(help="AgentLab GitLab agent orchestration CLI.")
+
+
+def _json_echo(value: object) -> None:
+    typer.echo(json.dumps(value, indent=2, ensure_ascii=False, default=str))
+
+
+@app.command()
+def plan(config: Path = typer.Option(..., "--config", exists=True, readable=True)) -> None:
+    cfg = load_config(config)
+    orchestrator = Orchestrator(cfg)
+    result = orchestrator.plan()
+    _json_echo({"run_id": orchestrator.run_id, "plan": result.model_dump(mode="json")})
+
+
+@app.command("run-task")
+def run_task(
+    config: Path = typer.Option(..., "--config", exists=True, readable=True),
+    task: Path = typer.Option(..., "--task", exists=True, readable=True),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    cfg = load_config(config)
+    agent_task = AgentTask.model_validate_json(task.read_text(encoding="utf-8"))
+    orchestrator = Orchestrator(cfg, dry_run=dry_run)
+    result = orchestrator.run_task(agent_task)
+    _json_echo({"run_id": orchestrator.run_id, "implementation": result.model_dump(mode="json")})
+
+
+@app.command("full-flow")
+def full_flow(config: Path = typer.Option(..., "--config", exists=True, readable=True)) -> None:
+    cfg = load_config(config)
+    _json_echo(Orchestrator(cfg).full_flow())
+
+
+@app.command("review-mr")
+def review_mr(
+    config: Path = typer.Option(..., "--config", exists=True, readable=True),
+    mr_id: int = typer.Option(..., "--mr-id"),
+) -> None:
+    cfg = load_config(config)
+    orchestrator = Orchestrator(cfg)
+    result = orchestrator.review_existing_mr(mr_id)
+    _json_echo({"run_id": orchestrator.run_id, **result})
+
+
+@app.command()
+def recover(
+    config: Path = typer.Option(..., "--config", exists=True, readable=True),
+    ref: str | None = typer.Option(None, "--ref"),
+    commit_sha: str | None = typer.Option(None, "--commit-sha"),
+) -> None:
+    cfg = load_config(config)
+    _json_echo(Orchestrator(cfg).recover(ref=ref, commit_sha=commit_sha))
+
+
+@app.command("dry-run")
+def dry_run(config: Path = typer.Option(..., "--config", exists=True, readable=True)) -> None:
+    cfg = load_config(config)
+    orchestrator = Orchestrator(cfg, dry_run=True)
+    _json_echo({"run_id": orchestrator.run_id, "plan": orchestrator.plan().model_dump(mode="json")})
+
+
+@app.command()
+def status(
+    config: Path = typer.Option(..., "--config", exists=True, readable=True),
+    run_id: str | None = typer.Option(None, "--run-id"),
+    limit: int = typer.Option(20, "--limit", min=1, max=100),
+    human: bool = typer.Option(False, "--human"),
+) -> None:
+    cfg = load_config(config)
+    if run_id:
+        snapshot = read_run_status(cfg, run_id)
+        typer.echo(format_status(snapshot) if human else snapshot.model_dump_json(indent=2))
+        return
+    snapshots = list_run_statuses(cfg, limit=limit)
+    payload = [snapshot.model_dump(mode="json") for snapshot in snapshots]
+    _json_echo(payload)
+
+
+@app.command()
+def watch(
+    config: Path = typer.Option(..., "--config", exists=True, readable=True),
+    run_id: str = typer.Option(..., "--run-id"),
+    interval: float = typer.Option(2.0, "--interval", min=0.5),
+    stop_on_terminal: bool = typer.Option(True, "--stop-on-terminal/--follow"),
+) -> None:
+    cfg = load_config(config)
+    last_rendered = ""
+    while True:
+        snapshot = read_run_status(cfg, run_id)
+        rendered = format_status(snapshot)
+        if rendered != last_rendered:
+            typer.echo(rendered)
+            typer.echo("")
+            last_rendered = rendered
+        if stop_on_terminal and snapshot.state in TERMINAL_STATES:
+            return
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    app()

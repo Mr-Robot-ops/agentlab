@@ -1,0 +1,87 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: agentlab-dry-run
+  namespace: agentlab
+  labels:
+    app.kubernetes.io/name: agentlab
+    app.kubernetes.io/component: runner
+    agentlab.io/mode: dry-run
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      serviceAccountName: agentlab-runner
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agentlab
+          image: registry.local/agentlab:0.1.0
+          imagePullPolicy: IfNotPresent
+          args: ["dry-run", "--config", "/etc/agentlab/config.yaml"]
+          env:
+            - name: GITLAB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: agentlab-secrets
+                  key: GITLAB_TOKEN
+            - name: HOME
+              value: /home/agentlab
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          volumeMounts:
+            - name: config
+              mountPath: /etc/agentlab/config.yaml
+              subPath: config.yaml
+              readOnly: true
+            - name: home
+              mountPath: /home/agentlab
+            - name: git-netrc
+              mountPath: /home/agentlab/.netrc
+              subPath: netrc
+              readOnly: true
+            - name: workspace
+              mountPath: /workspace
+            - name: runs
+              mountPath: /var/lib/agentlab
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: config
+          configMap:
+            name: agentlab-config
+        - name: git-netrc
+          secret:
+            secretName: agentlab-secrets
+            optional: true
+            defaultMode: 0600
+        - name: home
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: workspace
+          emptyDir:
+            sizeLimit: 10Gi
+        - name: runs
+          persistentVolumeClaim:
+            claimName: agentlab-runs
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi

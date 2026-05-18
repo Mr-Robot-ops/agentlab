@@ -1,0 +1,69 @@
+from __future__ import annotations
+
+import json
+from typing import Any, TypeVar
+
+import httpx
+from pydantic import BaseModel, ValidationError
+
+from agentlab.config import OllamaConfig
+
+T = TypeVar("T", bound=BaseModel)
+
+
+class OllamaClient:
+    def __init__(self, config: OllamaConfig, *, timeout_seconds: int = 120) -> None:
+        self.config = config
+        self.timeout_seconds = timeout_seconds
+
+    def chat_json(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        response_model: type[T],
+        retries: int = 2,
+    ) -> T:
+        messages: list[dict[str, str]] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        last_error: str | None = None
+        for attempt in range(retries + 1):
+            content = self._chat(model=model, messages=messages)
+            try:
+                return response_model.model_validate_json(content)
+            except ValidationError as exc:
+                last_error = str(exc)
+                messages.append({"role": "assistant", "content": content})
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your previous response did not match the required JSON schema. "
+                            f"Return only valid JSON for {response_model.__name__}. Validation error: {last_error}"
+                        ),
+                    }
+                )
+        raise RuntimeError(f"Ollama response failed schema validation: {last_error}")
+
+    def _chat(self, *, model: str, messages: list[dict[str, str]]) -> str:
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "format": "json",
+        }
+        with httpx.Client(timeout=self.timeout_seconds) as client:
+            response = client.post(f"{self.config.base_url.rstrip('/')}/api/chat", json=payload)
+            response.raise_for_status()
+        data = response.json()
+        content = data.get("message", {}).get("content")
+        if not isinstance(content, str):
+            raise RuntimeError("Ollama response did not include message.content")
+        try:
+            json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Ollama did not return JSON content") from exc
+        return content

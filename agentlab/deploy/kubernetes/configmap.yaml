@@ -1,0 +1,72 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: agentlab-config
+  namespace: agentlab
+data:
+  config.yaml: |
+    gitlab_url: "https://gitlab.local"
+    project_id: 12345
+    default_branch: "main"
+    gitlab_token_env: "GITLAB_TOKEN"
+
+    target_repo_url: "https://gitlab.local/group/project.git"
+    target_repo_path: "/workspace/repo"
+    target_repo_ref: "main"
+    clone_target_repo: true
+    clone_depth: 0
+    reject_embedded_git_credentials: true
+
+    workspace_root: "/var/lib/agentlab/runs"
+    audit_file: "audit.jsonl"
+
+    ollama:
+      base_url: "http://ollama.local:11434"
+      models:
+        default: "llama3.1"
+        planner: "llama3.1"
+        implementer: "codellama"
+        mr_agent: "llama3.1"
+        review_quality: "llama3.1"
+        review_security: "llama3.1"
+
+    allowed_commands:
+      - "python -m pytest"
+      - "pytest"
+      - "npm test"
+      - "pnpm test"
+      - "go test ./..."
+      - "cargo test"
+      - "trivy"
+      - "gitleaks"
+      - "semgrep"
+      - "bandit"
+      - "npm audit"
+
+    forbidden_commands:
+      - "rm -rf"
+      - "git reset --hard"
+      - "git push --force"
+      - "docker run --privileged"
+      - "docker compose up --privileged"
+
+    protected_paths:
+      - ".gitlab-ci.yml"
+      - "infra/prod"
+      - "terraform/prod"
+      - "secrets"
+
+    max_changed_files: 20
+    max_added_lines: 500
+    max_deleted_lines: 500
+    max_risk_score_for_merge: 60
+    max_risk_score_for_direct_main_push: 10
+
+    auto_merge_enabled: false
+    direct_main_push_enabled: false
+    push_agent_branches_enabled: false
+    require_two_reviewers: true
+    require_two_testers: true
+    docker_build_enabled: false
+    docker_compose_enabled: false
+    command_timeout_seconds: 900

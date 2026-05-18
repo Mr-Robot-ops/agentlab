@@ -1,0 +1,8 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: agentlab
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - pvc.yaml
+  - configmap.yaml
