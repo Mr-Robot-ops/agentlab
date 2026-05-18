@@ -55,6 +55,11 @@ protected_paths:
   - "infra/prod"
   - "terraform/prod"
   - "secrets"
+allowed_task_types: []
+forbidden_task_types: []
+required_test_commands: []
+repo_policy_file: ".agentlab.yaml"
+require_repo_policy_for_write: false
 
 max_changed_files: 20
 max_added_lines: 500

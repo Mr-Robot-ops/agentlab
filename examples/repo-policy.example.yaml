@@ -1,0 +1,31 @@
+version: 1
+
+# This file is meant to live inside the target repository as .agentlab.yaml.
+# It can only tighten the global AgentLab config, never loosen dangerous defaults.
+
+protected_paths:
+  - secrets
+  - infra/prod
+  - terraform/prod
+
+allowed_task_types:
+  - docs
+  - tests
+  - bugfix
+  - refactor
+
+forbidden_task_types:
+  - infra
+  - database_migration
+
+required_test_commands:
+  - python -m pytest
+
+max_changed_files: 10
+max_added_lines: 250
+max_deleted_lines: 250
+max_risk_score_for_merge: 40
+max_risk_score_for_direct_main_push: 5
+
+block_auto_merge: false
+block_direct_main_push: true

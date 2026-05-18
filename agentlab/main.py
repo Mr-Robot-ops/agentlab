@@ -9,6 +9,7 @@ import typer
 from agentlab.config import load_config
 from agentlab.models import AgentTask
 from agentlab.orchestrator import Orchestrator
+from agentlab.preflight import PreflightChecker
 from agentlab.status import TERMINAL_STATES, format_status, list_run_statuses, read_run_status
 
 app = typer.Typer(help="AgentLab GitLab agent orchestration CLI.")
@@ -71,6 +72,18 @@ def dry_run(config: Path = typer.Option(..., "--config", exists=True, readable=T
     cfg = load_config(config)
     orchestrator = Orchestrator(cfg, dry_run=True)
     _json_echo({"run_id": orchestrator.run_id, "plan": orchestrator.plan().model_dump(mode="json")})
+
+
+@app.command()
+def preflight(
+    config: Path = typer.Option(..., "--config", exists=True, readable=True),
+    mode: str = typer.Option("full-flow", "--mode"),
+) -> None:
+    cfg = load_config(config)
+    report = PreflightChecker(cfg, mode=mode).run()
+    _json_echo(report.model_dump(mode="json"))
+    if not report.passed:
+        raise typer.Exit(code=2)
 
 
 @app.command()

@@ -44,6 +44,21 @@ class PolicyEngine:
             self.config.direct_main_push_enabled if direct_main_push else self.config.auto_merge_enabled,
             "direct main push is disabled" if direct_main_push else "auto merge is disabled",
         )
+        task_type = task.task_type.value
+        self._check(
+            checks,
+            blockers,
+            "task_type_allowed",
+            not self.config.allowed_task_types or task_type in self.config.allowed_task_types,
+            f"task type is not allowed by policy: {task_type}",
+        )
+        self._check(
+            checks,
+            blockers,
+            "task_type_not_forbidden",
+            task_type not in self.config.forbidden_task_types,
+            f"task type is forbidden by policy: {task_type}",
+        )
         self._check(checks, blockers, "risk_not_blocked", not risk.blocked, "risk assessment is blocked")
 
         risk_limit = (
@@ -89,6 +104,17 @@ class PolicyEngine:
         self._check(checks, blockers, "no_secrets", not diff_stats.secrets_touched, "secrets touched")
 
         if self.config.require_two_testers:
+            executed_commands = {result.command for result in functional_tests.commands}
+            missing_required_tests = [
+                command for command in self.config.required_test_commands if command not in executed_commands
+            ]
+            self._check(
+                checks,
+                blockers,
+                "required_tests_executed",
+                not missing_required_tests,
+                "required test commands were not executed: " + ", ".join(missing_required_tests),
+            )
             self._check(
                 checks,
                 blockers,

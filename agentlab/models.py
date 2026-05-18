@@ -258,3 +258,53 @@ class RunStatusSnapshot(StrictModel):
     last_event: AuditEvent | None = None
     audit_file: str
     events_file: str
+
+
+class ArtifactRecord(StrictModel):
+    name: str
+    path: str
+    sha256: str
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+
+class ArtifactManifest(StrictModel):
+    run_id: str
+    artifacts: list[ArtifactRecord] = Field(default_factory=list)
+
+
+class PreflightCheck(StrictModel):
+    name: str
+    status: Literal["passed", "warning", "failed", "skipped"]
+    message: str
+    remediation: str | None = None
+
+
+class PreflightReport(StrictModel):
+    mode: str
+    passed: bool
+    checks: list[PreflightCheck] = Field(default_factory=list)
+
+
+class RepoPolicy(StrictModel):
+    version: int = 1
+    protected_paths: list[str] = Field(default_factory=list)
+    allowed_task_types: list[str] = Field(default_factory=list)
+    forbidden_task_types: list[str] = Field(default_factory=list)
+    required_test_commands: list[str] = Field(default_factory=list)
+    max_changed_files: int | None = Field(default=None, ge=1)
+    max_added_lines: int | None = Field(default=None, ge=1)
+    max_deleted_lines: int | None = Field(default=None, ge=1)
+    max_risk_score_for_merge: int | None = Field(default=None, ge=0)
+    max_risk_score_for_direct_main_push: int | None = Field(default=None, ge=0)
+    block_auto_merge: bool = False
+    block_direct_main_push: bool = True
+
+    @field_validator("protected_paths", "allowed_task_types", "forbidden_task_types", "required_test_commands")
+    @classmethod
+    def normalize_policy_strings(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            stripped = value.strip()
+            if stripped and stripped not in normalized:
+                normalized.append(stripped)
+        return normalized

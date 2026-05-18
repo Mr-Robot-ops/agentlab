@@ -133,7 +133,7 @@ Linux:
 Aktueller Stand:
 
 ```text
-24 passed
+32 passed
 ```
 
 ### Lokale CLI-Nutzung
@@ -147,6 +147,7 @@ agentlab full-flow --config config.yaml
 agentlab review-mr --config config.yaml --mr-id 123
 agentlab recover --config config.yaml --ref main --commit-sha <sha>
 agentlab dry-run --config config.yaml
+agentlab preflight --config config.yaml --mode full-flow
 agentlab status --config config.yaml
 agentlab status --config config.yaml --run-id <run_id> --human
 agentlab watch --config config.yaml --run-id <run_id>
@@ -212,9 +213,46 @@ ollama:
 
 docker_build_enabled: false
 docker_compose_enabled: false
+require_repo_policy_for_write: true
 ```
 
 Wichtig: Keine Zugangsdaten in `target_repo_url` einbauen. Git-Zugriff erfolgt ueber ein Kubernetes Secret, zum Beispiel als gemountete `.netrc`.
+
+### Repo-Policy im Zielrepository
+
+Fuer produktive Repositories sollte im Zielrepo eine `.agentlab.yaml` liegen. AgentLab kann diese Policy pro Run laden und die globale Config damit nur verschaerfen, nie lockern.
+
+Beispiel:
+
+```yaml
+version: 1
+protected_paths:
+  - secrets
+  - infra/prod
+allowed_task_types:
+  - docs
+  - tests
+  - bugfix
+  - refactor
+forbidden_task_types:
+  - infra
+  - database_migration
+required_test_commands:
+  - python -m pytest
+max_changed_files: 10
+max_added_lines: 250
+max_deleted_lines: 250
+max_risk_score_for_merge: 40
+block_direct_main_push: true
+```
+
+Eine Vorlage liegt unter:
+
+```text
+examples/repo-policy.example.yaml
+```
+
+Wenn `require_repo_policy_for_write: true` gesetzt ist, blockiert AgentLab Schreib-Modi wie `run-task` und `full-flow`, falls das Zielrepo keine `.agentlab.yaml` enthaelt.
 
 ### Kubernetes-Manifeste
 
@@ -303,6 +341,7 @@ Jeder Run schreibt drei Dateien unter `workspace_root/<run_id>/`:
 audit.jsonl    unveraenderliches Audit-Protokoll
 events.jsonl   Live-Event-Stream fuer Tools und spaetere UIs
 status.json    aktueller Snapshot des Runs
+artifacts/     strukturierte Reports und Entscheidungen
 ```
 
 `status.json` zeigt:
@@ -347,6 +386,39 @@ export AGENTLAB_LIVE_EVENTS=0
 
 Fuer maschinenlesbare Transparenz sind `events.jsonl` und `status.json` die dauerhaft wichtigeren Quellen. Ein spaeterer Controller oder ein kleines Dashboard kann direkt darauf aufbauen.
 
+Wichtige Run-Artefakte:
+
+- `preflight_<mode>.json`
+- `plan.json`
+- `implementation_report.json`
+- `functional_test_report.json`
+- `build_security_report.json`
+- `quality_review.json`
+- `security_architecture_review.json`
+- `risk_assessment.json`
+- `diff_stats.json`
+- `gate_decision.json`
+- `artifacts/manifest.json`
+
+### Preflight Gates
+
+Vor produktionsnahen Schreiblaeufen sollte immer ein Preflight laufen:
+
+```bash
+agentlab preflight --config config.yaml --mode full-flow
+```
+
+Der Preflight prueft unter anderem:
+
+- Zielrepo vorhanden oder Clone-Quelle konfiguriert
+- keine eingebetteten Git-Credentials in `target_repo_url`
+- Git verfuegbar
+- Repo-Policy vorhanden, falls fuer Schreibmodi vorgeschrieben
+- Target-Checkout sauber, bevor geschrieben wird
+- GitLab Token fuer GitLab-Modi vorhanden
+- Safety-Switches wie Auto-Merge und Direct-Main-Push
+- required test commands sind allowlisted
+
 ## Sicherheitsmodell
 
 - LLMs bekommen keine GitLab Tokens.
@@ -364,6 +436,7 @@ Fuer maschinenlesbare Transparenz sind `events.jsonl` und `status.json` die daue
 - Audit-Logs landen unter `workspace_root/<run_id>/audit.jsonl`.
 - Live-Status landet unter `workspace_root/<run_id>/status.json`.
 - Live-Events landen unter `workspace_root/<run_id>/events.jsonl`.
+- Persistente Reports landen unter `workspace_root/<run_id>/artifacts/`.
 
 ## Docker Builds im Cluster
 

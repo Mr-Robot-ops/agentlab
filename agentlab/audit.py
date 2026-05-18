@@ -20,6 +20,7 @@ SECRET_PATTERNS = [
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----",
     )
 ]
+SECRET_KEYWORDS = ("token", "password", "secret", "api_key", "apikey", "private_key")
 
 
 def stable_hash(value: Any) -> str:
@@ -36,7 +37,13 @@ def redact_secrets(value: Any) -> Any:
     if isinstance(value, list):
         return [redact_secrets(item) for item in value]
     if isinstance(value, dict):
-        return {key: redact_secrets(item) for key, item in value.items()}
+        redacted: dict[Any, Any] = {}
+        for key, item in value.items():
+            if any(keyword in str(key).lower() for keyword in SECRET_KEYWORDS):
+                redacted[key] = "REDACTED"
+            else:
+                redacted[key] = redact_secrets(item)
+        return redacted
     return value
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from pathlib import Path
 
+from agentlab.artifacts import ArtifactStore
 from agentlab.agents.gatekeeper import Gatekeeper
 from agentlab.agents.implementer import ImplementationAgent
 from agentlab.agents.mr_agent import MergeRequestAgent
@@ -15,8 +16,10 @@ from agentlab.agents.test_functional import FunctionalTestAgent
 from agentlab.audit import AuditLogger
 from agentlab.config import AppConfig
 from agentlab.models import AgentTask, GateDecision, ImplementationReport, ReportStatus, TaskPlan
+from agentlab.preflight import PreflightChecker
 from agentlab.policies.policy_engine import PolicyEngine
 from agentlab.policies.risk import assess_risk
+from agentlab.repo_policy import apply_repo_policy, load_repo_policy
 from agentlab.tools.docker_tool import DockerTool
 from agentlab.tools.file_tool import FileTool
 from agentlab.tools.git_tool import GitTool
@@ -36,6 +39,11 @@ class Orchestrator:
         self.audit = AuditLogger(self.run_dir / config.audit_file, self.run_id)
         with self.audit.span(agent="workspace", action="prepare"):
             self.workspace_info = WorkspaceManager(config, self.audit).prepare()
+        self.repo_policy = load_repo_policy(config.target_repo_path, config.repo_policy_file)
+        self.config = apply_repo_policy(config, self.repo_policy)
+        self.artifacts = ArtifactStore(self.run_dir, self.run_id)
+        if self.repo_policy is not None:
+            self.artifacts.write_json("repo_policy", self.repo_policy)
         self.ollama = OllamaClient(config.ollama, timeout_seconds=config.command_timeout_seconds)
 
     def _tools(self) -> tuple[GitTool, FileTool, TestTool, DockerTool]:
@@ -53,14 +61,36 @@ class Orchestrator:
         return git_tool, file_tool, test_tool, docker_tool
 
     def plan(self) -> TaskPlan:
+        self.preflight("plan", enforce=False)
         _, file_tool, _, _ = self._tools()
         with self.audit.span(agent="planner", action="plan"):
-            return PlanningAgent(self.config, file_tool, self.ollama).plan()
+            result = PlanningAgent(self.config, file_tool, self.ollama).plan()
+        self.artifacts.write_json("plan", result)
+        return result
 
     def run_task(self, task: AgentTask) -> ImplementationReport:
+        self.preflight("run-task", enforce=True)
         git_tool, file_tool, _, _ = self._tools()
         with self.audit.span(agent="implementer", action="implement", input_payload=task.model_dump(mode="json")):
-            return ImplementationAgent(self.config, git_tool, file_tool, self.ollama, dry_run=self.dry_run).implement(task)
+            result = ImplementationAgent(self.config, git_tool, file_tool, self.ollama, dry_run=self.dry_run).implement(task)
+        self.artifacts.write_json("implementation_report", result)
+        return result
+
+    def preflight(self, mode: str, *, enforce: bool = True) -> object:
+        with self.audit.span(agent="preflight", action=mode):
+            report = PreflightChecker(self.config, mode=mode).run()
+        self.artifacts.write_json(f"preflight_{mode.replace('-', '_')}", report)
+        if enforce and not report.passed:
+            failed = [check.name for check in report.checks if check.status == "failed"]
+            self.audit.emit(
+                agent="preflight",
+                action=mode,
+                status="blocked",
+                metadata={"failed_checks": failed},
+                output_payload=report.model_dump(mode="json"),
+            )
+            raise RuntimeError("preflight failed: " + ", ".join(failed))
+        return report
 
     def full_flow(self) -> dict[str, object]:
         self.audit.emit(agent="orchestrator", action="full_flow", status="started")
@@ -141,6 +171,7 @@ class Orchestrator:
         risk = assess_risk(task, diff_stats.changed_files, diff_text)
         with self.audit.span(agent="functional_test", action="run_tests"):
             functional = FunctionalTestAgent(file_tool, test_tool).run()
+        self.artifacts.write_json("functional_test_report", functional)
         with self.audit.span(agent="build_security_test", action="run_build_and_security_checks"):
             build_security = BuildSecurityTestAgent(
                 file_tool,
@@ -149,14 +180,17 @@ class Orchestrator:
                 docker_build_enabled=self.config.docker_build_enabled,
                 docker_compose_enabled=self.config.docker_compose_enabled,
             ).run()
+        self.artifacts.write_json("build_security_report", build_security)
         with self.audit.span(agent="review_quality", action="review_diff"):
             quality_review = CodeQualityReviewAgent(self.config, self.ollama).review(diff_text)
+        self.artifacts.write_json("quality_review", quality_review)
         with self.audit.span(agent="review_security_architecture", action="review_diff"):
             security_review = SecurityArchitectureReviewAgent(self.config, self.ollama).review(diff_text)
+        self.artifacts.write_json("security_architecture_review", security_review)
         rollback_plan = f"Revert the agent branch commit for task {task.id} or close the MR before merge."
         gatekeeper = Gatekeeper(PolicyEngine(self.config))
         with self.audit.span(agent="gatekeeper", action="decide"):
-            return gatekeeper.decide(
+            decision = gatekeeper.decide(
                 task=task,
                 risk=risk,
                 diff_stats=diff_stats,
@@ -167,6 +201,10 @@ class Orchestrator:
                 rollback_plan=rollback_plan,
                 direct_main_push=direct_main_push,
             )
+        self.artifacts.write_json("risk_assessment", risk)
+        self.artifacts.write_json("diff_stats", diff_stats)
+        self.artifacts.write_json("gate_decision", decision)
+        return decision
 
     def review_existing_mr(self, mr_id: int) -> dict[str, object]:
         gitlab_tool = GitLabTool(self.config)
@@ -175,14 +213,18 @@ class Orchestrator:
         diff_text = "\n".join(change.get("diff", "") for change in changes.get("changes", []))
         quality_review = CodeQualityReviewAgent(self.config, self.ollama).review(diff_text)
         security_review = SecurityArchitectureReviewAgent(self.config, self.ollama).review(diff_text)
-        return {
+        result = {
             "mr_id": mr_id,
             "quality_review": quality_review.model_dump(mode="json"),
             "security_review": security_review.model_dump(mode="json"),
         }
+        self.artifacts.write_json("review_existing_mr", result)
+        return result
 
     def recover(self, *, ref: str | None = None, commit_sha: str | None = None) -> dict[str, object]:
         git_tool, _, _, _ = self._tools()
         gitlab_tool = GitLabTool(self.config)
         report = RollbackRecoveryAgent(self.config, git_tool, gitlab_tool).recover(ref=ref, commit_sha=commit_sha)
-        return {"run_id": self.run_id, "recovery": report.model_dump(mode="json")}
+        result = {"run_id": self.run_id, "recovery": report.model_dump(mode="json")}
+        self.artifacts.write_json("recovery_report", report)
+        return result

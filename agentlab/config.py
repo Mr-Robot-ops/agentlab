@@ -43,6 +43,11 @@ class AppConfig(BaseModel):
     allowed_commands: list[str] = Field(default_factory=list)
     forbidden_commands: list[str] = Field(default_factory=list)
     protected_paths: list[str] = Field(default_factory=list)
+    allowed_task_types: list[str] = Field(default_factory=list)
+    forbidden_task_types: list[str] = Field(default_factory=list)
+    required_test_commands: list[str] = Field(default_factory=list)
+    repo_policy_file: str = ".agentlab.yaml"
+    require_repo_policy_for_write: bool = False
     max_changed_files: int = Field(default=20, ge=1)
     max_added_lines: int = Field(default=500, ge=1)
     max_deleted_lines: int = Field(default=500, ge=1)
@@ -58,7 +63,14 @@ class AppConfig(BaseModel):
     command_timeout_seconds: int = Field(default=900, ge=1)
     audit_file: str = "audit.jsonl"
 
-    @field_validator("protected_paths", "allowed_commands", "forbidden_commands")
+    @field_validator(
+        "protected_paths",
+        "allowed_commands",
+        "forbidden_commands",
+        "allowed_task_types",
+        "forbidden_task_types",
+        "required_test_commands",
+    )
     @classmethod
     def normalize_strings(cls, values: list[str]) -> list[str]:
         return [value.strip() for value in values if value.strip()]

@@ -4,6 +4,7 @@ from agentlab.config import AppConfig
 from agentlab.models import (
     AgentTask,
     BuildSecurityReport,
+    CommandResult,
     DiffStats,
     Finding,
     FindingSeverity,
@@ -98,3 +99,25 @@ def test_missing_rollback_plan_blocks() -> None:
     )  # type: ignore[arg-type]
     assert decision.allowed is False
     assert "rollback plan missing" in decision.blockers
+
+
+def test_forbidden_task_type_blocks() -> None:
+    task = AgentTask(id="infra", title="Infra", task_type=TaskType.INFRA, approved=True)
+    decision = PolicyEngine(config(auto_merge_enabled=True, forbidden_task_types=["infra"])).evaluate(
+        **inputs(task=task)
+    )  # type: ignore[arg-type]
+    assert decision.allowed is False
+    assert "task type is forbidden by policy: infra" in decision.blockers
+
+
+def test_required_test_command_must_execute() -> None:
+    report = AgentTestReport(
+        status=ReportStatus.PASSED,
+        passed=True,
+        commands=[CommandResult(command="python -m pytest", cwd=".", exit_code=0)],
+    )
+    decision = PolicyEngine(config(auto_merge_enabled=True, required_test_commands=["npm test"])).evaluate(
+        **inputs(functional_tests=report)
+    )  # type: ignore[arg-type]
+    assert decision.allowed is False
+    assert "required test commands were not executed: npm test" in decision.blockers
