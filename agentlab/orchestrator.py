@@ -15,11 +15,13 @@ from agentlab.agents.test_build_security import BuildSecurityTestAgent
 from agentlab.agents.test_functional import FunctionalTestAgent
 from agentlab.audit import AuditLogger
 from agentlab.config import AppConfig
-from agentlab.models import AgentTask, GateDecision, ImplementationReport, ReportStatus, TaskPlan
+from agentlab.models import AgentTask, ArchitectureSummary, GateDecision, ImplementationReport, RepoIndex, ReportStatus, StewardReport, TaskPlan
 from agentlab.preflight import PreflightChecker
 from agentlab.policies.policy_engine import PolicyEngine
 from agentlab.policies.risk import assess_risk
+from agentlab.repo_indexer import RepoIndexer
 from agentlab.repo_policy import apply_repo_policy, load_repo_policy
+from agentlab.steward import BacklogSteward
 from agentlab.tools.docker_tool import DockerTool
 from agentlab.tools.file_tool import FileTool
 from agentlab.tools.git_tool import GitTool
@@ -45,6 +47,8 @@ class Orchestrator:
         if self.repo_policy is not None:
             self.artifacts.write_json("repo_policy", self.repo_policy)
         self.ollama = OllamaClient(config.ollama, timeout_seconds=config.command_timeout_seconds)
+        self.repo_index: RepoIndex | None = None
+        self.architecture_summary: ArchitectureSummary | None = None
 
     def _tools(self) -> tuple[GitTool, FileTool, TestTool, DockerTool]:
         repo = self.config.target_repo_path
@@ -62,19 +66,71 @@ class Orchestrator:
 
     def plan(self) -> TaskPlan:
         self.preflight("plan", enforce=False)
+        repo_index, architecture = self.index_repository()
         _, file_tool, _, _ = self._tools()
         with self.audit.span(agent="planner", action="plan"):
-            result = PlanningAgent(self.config, file_tool, self.ollama).plan()
+            result = PlanningAgent(self.config, file_tool, self.ollama, repo_index=repo_index, architecture=architecture).plan()
         self.artifacts.write_json("plan", result)
         return result
 
     def run_task(self, task: AgentTask) -> ImplementationReport:
         self.preflight("run-task", enforce=True)
+        repo_index, architecture = self.index_repository()
         git_tool, file_tool, _, _ = self._tools()
         with self.audit.span(agent="implementer", action="implement", input_payload=task.model_dump(mode="json")):
-            result = ImplementationAgent(self.config, git_tool, file_tool, self.ollama, dry_run=self.dry_run).implement(task)
+            result = ImplementationAgent(
+                self.config,
+                git_tool,
+                file_tool,
+                self.ollama,
+                dry_run=self.dry_run,
+                repo_context={
+                    "architecture": architecture.model_dump(mode="json"),
+                    "repo_index_summary": self._repo_index_summary(repo_index),
+                },
+            ).implement(task)
         self.artifacts.write_json("implementation_report", result)
         return result
+
+    def index_repository(self) -> tuple[RepoIndex, ArchitectureSummary]:
+        if self.repo_index is not None and self.architecture_summary is not None:
+            return self.repo_index, self.architecture_summary
+        self.preflight("index", enforce=False)
+        with self.audit.span(agent="repo_indexer", action="index_repository"):
+            indexer = RepoIndexer(self.config)
+            self.repo_index = indexer.build_index()
+            self.architecture_summary = indexer.summarize_architecture(self.repo_index)
+        self.artifacts.write_json("repo_index", self.repo_index)
+        self.artifacts.write_json("architecture_summary", self.architecture_summary)
+        return self.repo_index, self.architecture_summary
+
+    def steward(self) -> StewardReport:
+        repo_index, architecture = self.index_repository()
+        with self.audit.span(agent="steward", action="build_backlog"):
+            report = BacklogSteward(repo_index, architecture).build_report()
+        self.artifacts.write_json("steward_report", report)
+        self.artifacts.write_json("backlog", [item.proposed_task for item in report.backlog])
+        return report
+
+    @staticmethod
+    def _repo_index_summary(index: RepoIndex) -> dict[str, object]:
+        return {
+            "total_files": index.total_files,
+            "indexed_files": index.indexed_files,
+            "languages": index.languages,
+            "top_level_dirs": index.top_level_dirs,
+            "manifests": index.manifests,
+            "test_files": index.test_files[:100],
+            "docs_files": index.docs_files[:50],
+            "ci_files": index.ci_files,
+            "docker_files": index.docker_files,
+            "kubernetes_files": index.kubernetes_files[:100],
+            "infra_files": index.infra_files[:100],
+            "security_files": index.security_files[:100],
+            "entrypoint_candidates": index.entrypoint_candidates,
+            "todos": [todo.model_dump(mode="json") for todo in index.todos[:50]],
+            "warnings": index.warnings,
+        }
 
     def preflight(self, mode: str, *, enforce: bool = True) -> object:
         with self.audit.span(agent="preflight", action=mode):

@@ -20,6 +20,28 @@ def _json_echo(value: object) -> None:
 
 
 @app.command()
+def index(config: Path = typer.Option(..., "--config", exists=True, readable=True)) -> None:
+    cfg = load_config(config)
+    orchestrator = Orchestrator(cfg)
+    repo_index, architecture = orchestrator.index_repository()
+    _json_echo(
+        {
+            "run_id": orchestrator.run_id,
+            "repo_index": repo_index.model_dump(mode="json"),
+            "architecture_summary": architecture.model_dump(mode="json"),
+        }
+    )
+
+
+@app.command()
+def steward(config: Path = typer.Option(..., "--config", exists=True, readable=True)) -> None:
+    cfg = load_config(config)
+    orchestrator = Orchestrator(cfg)
+    result = orchestrator.steward()
+    _json_echo({"run_id": orchestrator.run_id, "steward": result.model_dump(mode="json")})
+
+
+@app.command()
 def plan(config: Path = typer.Option(..., "--config", exists=True, readable=True)) -> None:
     cfg = load_config(config)
     orchestrator = Orchestrator(cfg)

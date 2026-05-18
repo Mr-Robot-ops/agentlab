@@ -61,6 +61,22 @@ data:
     repo_policy_file: ".agentlab.yaml"
     require_repo_policy_for_write: true
 
+    repo_index_ignore:
+      - ".git"
+      - ".venv"
+      - "venv"
+      - "node_modules"
+      - "dist"
+      - "build"
+      - ".pytest_cache"
+      - "__pycache__"
+      - ".mypy_cache"
+      - ".ruff_cache"
+      - "coverage"
+    max_index_files: 5000
+    max_index_file_bytes: 250000
+    max_index_todos: 200
+
     max_changed_files: 20
     max_added_lines: 500
     max_deleted_lines: 500

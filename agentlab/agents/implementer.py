@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from agentlab.config import AppConfig
 from agentlab.models import AgentTask, ImplementationReport, PatchProposal, ReportStatus
@@ -24,12 +25,14 @@ class ImplementationAgent:
         ollama: OllamaClient | None = None,
         *,
         dry_run: bool = False,
+        repo_context: dict[str, Any] | None = None,
     ) -> None:
         self.config = config
         self.git_tool = git_tool
         self.file_tool = file_tool
         self.ollama = ollama
         self.dry_run = dry_run
+        self.repo_context = repo_context or {}
 
     def implement(self, task: AgentTask) -> ImplementationReport:
         branch = f"agent/{task.id}"
@@ -90,11 +93,13 @@ class ImplementationAgent:
                 snippets[path] = f"<unreadable: {exc}>"
         payload = {
             "task": task.model_dump(mode="json"),
+            "repo_context": self.repo_context,
             "file_snippets": snippets,
             "rules": {
                 "output": "Return exactly one unified diff in PatchProposal.patch.",
                 "scope": "Only touch files needed for this task.",
                 "forbidden_actions": task.forbidden_actions,
+                "whole_repo_awareness": "Use repo_context to respect architecture, test strategy, ownership boundaries, and deployment signals.",
             },
         }
         proposal = self.ollama.chat_json(

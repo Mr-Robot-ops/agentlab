@@ -308,3 +308,86 @@ class RepoPolicy(StrictModel):
             if stripped and stripped not in normalized:
                 normalized.append(stripped)
         return normalized
+
+
+class RepoFileSummary(StrictModel):
+    path: str
+    size_bytes: int = Field(ge=0)
+    extension: str = ""
+    language: str = "unknown"
+    role: Literal[
+        "source",
+        "test",
+        "docs",
+        "manifest",
+        "ci",
+        "docker",
+        "kubernetes",
+        "infra",
+        "config",
+        "security",
+        "unknown",
+    ] = "unknown"
+
+
+class RepoTodo(StrictModel):
+    path: str
+    line: int = Field(ge=1)
+    tag: Literal["TODO", "FIXME", "HACK"]
+    text: str
+
+
+class RepoIndex(StrictModel):
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    root_path: str
+    total_files: int = Field(ge=0)
+    indexed_files: int = Field(ge=0)
+    skipped_files: int = Field(default=0, ge=0)
+    files: list[RepoFileSummary] = Field(default_factory=list)
+    languages: dict[str, int] = Field(default_factory=dict)
+    top_level_dirs: list[str] = Field(default_factory=list)
+    manifests: list[str] = Field(default_factory=list)
+    test_files: list[str] = Field(default_factory=list)
+    docs_files: list[str] = Field(default_factory=list)
+    ci_files: list[str] = Field(default_factory=list)
+    docker_files: list[str] = Field(default_factory=list)
+    kubernetes_files: list[str] = Field(default_factory=list)
+    infra_files: list[str] = Field(default_factory=list)
+    config_files: list[str] = Field(default_factory=list)
+    security_files: list[str] = Field(default_factory=list)
+    entrypoint_candidates: list[str] = Field(default_factory=list)
+    todos: list[RepoTodo] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+
+class ArchitectureSummary(StrictModel):
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    project_type: str = "unknown"
+    primary_languages: list[str] = Field(default_factory=list)
+    frameworks: list[str] = Field(default_factory=list)
+    package_managers: list[str] = Field(default_factory=list)
+    test_strategy: str = "unknown"
+    build_strategy: str = "unknown"
+    deployment_signals: list[str] = Field(default_factory=list)
+    important_paths: list[str] = Field(default_factory=list)
+    boundaries: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)
+
+
+class BacklogItem(StrictModel):
+    id: str
+    title: str
+    task_type: TaskType
+    priority: Literal["low", "medium", "high", "critical"] = "medium"
+    rationale: str
+    evidence: list[str] = Field(default_factory=list)
+    proposed_task: AgentTask
+
+
+class StewardReport(StrictModel):
+    generated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    summary: str
+    repo_health_score: int = Field(ge=0, le=100)
+    backlog: list[BacklogItem] = Field(default_factory=list)
+    recommended_next_task_ids: list[str] = Field(default_factory=list)
+    risks: list[str] = Field(default_factory=list)

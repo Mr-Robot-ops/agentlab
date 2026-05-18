@@ -133,7 +133,7 @@ Linux:
 Aktueller Stand:
 
 ```text
-32 passed
+34 passed
 ```
 
 ### Lokale CLI-Nutzung
@@ -142,6 +142,8 @@ Nach Aktivierung der virtuellen Umgebung:
 
 ```bash
 agentlab plan --config config.yaml
+agentlab index --config config.yaml
+agentlab steward --config config.yaml
 agentlab run-task --config config.yaml --task task.json
 agentlab full-flow --config config.yaml
 agentlab review-mr --config config.yaml --mr-id 123
@@ -154,6 +156,32 @@ agentlab watch --config config.yaml --run-id <run_id>
 ```
 
 Fuer `run-task` muss die Task-Datei `"approved": true` enthalten. Das ist Absicht: Implementierung braucht eine explizite Freigabe.
+
+### Whole-Repo-Index und Steward
+
+Damit Agents nicht nur einzelne Dateien sehen, erzeugt AgentLab vor Planning- und Implementierungslaeufen einen deterministischen Repo-Index. Dieser Index ist kein LLM-Output, sondern ein reproduzierbares Artefakt:
+
+```bash
+agentlab index --config config.yaml
+```
+
+Der Index enthaelt unter anderem:
+
+- Sprachen und Top-Level-Verzeichnisse
+- Manifeste wie `pyproject.toml`, `package.json`, `go.mod` oder `Cargo.toml`
+- Test-, Dokumentations-, CI-, Docker-, Kubernetes- und Infra-Dateien
+- secret-nahe Dateien als eigene Risikokategorie
+- Entry-Point-Kandidaten
+- TODO/FIXME/HACK-Fundstellen
+- Architekturzusammenfassung mit Projektart, Frameworks, Teststrategie, Buildstrategie und Deployment-Signalen
+
+Der Steward baut darauf einen priorisierten Backlog-Report:
+
+```bash
+agentlab steward --config config.yaml
+```
+
+Dieser Report ist als Grundlage fuer spaetere autonome Wartung gedacht. Er zeigt, welche Aufgaben als naechstes sinnvoll waeren, ohne sofort Code zu aendern.
 
 ### Image lokal bauen
 
@@ -323,6 +351,8 @@ Vor echter Nutzung muss `task.example.configmap.yaml` durch einen freigegebenen 
 
 ## Komponenten
 
+- Repo Indexer: erstellt eine deterministische, LLM-unabhaengige Sicht auf das gesamte Repository.
+- Backlog Steward: bewertet Repo-Gaps und erzeugt priorisierte, policy-kompatible Wartungsaufgaben.
 - Planning Agent: analysiert Repository-Struktur, README-Dateien, TODOs, Manifeste und Tests. Aendert keinen Code.
 - Implementation Agent: verarbeitet genau einen freigegebenen Task und arbeitet ausschliesslich ueber `PatchProposal`. Er erstellt `agent/<task-id>`, validiert den Patch, wendet ihn ueber `FileTool` an und committet lokal.
 - MR Agent: erstellt oder aktualisiert GitLab Merge Requests mit Zusammenfassung, Checkliste, Risiko, Tests und Rollback-Hinweisen.
@@ -389,6 +419,10 @@ Fuer maschinenlesbare Transparenz sind `events.jsonl` und `status.json` die daue
 Wichtige Run-Artefakte:
 
 - `preflight_<mode>.json`
+- `repo_index.json`
+- `architecture_summary.json`
+- `steward_report.json`
+- `backlog.json`
 - `plan.json`
 - `implementation_report.json`
 - `functional_test_report.json`
@@ -460,5 +494,6 @@ Der Grund: Ein Mount von `/var/run/docker.sock` waere praktisch, aber sicherheit
 - `configmap.yaml` auf deine lokalen Domaenen/IPs anpassen.
 - Netzwerkpfade vom Kubernetes-Cluster zu GitLab und Ollama pruefen.
 - Erst `job-plan.yaml`, dann `job-dry-run.yaml` ausfuehren.
+- Whole-Repo-Index regelmaessig erzeugen und Steward-Backlog als Governance-Basis verwenden.
 - Danach einen echten Low-Risk Task als ConfigMap mounten und `job-run-task.yaml` testen.
 - Spaeter: Controller bauen, der Jobs dynamisch erzeugt und Artefakte/MR-Kommentare zentral verwaltet.

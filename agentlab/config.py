@@ -49,6 +49,24 @@ class AppConfig(BaseModel):
     required_test_commands: list[str] = Field(default_factory=list)
     repo_policy_file: str = ".agentlab.yaml"
     require_repo_policy_for_write: bool = False
+    repo_index_ignore: list[str] = Field(
+        default_factory=lambda: [
+            ".git",
+            ".venv",
+            "venv",
+            "node_modules",
+            "dist",
+            "build",
+            ".pytest_cache",
+            "__pycache__",
+            ".mypy_cache",
+            ".ruff_cache",
+            "coverage",
+        ]
+    )
+    max_index_files: int = Field(default=5000, ge=1)
+    max_index_file_bytes: int = Field(default=250_000, ge=1)
+    max_index_todos: int = Field(default=200, ge=0)
     max_changed_files: int = Field(default=20, ge=1)
     max_added_lines: int = Field(default=500, ge=1)
     max_deleted_lines: int = Field(default=500, ge=1)
@@ -71,6 +89,7 @@ class AppConfig(BaseModel):
         "allowed_task_types",
         "forbidden_task_types",
         "required_test_commands",
+        "repo_index_ignore",
     )
     @classmethod
     def normalize_strings(cls, values: list[str]) -> list[str]:
