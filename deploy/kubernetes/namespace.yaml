@@ -4,3 +4,6 @@ metadata:
   name: agentlab
   labels:
     app.kubernetes.io/name: agentlab
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted

@@ -12,6 +12,8 @@ from agentlab.models import (
     ReviewReport,
     RiskAssessment,
     RiskLevel,
+    SbomDocument,
+    SupplyChainReport,
     TaskType,
     Verdict,
 )
@@ -121,3 +123,21 @@ def test_required_test_command_must_execute() -> None:
     )  # type: ignore[arg-type]
     assert decision.allowed is False
     assert "required test commands were not executed: npm test" in decision.blockers
+
+
+def test_supply_chain_lockfile_policy_blocks_when_required() -> None:
+    supply_chain = SupplyChainReport(
+        status=ReportStatus.FAILED,
+        passed=False,
+        manifests=["pyproject.toml"],
+        missing_lockfiles=["pyproject.toml"],
+        components_count=0,
+        sbom=SbomDocument(serialNumber="urn:uuid:test"),
+    )
+    decision = PolicyEngine(config(auto_merge_enabled=True, require_lockfiles_for_merge=True)).evaluate(
+        **inputs(supply_chain=supply_chain)
+    )  # type: ignore[arg-type]
+
+    assert decision.allowed is False
+    assert "supply chain analysis did not pass" in decision.blockers
+    assert "dependency lockfiles missing: pyproject.toml" in decision.blockers

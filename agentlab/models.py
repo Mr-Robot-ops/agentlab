@@ -162,6 +162,40 @@ class BuildSecurityReport(StrictModel):
     recommendation: str = ""
 
 
+class SbomComponent(StrictModel):
+    bom_ref: str
+    type: Literal["application", "library", "framework", "container", "file"] = "library"
+    name: str
+    version: str | None = None
+    purl: str | None = None
+    scope: Literal["required", "optional", "excluded"] | None = None
+    properties: list[dict[str, str]] = Field(default_factory=list)
+
+
+class SbomDocument(StrictModel):
+    bomFormat: Literal["CycloneDX"] = "CycloneDX"
+    specVersion: str = "1.6"
+    serialNumber: str
+    version: int = Field(default=1, ge=1)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    components: list[SbomComponent] = Field(default_factory=list)
+    dependencies: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class SupplyChainReport(StrictModel):
+    status: ReportStatus
+    passed: bool
+    sbom_format: str = "CycloneDX"
+    manifests: list[str] = Field(default_factory=list)
+    lockfiles: list[str] = Field(default_factory=list)
+    missing_lockfiles: list[str] = Field(default_factory=list)
+    package_managers: list[str] = Field(default_factory=list)
+    components_count: int = Field(default=0, ge=0)
+    findings: list[Finding] = Field(default_factory=list)
+    recommendations: list[str] = Field(default_factory=list)
+    sbom: SbomDocument
+
+
 class ReviewComment(StrictModel):
     path: str | None = None
     line: int | None = Field(default=None, ge=1)
@@ -219,6 +253,18 @@ class RollbackReport(StrictModel):
     revert_commit_sha: str | None = None
     incident_summary: str = ""
     recommended_action: str = ""
+
+
+class ProvenanceSubject(StrictModel):
+    name: str
+    digest: dict[str, str] = Field(default_factory=dict)
+
+
+class ProvenanceStatement(StrictModel):
+    statement_type: str = "https://in-toto.io/Statement/v1"
+    predicate_type: str = "https://slsa.dev/provenance/v1"
+    subject: list[ProvenanceSubject] = Field(default_factory=list)
+    predicate: dict[str, Any] = Field(default_factory=dict)
 
 
 class AuditEvent(StrictModel):

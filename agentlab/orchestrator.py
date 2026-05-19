@@ -15,13 +15,26 @@ from agentlab.agents.test_build_security import BuildSecurityTestAgent
 from agentlab.agents.test_functional import FunctionalTestAgent
 from agentlab.audit import AuditLogger
 from agentlab.config import AppConfig
-from agentlab.models import AgentTask, ArchitectureSummary, GateDecision, ImplementationReport, RepoIndex, ReportStatus, StewardReport, TaskPlan
+from agentlab.models import (
+    AgentTask,
+    ArchitectureSummary,
+    GateDecision,
+    ImplementationReport,
+    ProvenanceStatement,
+    RepoIndex,
+    ReportStatus,
+    StewardReport,
+    SupplyChainReport,
+    TaskPlan,
+)
 from agentlab.preflight import PreflightChecker
 from agentlab.policies.policy_engine import PolicyEngine
 from agentlab.policies.risk import assess_risk
+from agentlab.provenance import ProvenanceBuilder
 from agentlab.repo_indexer import RepoIndexer
 from agentlab.repo_policy import apply_repo_policy, load_repo_policy
 from agentlab.steward import BacklogSteward
+from agentlab.supply_chain import SupplyChainAnalyzer
 from agentlab.tools.docker_tool import DockerTool
 from agentlab.tools.file_tool import FileTool
 from agentlab.tools.git_tool import GitTool
@@ -49,6 +62,7 @@ class Orchestrator:
         self.ollama = OllamaClient(config.ollama, timeout_seconds=config.command_timeout_seconds)
         self.repo_index: RepoIndex | None = None
         self.architecture_summary: ArchitectureSummary | None = None
+        self.supply_chain_report: SupplyChainReport | None = None
 
     def _tools(self) -> tuple[GitTool, FileTool, TestTool, DockerTool]:
         repo = self.config.target_repo_path
@@ -67,6 +81,8 @@ class Orchestrator:
     def plan(self) -> TaskPlan:
         self.preflight("plan", enforce=False)
         repo_index, architecture = self.index_repository()
+        if self.config.supply_chain_enabled:
+            self.supply_chain()
         _, file_tool, _, _ = self._tools()
         with self.audit.span(agent="planner", action="plan"):
             result = PlanningAgent(self.config, file_tool, self.ollama, repo_index=repo_index, architecture=architecture).plan()
@@ -76,6 +92,7 @@ class Orchestrator:
     def run_task(self, task: AgentTask) -> ImplementationReport:
         self.preflight("run-task", enforce=True)
         repo_index, architecture = self.index_repository()
+        supply_chain = self.supply_chain() if self.config.supply_chain_enabled else None
         git_tool, file_tool, _, _ = self._tools()
         with self.audit.span(agent="implementer", action="implement", input_payload=task.model_dump(mode="json")):
             result = ImplementationAgent(
@@ -87,6 +104,7 @@ class Orchestrator:
                 repo_context={
                     "architecture": architecture.model_dump(mode="json"),
                     "repo_index_summary": self._repo_index_summary(repo_index),
+                    "supply_chain_summary": self._supply_chain_summary(supply_chain) if supply_chain else None,
                 },
             ).implement(task)
         self.artifacts.write_json("implementation_report", result)
@@ -104,8 +122,31 @@ class Orchestrator:
         self.artifacts.write_json("architecture_summary", self.architecture_summary)
         return self.repo_index, self.architecture_summary
 
+    def supply_chain(self) -> SupplyChainReport:
+        if self.supply_chain_report is not None:
+            return self.supply_chain_report
+        repo_index, _ = self.index_repository()
+        with self.audit.span(agent="supply_chain", action="analyze"):
+            self.supply_chain_report = SupplyChainAnalyzer(self.config, repo_index).analyze()
+        self.artifacts.write_json("supply_chain_report", self.supply_chain_report)
+        self.artifacts.write_json("sbom_cyclonedx", self.supply_chain_report.sbom)
+        return self.supply_chain_report
+
+    def provenance(self) -> ProvenanceStatement:
+        with self.audit.span(agent="provenance", action="build_statement"):
+            statement = ProvenanceBuilder(
+                self.config,
+                run_id=self.run_id,
+                run_dir=self.run_dir,
+                artifacts=self.artifacts,
+            ).build()
+        self.artifacts.write_json("run_provenance", statement)
+        return statement
+
     def steward(self) -> StewardReport:
         repo_index, architecture = self.index_repository()
+        if self.config.supply_chain_enabled:
+            self.supply_chain()
         with self.audit.span(agent="steward", action="build_backlog"):
             report = BacklogSteward(repo_index, architecture).build_report()
         self.artifacts.write_json("steward_report", report)
@@ -130,6 +171,18 @@ class Orchestrator:
             "entrypoint_candidates": index.entrypoint_candidates,
             "todos": [todo.model_dump(mode="json") for todo in index.todos[:50]],
             "warnings": index.warnings,
+        }
+
+    @staticmethod
+    def _supply_chain_summary(report: SupplyChainReport) -> dict[str, object]:
+        return {
+            "status": report.status,
+            "passed": report.passed,
+            "components_count": report.components_count,
+            "package_managers": report.package_managers,
+            "missing_lockfiles": report.missing_lockfiles,
+            "findings": [finding.model_dump(mode="json") for finding in report.findings[:50]],
+            "recommendations": report.recommendations,
         }
 
     def preflight(self, mode: str, *, enforce: bool = True) -> object:
@@ -200,12 +253,14 @@ class Orchestrator:
                 )
                 mr_result = {"status": "skipped", "reason": "push_agent_branches_enabled is false or dry-run is active"}
             decision = self.review_and_gate(task)
+            provenance = self.provenance() if self.config.provenance_enabled else None
             result = {
                 "run_id": self.run_id,
                 "status": "passed" if decision.allowed else "blocked",
                 "implementation": implementation.model_dump(mode="json"),
                 "merge_request": mr_result,
                 "gate": decision.model_dump(mode="json"),
+                "provenance": provenance.model_dump(mode="json") if provenance else None,
             }
             self.audit.emit(
                 agent="orchestrator",
@@ -225,6 +280,7 @@ class Orchestrator:
         diff_text = git_tool.diff(base_ref)
         diff_stats = git_tool.diff_stats(base_ref, self.config.protected_paths)
         risk = assess_risk(task, diff_stats.changed_files, diff_text)
+        supply_chain = self.supply_chain() if self.config.supply_chain_enabled else None
         with self.audit.span(agent="functional_test", action="run_tests"):
             functional = FunctionalTestAgent(file_tool, test_tool).run()
         self.artifacts.write_json("functional_test_report", functional)
@@ -254,6 +310,7 @@ class Orchestrator:
                 build_security=build_security,
                 quality_review=quality_review,
                 security_review=security_review,
+                supply_chain=supply_chain,
                 rollback_plan=rollback_plan,
                 direct_main_push=direct_main_push,
             )

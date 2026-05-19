@@ -76,6 +76,9 @@ data:
     max_index_files: 5000
     max_index_file_bytes: 250000
     max_index_todos: 200
+    supply_chain_enabled: true
+    provenance_enabled: true
+    require_lockfiles_for_merge: false
 
     max_changed_files: 20
     max_added_lines: 500

@@ -133,7 +133,7 @@ Linux:
 Aktueller Stand:
 
 ```text
-34 passed
+37 passed
 ```
 
 ### Lokale CLI-Nutzung
@@ -144,6 +144,8 @@ Nach Aktivierung der virtuellen Umgebung:
 agentlab plan --config config.yaml
 agentlab index --config config.yaml
 agentlab steward --config config.yaml
+agentlab supply-chain --config config.yaml
+agentlab provenance --config config.yaml
 agentlab run-task --config config.yaml --task task.json
 agentlab full-flow --config config.yaml
 agentlab review-mr --config config.yaml --mr-id 123
@@ -182,6 +184,30 @@ agentlab steward --config config.yaml
 ```
 
 Dieser Report ist als Grundlage fuer spaetere autonome Wartung gedacht. Er zeigt, welche Aufgaben als naechstes sinnvoll waeren, ohne sofort Code zu aendern.
+
+### Supply Chain und Provenance
+
+AgentLab erzeugt zusaetzlich eine lokale Supply-Chain-Sicht. Sie orientiert sich an CycloneDX fuer maschinenlesbare Software-Inventare und an SLSA/In-Toto fuer Build-/Run-Provenance.
+
+```bash
+agentlab supply-chain --config config.yaml
+agentlab provenance --config config.yaml
+```
+
+`supply-chain` liest bekannte Manifeste wie `pyproject.toml`, `requirements.txt`, `package.json`, `go.mod` und `Cargo.toml`, extrahiert Abhaengigkeiten und schreibt:
+
+- `supply_chain_report.json`
+- `sbom_cyclonedx.json`
+
+Dabei werden fehlende Lockfiles als Findings markiert. Standardmaessig blockieren sie nicht. Wenn du spaeter strenger werden willst:
+
+```yaml
+require_lockfiles_for_merge: true
+```
+
+Dann blockiert der Gatekeeper Merge-Freigaben, wenn Dependency-Manifeste ohne passenden Lockfile erkannt werden.
+
+`provenance` schreibt `run_provenance.json` mit Run-ID, Git-Commit, Dirty-State, redigiertem Config-Hash, Artefakt-Hashes und Policy-Grenzen. Das ist noch keine signierte Attestation, aber ein sinnvoller naechster Schritt Richtung verifizierbarer Runs.
 
 ### Image lokal bauen
 
@@ -358,6 +384,8 @@ Vor echter Nutzung muss `task.example.configmap.yaml` durch einen freigegebenen 
 - MR Agent: erstellt oder aktualisiert GitLab Merge Requests mit Zusammenfassung, Checkliste, Risiko, Tests und Rollback-Hinweisen.
 - Functional Test Agent: erkennt typische Testkommandos wie `python -m pytest`, `npm test`, `pnpm test`, `go test ./...` und `cargo test`.
 - Build and Security Test Agent: fuehrt Docker-/Compose-Pruefungen nur aus, wenn sie aktiviert sind. Optionale Scanner wie `trivy`, `gitleaks`, `semgrep`, `bandit` und `npm audit` werden genutzt, wenn sie vorhanden sind.
+- Supply Chain Analyzer: erzeugt ein CycloneDX-artiges SBOM, prueft Lockfile-Abdeckung und liefert Findings an den Gatekeeper.
+- Provenance Builder: erzeugt eine SLSA/In-Toto-inspirierte Run-Provenance mit Git-, Config- und Artefakt-Hashes.
 - Code Quality Review Agent: prueft Lesbarkeit, Wartbarkeit, Fehlerbehandlung, Testqualitaet und unnoetige Aenderungen.
 - Security and Architecture Review Agent: prueft Secrets, Auth, Injection-Risiken, Dockerfile-Risiken, Dependency-Risiken und Architekturbrueche.
 - Gatekeeper: deterministische Policy Engine. Merge- und Direct-Main-Entscheidungen sind keine reine LLM-Entscheidung.
@@ -423,6 +451,9 @@ Wichtige Run-Artefakte:
 - `architecture_summary.json`
 - `steward_report.json`
 - `backlog.json`
+- `supply_chain_report.json`
+- `sbom_cyclonedx.json`
+- `run_provenance.json`
 - `plan.json`
 - `implementation_report.json`
 - `functional_test_report.json`
@@ -471,6 +502,7 @@ Der Preflight prueft unter anderem:
 - Live-Status landet unter `workspace_root/<run_id>/status.json`.
 - Live-Events landen unter `workspace_root/<run_id>/events.jsonl`.
 - Persistente Reports landen unter `workspace_root/<run_id>/artifacts/`.
+- SBOM- und Provenance-Artefakte werden pro Run erzeugt, wenn `supply_chain_enabled` und `provenance_enabled` aktiv sind.
 
 ## Docker Builds im Cluster
 
@@ -488,6 +520,17 @@ Der Grund: Ein Mount von `/var/run/docker.sock` waere praktisch, aber sicherheit
 - dedizierter externer Build Runner
 - GitLab CI Pipeline als Build-Gate
 
+## Recherchebasis fuer diese Sicherheitsrichtung
+
+Die aktuelle Richtung orientiert sich an folgenden Primaerquellen:
+
+- GitLab Merge Request Approvals und Approval API fuer nachvollziehbare Review-Gates.
+- GitLab Pipeline API fuer spaetere Pipeline-/Recovery-Gates.
+- Kubernetes Pod Security Standards, insbesondere das `Restricted`-Profil.
+- Kubernetes Seccomp-Dokumentation mit `RuntimeDefault`.
+- SLSA Specification v1.2 fuer Provenance- und Supply-Chain-Evidence.
+- OWASP CycloneDX SBOM-Spezifikation fuer maschinenlesbare Software-Inventare.
+
 ## Naechste Ausbaustufen
 
 - AgentLab Image in deine interne Registry pushen.
@@ -495,5 +538,6 @@ Der Grund: Ein Mount von `/var/run/docker.sock` waere praktisch, aber sicherheit
 - Netzwerkpfade vom Kubernetes-Cluster zu GitLab und Ollama pruefen.
 - Erst `job-plan.yaml`, dann `job-dry-run.yaml` ausfuehren.
 - Whole-Repo-Index regelmaessig erzeugen und Steward-Backlog als Governance-Basis verwenden.
+- SBOM und Provenance in MR-Kommentare oder externe Evidence Stores uebertragen.
 - Danach einen echten Low-Risk Task als ConfigMap mounten und `job-run-task.yaml` testen.
 - Spaeter: Controller bauen, der Jobs dynamisch erzeugt und Artefakte/MR-Kommentare zentral verwaltet.

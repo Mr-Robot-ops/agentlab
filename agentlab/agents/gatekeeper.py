@@ -7,6 +7,7 @@ from agentlab.models import (
     GateDecision,
     ReviewReport,
     RiskAssessment,
+    SupplyChainReport,
     TestReport,
 )
 from agentlab.policies.policy_engine import PolicyEngine
@@ -29,6 +30,7 @@ class Gatekeeper:
         quality_review: ReviewReport,
         security_review: ReviewReport,
         rollback_plan: str | None,
+        supply_chain: SupplyChainReport | None = None,
         direct_main_push: bool = False,
     ) -> GateDecision:
         return self.policy_engine.evaluate(
@@ -39,6 +41,7 @@ class Gatekeeper:
             build_security=build_security,
             quality_review=quality_review,
             security_review=security_review,
+            supply_chain=supply_chain,
             rollback_plan=rollback_plan,
             direct_main_push=direct_main_push,
         )

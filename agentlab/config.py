@@ -67,6 +67,9 @@ class AppConfig(BaseModel):
     max_index_files: int = Field(default=5000, ge=1)
     max_index_file_bytes: int = Field(default=250_000, ge=1)
     max_index_todos: int = Field(default=200, ge=0)
+    supply_chain_enabled: bool = True
+    provenance_enabled: bool = True
+    require_lockfiles_for_merge: bool = False
     max_changed_files: int = Field(default=20, ge=1)
     max_added_lines: int = Field(default=500, ge=1)
     max_deleted_lines: int = Field(default=500, ge=1)

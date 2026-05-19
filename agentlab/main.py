@@ -41,6 +41,22 @@ def steward(config: Path = typer.Option(..., "--config", exists=True, readable=T
     _json_echo({"run_id": orchestrator.run_id, "steward": result.model_dump(mode="json")})
 
 
+@app.command("supply-chain")
+def supply_chain(config: Path = typer.Option(..., "--config", exists=True, readable=True)) -> None:
+    cfg = load_config(config)
+    orchestrator = Orchestrator(cfg)
+    result = orchestrator.supply_chain()
+    _json_echo({"run_id": orchestrator.run_id, "supply_chain": result.model_dump(mode="json")})
+
+
+@app.command()
+def provenance(config: Path = typer.Option(..., "--config", exists=True, readable=True)) -> None:
+    cfg = load_config(config)
+    orchestrator = Orchestrator(cfg)
+    result = orchestrator.provenance()
+    _json_echo({"run_id": orchestrator.run_id, "provenance": result.model_dump(mode="json")})
+
+
 @app.command()
 def plan(config: Path = typer.Option(..., "--config", exists=True, readable=True)) -> None:
     cfg = load_config(config)

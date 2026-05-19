@@ -10,6 +10,7 @@ from agentlab.models import (
     ReportStatus,
     ReviewReport,
     RiskAssessment,
+    SupplyChainReport,
     TestReport,
     Verdict,
 )
@@ -30,6 +31,7 @@ class PolicyEngine:
         quality_review: ReviewReport,
         security_review: ReviewReport,
         rollback_plan: str | None,
+        supply_chain: SupplyChainReport | None = None,
         direct_main_push: bool = False,
     ) -> GateDecision:
         mode = "direct_main_push" if direct_main_push else "merge_request"
@@ -103,6 +105,22 @@ class PolicyEngine:
         )
         self._check(checks, blockers, "no_secrets", not diff_stats.secrets_touched, "secrets touched")
 
+        if supply_chain is not None:
+            self._check(
+                checks,
+                blockers,
+                "supply_chain_passed",
+                supply_chain.passed,
+                "supply chain analysis did not pass",
+            )
+            self._check(
+                checks,
+                blockers,
+                "lockfiles_present",
+                not self.config.require_lockfiles_for_merge or not supply_chain.missing_lockfiles,
+                "dependency lockfiles missing: " + ", ".join(supply_chain.missing_lockfiles),
+            )
+
         if self.config.require_two_testers:
             executed_commands = {result.command for result in functional_tests.commands}
             missing_required_tests = [
@@ -151,6 +169,12 @@ class PolicyEngine:
             for finding in build_security.findings
             if finding.blocked or finding.severity == FindingSeverity.CRITICAL
         ]
+        if supply_chain is not None:
+            critical_findings.extend(
+                finding
+                for finding in supply_chain.findings
+                if finding.blocked or finding.severity == FindingSeverity.CRITICAL
+            )
         self._check(
             checks,
             blockers,

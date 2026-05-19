@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from typing import Any
+from urllib.parse import quote
 
 from agentlab.config import AppConfig
 from agentlab.models import MergeRequestInfo
@@ -59,9 +60,31 @@ class GitLabTool:
         pipeline = self.project.pipelines.get(pipelines[0].id)
         return {"id": pipeline.id, "status": pipeline.status, "web_url": getattr(pipeline, "web_url", None)}
 
+    def get_latest_pipeline_status(self, ref: str) -> dict[str, Any]:
+        project_id = quote(str(self.config.project_id), safe="")
+        try:
+            pipeline = self.client.http_get(f"/projects/{project_id}/pipelines/latest", query_data={"ref": ref})
+        except Exception as exc:
+            return {"status": "missing", "error": str(exc)}
+        return {
+            "id": pipeline.get("id"),
+            "status": pipeline.get("status"),
+            "web_url": pipeline.get("web_url"),
+            "ref": pipeline.get("ref"),
+            "sha": pipeline.get("sha"),
+        }
+
     def trigger_pipeline(self, ref: str) -> dict[str, Any]:
         pipeline = self.project.pipelines.create({"ref": ref})
         return {"id": pipeline.id, "status": pipeline.status, "web_url": getattr(pipeline, "web_url", None)}
+
+    def get_mr_approval_state(self, mr_iid: int) -> dict[str, Any]:
+        project_id = quote(str(self.config.project_id), safe="")
+        return self.client.http_get(f"/projects/{project_id}/merge_requests/{mr_iid}/approval_state")
+
+    def get_mr_approvals(self, mr_iid: int) -> dict[str, Any]:
+        project_id = quote(str(self.config.project_id), safe="")
+        return self.client.http_get(f"/projects/{project_id}/merge_requests/{mr_iid}/approvals")
 
     def merge_mr(self, mr_id: int, *, squash: bool = True) -> MergeRequestInfo:
         mr = self.project.mergerequests.get(mr_id)
