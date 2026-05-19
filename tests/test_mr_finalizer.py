@@ -21,10 +21,26 @@ from agentlab.services.mr_finalizer import MRFinalizer
 
 
 class FakeGitLabTool:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        pipeline_status: str = "success",
+        wait_status: str | None = None,
+        readiness: dict[str, object] | None = None,
+    ) -> None:
         self.comments: list[tuple[int, str]] = []
         self.labels: list[str] = []
         self.merge_called = False
+        self.wait_called = False
+        self.pipeline_status = pipeline_status
+        self.wait_status = wait_status
+        self.readiness = readiness or {
+            "state": "opened",
+            "draft": False,
+            "has_conflicts": False,
+            "detailed_merge_status": "mergeable",
+            "merge_status": "can_be_merged",
+        }
 
     def comment_mr(self, mr_id: int, body: str) -> None:
         self.comments.append((mr_id, body))
@@ -36,6 +52,16 @@ class FakeGitLabTool:
     def merge_mr_guarded(self, mr_id: int, *, squash: bool = True) -> MergeRequestInfo:
         self.merge_called = True
         return MergeRequestInfo(mr_id=1, iid=mr_id, title="MR", source_branch="agent/t1", target_branch="main")
+
+    def get_mr_merge_readiness(self, mr_id: int) -> dict[str, object]:
+        return self.readiness
+
+    def get_mr_pipeline_status(self, mr_id: int) -> dict[str, object]:
+        return {"status": self.pipeline_status, "web_url": "https://gitlab.example.com/pipeline/1"}
+
+    def wait_for_pipeline(self, *, mr_iid: int, timeout_seconds: int = 600) -> dict[str, object]:
+        self.wait_called = True
+        return {"status": self.wait_status or self.pipeline_status, "web_url": "https://gitlab.example.com/pipeline/2"}
 
 
 def config(**overrides: object) -> AppConfig:
@@ -91,3 +117,39 @@ def test_finalizer_auto_merges_only_when_gate_allows() -> None:
     assert result.auto_merge_attempted is True
     assert result.auto_merge_succeeded is True
     assert fake.merge_called is True
+    assert result.pipeline_status == "success"
+
+
+def test_finalizer_waits_for_running_pipeline_before_merge() -> None:
+    fake = FakeGitLabTool(pipeline_status="running", wait_status="success")
+    gate = GateDecision(allowed=True, mode="merge_request", verdict="allowed", risk_score=10)
+
+    result = MRFinalizer(config(auto_merge_enabled=True), fake).finalize(**inputs(gate))  # type: ignore[arg-type]
+
+    assert fake.wait_called is True
+    assert result.auto_merge_succeeded is True
+    assert result.pipeline_status == "success"
+
+
+def test_finalizer_blocks_auto_merge_when_pipeline_failed_and_comments_reason() -> None:
+    fake = FakeGitLabTool(pipeline_status="failed")
+    gate = GateDecision(allowed=True, mode="merge_request", verdict="allowed", risk_score=10)
+
+    result = MRFinalizer(config(auto_merge_enabled=True), fake).finalize(**inputs(gate))  # type: ignore[arg-type]
+
+    assert result.auto_merge_attempted is False
+    assert fake.merge_called is False
+    assert result.pipeline_status == "failed"
+    assert result.skipped_reason == "MR pipeline status is not mergeable: failed"
+    assert "MR pipeline status is not mergeable: failed" in fake.comments[-1][1]
+
+
+def test_finalizer_blocks_auto_merge_when_mr_is_draft() -> None:
+    fake = FakeGitLabTool(readiness={"state": "opened", "draft": True, "has_conflicts": False})
+    gate = GateDecision(allowed=True, mode="merge_request", verdict="allowed", risk_score=10)
+
+    result = MRFinalizer(config(auto_merge_enabled=True), fake).finalize(**inputs(gate))  # type: ignore[arg-type]
+
+    assert result.auto_merge_attempted is False
+    assert result.skipped_reason == "MR is draft"
+    assert fake.merge_called is False

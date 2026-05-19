@@ -45,3 +45,35 @@ volumes:
     )
 
     assert DockerSafetyScanner(tmp_path).scan_compose_file() == []
+
+
+def test_docker_safety_scanner_reports_runtime_and_secret_hints(tmp_path: Path) -> None:
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text(
+        """
+services:
+  app:
+    image: alpine
+    user: "0"
+    security_opt:
+      - seccomp=unconfined
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    environment:
+      API_KEY: example
+      NORMAL: value
+    env_file:
+      - .env
+""",
+        encoding="utf-8",
+    )
+
+    findings = DockerSafetyScanner(tmp_path).scan_compose_file()
+    by_title = {finding.title: finding for finding in findings}
+
+    assert by_title["Container runs as root"].blocked is False
+    assert by_title["Container runs as root"].severity == "high"
+    assert by_title["Unconfined security profile"].blocked is True
+    assert by_title["Host gateway exposed to container"].severity == "medium"
+    assert by_title["Secret-like environment variable name"].severity == "high"
+    assert by_title["Secret-like env_file referenced"].severity == "high"

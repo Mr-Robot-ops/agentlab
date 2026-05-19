@@ -9,6 +9,10 @@ from agentlab.config import AppConfig
 from agentlab.models import MergeRequestInfo
 
 
+MERGEABLE_DETAILED_STATUSES = {"mergeable", "can_be_merged"}
+MERGEABLE_STATUSES = {"can_be_merged"}
+
+
 class GitLabTool:
     def __init__(self, config: AppConfig) -> None:
         try:
@@ -160,6 +164,16 @@ class GitLabTool:
         project_id = quote(str(self.config.project_id), safe="")
         return self.client.http_get(f"/projects/{project_id}/merge_requests/{mr_iid}/approvals")
 
+    def get_mr_merge_readiness(self, mr_id: int) -> dict[str, Any]:
+        mr = self.project.mergerequests.get(mr_id)
+        return {
+            "state": getattr(mr, "state", None),
+            "draft": bool(getattr(mr, "draft", False)),
+            "has_conflicts": bool(getattr(mr, "has_conflicts", False)),
+            "detailed_merge_status": getattr(mr, "detailed_merge_status", None),
+            "merge_status": getattr(mr, "merge_status", None),
+        }
+
     def merge_mr(self, mr_id: int, *, squash: bool = True) -> MergeRequestInfo:
         mr = self.project.mergerequests.get(mr_id)
         mr.merge(squash=squash)
@@ -167,19 +181,31 @@ class GitLabTool:
 
     def merge_mr_guarded(self, mr_id: int, *, squash: bool = True) -> MergeRequestInfo:
         mr = self.project.mergerequests.get(mr_id)
+        self._assert_mr_mergeable(mr)
+        mr.merge(squash=squash)
+        refreshed = self.project.mergerequests.get(mr_id)
+        return self._mr_info(refreshed)
+
+    @staticmethod
+    def _assert_mr_mergeable(mr: Any) -> None:
+        state = getattr(mr, "state", None)
+        if state and state != "opened":
+            raise RuntimeError(f"refusing to merge MR with state: {state}")
         if getattr(mr, "draft", False):
             raise RuntimeError("refusing to merge draft MR")
         if getattr(mr, "has_conflicts", False):
             raise RuntimeError("refusing to merge MR with conflicts")
         detailed_status = getattr(mr, "detailed_merge_status", None)
         merge_status = getattr(mr, "merge_status", None)
-        if detailed_status and detailed_status not in {"mergeable", "can_be_merged", "not_open"}:
-            raise RuntimeError(f"MR is not mergeable: {detailed_status}")
-        if merge_status and merge_status not in {"can_be_merged", "unchecked", "checking"}:
-            raise RuntimeError(f"MR merge_status is not mergeable: {merge_status}")
-        mr.merge(squash=squash)
-        refreshed = self.project.mergerequests.get(mr_id)
-        return self._mr_info(refreshed)
+        if detailed_status:
+            if detailed_status not in MERGEABLE_DETAILED_STATUSES:
+                raise RuntimeError(f"MR detailed_merge_status is not mergeable: {detailed_status}")
+            return
+        if merge_status:
+            if merge_status not in MERGEABLE_STATUSES:
+                raise RuntimeError(f"MR merge_status is not mergeable: {merge_status}")
+            return
+        raise RuntimeError("MR mergeability is unknown")
 
     def get_latest_pipeline_jobs(self, ref: str, *, per_page: int = 20) -> list[dict[str, Any]]:
         pipeline_status = self.get_latest_pipeline_status(ref)

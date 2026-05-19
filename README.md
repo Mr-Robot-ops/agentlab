@@ -133,7 +133,7 @@ Linux:
 Aktueller Stand:
 
 ```text
-52 passed
+76 passed
 ```
 
 ### Lokale CLI-Nutzung
@@ -234,7 +234,7 @@ flowchart LR
 
 ### MR Finalization and Auto-Merge
 
-`MRFinalizer` schreibt nach dem Gate einen strukturierten Kommentar in den Merge Request. Dieser Kommentar enthaelt Task, Implementierungsstatus, Teststatus, Review-Verdicts, Risk Score, Diff-Statistiken, Blocker und Policy-Checks.
+`MRFinalizer` schreibt nach dem Gate einen strukturierten Kommentar in den Merge Request. Dieser Kommentar enthaelt Task, Implementierungsstatus, Teststatus, Review-Verdicts, Risk Score, Diff-Statistiken, Blocker, Pipeline-Status, Auto-Merge-Entscheidung, Run-ID und Policy-Checks.
 
 Auto-Merge wird nur versucht, wenn alle Bedingungen gleichzeitig erfuellt sind:
 
@@ -244,6 +244,14 @@ Auto-Merge wird nur versucht, wenn alle Bedingungen gleichzeitig erfuellt sind:
 - keine Gate-Blocker
 - Agent-Branch wurde gepusht
 - ein Merge Request existiert
+- Merge Request ist nicht draft
+- Merge Request hat keine Konflikte
+- GitLab meldet einen eindeutig mergebaren Zustand
+- die MR-Pipeline ist direkt vor dem Merge `success`
+
+Pipeline-Zustaende wie `pending`, `running`, `created`, `preparing` oder `waiting_for_resource` werden vor dem Merge abgewartet. Zustaende wie `failed`, `canceled`, `skipped`, `manual` oder `missing` blockieren Auto-Merge. Das ist wichtig: Ein Merge basiert nie nur auf lokal bestandenen Tests.
+
+`merge_mr_guarded` merged nur eindeutig mergebare GitLab-Zustaende. Draft-MRs, Konflikte, geschlossene MRs, `not_open`, `checking`, `unchecked` und unbekannte Mergeability werden blockiert. Bei uneindeutigen GitLab-Antworten wird nicht geraten.
 
 Warnung: Der sichere Default bleibt:
 
@@ -276,7 +284,9 @@ Direct-Main-Push laeuft nicht ueber ein LLM und nicht ueber `GitTool.push`. Er i
 - kein Dry Run
 - sauberer Workspace
 
-Die aktuelle sichere Zwischenstrategie ist: Default Branch aktualisieren, Agent-Commit per Cherry-Pick ohne Commit uebernehmen, finalen Diff erneut pruefen, required test commands erneut ausfuehren, dann mit Audit-ID/Task-ID/Risk-Score/Gate-Verdict committen und ohne Force Push pushen.
+Die aktuelle sichere Zwischenstrategie ist: Default Branch aktualisieren, Agent-Commit per Cherry-Pick ohne Commit uebernehmen, finalen Diff erneut pruefen, mit Audit-ID/Task-ID/Risk-Score/Gate-Verdict committen, required test commands erneut ausfuehren und erst danach ohne Force Push pushen.
+
+Wenn nach Cherry-Pick oder lokalem Commit etwas fehlschlaegt, fuehrt AgentLab keinen riskanten automatischen Reset aus. `direct_main_push_result.json` markiert dann, ob ein lokaler Commit existiert, und gibt eine Recovery-Empfehlung wie Inspektion und anschliessendes Zuruecksetzen auf `origin/main` nach menschlicher Pruefung.
 
 Warnung: Direct-Main-Push bleibt fuer produktive Repos hochsensibel und ist default aus:
 
@@ -307,8 +317,13 @@ Vor Compose-Operationen analysiert AgentLab die Compose-Datei lokal. Der Scanner
 - Mounts auf `/`, `/root`, `/home`, `/var/run/docker.sock`, `/etc`, `/var/lib`
 - `cap_add`
 - `devices`
+- `security_opt` mit `apparmor=unconfined` oder `seccomp=unconfined`
+
+Zusaetzlich erzeugt der Scanner nicht-blockierende Findings fuer riskante Signale wie `user: root`, `extra_hosts` mit `host-gateway`, secretartige Environment-Keys und `env_file`-Verweise auf `.env` oder secretartige Dateien.
 
 Findings werden in `BuildSecurityReport` aufgenommen und koennen den Gatekeeper blockieren.
+
+Compose-Dateipfade sind bewusst eingeschraenkt. `DockerTool` akzeptiert nur `docker-compose.yml`, `docker-compose.yaml`, `compose.yml` und `compose.yaml` direkt im Repo-Root. Absolute Pfade, Unterverzeichnisse und `..` werden abgelehnt, bevor ein Docker-Kommando gestartet wird.
 
 ### Image lokal bauen
 

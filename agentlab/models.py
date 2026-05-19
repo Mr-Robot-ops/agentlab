@@ -248,12 +248,28 @@ class MRFinalizationResult(StrictModel):
     status: ReportStatus
     actions: list[FinalizationAction] = Field(default_factory=list)
     mr: MergeRequestInfo | None = None
+    pipeline_status: str | None = None
+    pipeline_url: str | None = None
     auto_merge_attempted: bool = False
     auto_merge_succeeded: bool = False
     comment_posted: bool = False
     labels_applied: list[str] = Field(default_factory=list)
+    audit_id: str | None = None
+    direct_main_note: str | None = None
+    supply_chain_status: str | None = None
     skipped_reason: str | None = None
     errors: list[str] = Field(default_factory=list)
+
+
+class GateContext(StrictModel):
+    risk: RiskAssessment
+    diff_stats: DiffStats
+    functional_tests: TestReport
+    build_security: BuildSecurityReport
+    quality_review: ReviewReport
+    security_review: ReviewReport
+    rollback_plan: str
+    supply_chain: SupplyChainReport | None = None
 
 
 class PostMergeMonitorResult(StrictModel):
@@ -268,10 +284,12 @@ class PostMergeMonitorResult(StrictModel):
 class DirectMainPushResult(StrictModel):
     status: ReportStatus
     pushed: bool = False
+    local_commit_created: bool = False
     branch: str | None = None
     commit_sha: str | None = None
     actions: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+    recommended_recovery: str | None = None
     skipped_reason: str | None = None
 
 

@@ -9,6 +9,8 @@ from agentlab.tools.docker_safety import DockerSafetyScanner
 
 
 class DockerTool:
+    ALLOWED_COMPOSE_FILES = {"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}
+
     def __init__(self, repo_path: str | Path, config: AppConfig) -> None:
         self.repo_path = Path(repo_path).resolve()
         self.config = config
@@ -26,6 +28,7 @@ class DockerTool:
         )
 
     def docker_compose_config(self, compose_file: str = "docker-compose.yml") -> CommandResult:
+        compose_file = self._safe_compose_file(compose_file)
         if not (self.repo_path / compose_file).exists():
             return CommandResult(command="docker compose config", cwd=str(self.repo_path), exit_code=0, stderr="compose file not present")
         findings = self.safety.scan_compose_file(compose_file)
@@ -43,6 +46,7 @@ class DockerTool:
         )
 
     def docker_compose_up(self, compose_file: str = "docker-compose.yml") -> CommandResult:
+        compose_file = self._safe_compose_file(compose_file)
         findings = self.safety.scan_compose_file(compose_file)
         if any(finding.blocked for finding in findings):
             return CommandResult(
@@ -58,14 +62,24 @@ class DockerTool:
         )
 
     def docker_logs(self, service: str | None = None, compose_file: str = "docker-compose.yml") -> CommandResult:
+        compose_file = self._safe_compose_file(compose_file)
         command = ["docker", "compose", "-f", compose_file, "logs", "--no-color"]
         if service:
             command.append(service)
         return run_subprocess(command, cwd=self.repo_path, timeout_seconds=self.config.command_timeout_seconds)
 
     def docker_down(self, compose_file: str = "docker-compose.yml") -> CommandResult:
+        compose_file = self._safe_compose_file(compose_file)
         return run_subprocess(
             ["docker", "compose", "-f", compose_file, "down"],
             cwd=self.repo_path,
             timeout_seconds=self.config.command_timeout_seconds,
         )
+
+    def _safe_compose_file(self, compose_file: str) -> str:
+        path = Path(compose_file)
+        if path.is_absolute() or ".." in path.parts:
+            raise ToolError("unsafe compose file path")
+        if compose_file not in self.ALLOWED_COMPOSE_FILES:
+            raise ToolError("compose file is not allowlisted")
+        return compose_file

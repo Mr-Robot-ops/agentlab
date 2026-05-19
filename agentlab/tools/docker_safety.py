@@ -9,6 +9,7 @@ from agentlab.models import Finding, FindingSeverity
 
 
 BLOCKED_VOLUME_TARGETS = ("/", "/root", "/home", "/var/run/docker.sock", "/etc", "/var/lib")
+SECRET_ENV_HINTS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY", "PRIVATE_KEY")
 
 
 class DockerSafetyScanner:
@@ -54,6 +55,34 @@ class DockerSafetyScanner:
             findings.append(self._blocked(path, "Linux capabilities added", "cap_add requires explicit policy support and is blocked."))
         if service.get("devices"):
             findings.append(self._blocked(path, "Host devices mounted", "devices entries require explicit policy support and are blocked."))
+        user = str(service.get("user", "")).strip().lower()
+        if user in {"0", "root"}:
+            findings.append(
+                self._finding(
+                    path,
+                    "Container runs as root",
+                    "user is root/0. Prefer an explicit non-root UID for agent-managed workloads.",
+                    FindingSeverity.HIGH,
+                    blocked=False,
+                )
+            )
+        for option in service.get("security_opt", []) or []:
+            normalized = str(option).lower()
+            if normalized in {"apparmor=unconfined", "seccomp=unconfined"}:
+                findings.append(self._blocked(path, "Unconfined security profile", f"security_opt {option} is not allowed."))
+        for host in service.get("extra_hosts", []) or []:
+            if "host-gateway" in str(host).lower():
+                findings.append(
+                    self._finding(
+                        path,
+                        "Host gateway exposed to container",
+                        f"extra_hosts entry uses host-gateway: {host}",
+                        FindingSeverity.MEDIUM,
+                        blocked=False,
+                    )
+                )
+        findings.extend(self._scan_environment(path, service.get("environment")))
+        findings.extend(self._scan_env_files(path, service.get("env_file")))
         for volume in service.get("volumes", []) or []:
             target = self._volume_target(volume)
             source = self._volume_source(volume)
@@ -63,6 +92,46 @@ class DockerSafetyScanner:
                         path,
                         "Unsafe compose volume mount",
                         f"Volume mount touches blocked host/container path: {volume}",
+                    )
+                )
+        return findings
+
+    def _scan_environment(self, path: str, environment: Any) -> list[Finding]:
+        keys: list[str] = []
+        if isinstance(environment, dict):
+            keys = [str(key) for key in environment]
+        elif isinstance(environment, list):
+            for item in environment:
+                key = str(item).split("=", 1)[0]
+                if key:
+                    keys.append(key)
+        return [
+            self._finding(
+                path,
+                "Secret-like environment variable name",
+                f"Environment key looks secret-like: {key}",
+                FindingSeverity.HIGH,
+                blocked=False,
+            )
+            for key in keys
+            if any(hint in key.upper() for hint in SECRET_ENV_HINTS)
+        ]
+
+    def _scan_env_files(self, path: str, env_file: Any) -> list[Finding]:
+        if env_file is None:
+            return []
+        values = env_file if isinstance(env_file, list) else [env_file]
+        findings = []
+        for value in values:
+            text = str(value).lower()
+            if text.endswith(".env") or "secret" in text or "token" in text or "password" in text:
+                findings.append(
+                    self._finding(
+                        path,
+                        "Secret-like env_file referenced",
+                        f"env_file points to a secret-like file: {value}",
+                        FindingSeverity.HIGH,
+                        blocked=False,
                     )
                 )
         return findings
@@ -99,11 +168,15 @@ class DockerSafetyScanner:
 
     @staticmethod
     def _blocked(path: str, title: str, description: str) -> Finding:
+        return DockerSafetyScanner._finding(path, title, description, FindingSeverity.CRITICAL, blocked=True)
+
+    @staticmethod
+    def _finding(path: str, title: str, description: str, severity: FindingSeverity, *, blocked: bool) -> Finding:
         return Finding(
             tool="docker-safety",
-            severity=FindingSeverity.CRITICAL,
+            severity=severity,
             title=title,
             path=path,
             description=description,
-            blocked=True,
+            blocked=blocked,
         )

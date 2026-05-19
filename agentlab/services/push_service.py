@@ -52,6 +52,8 @@ class PushService:
             return DirectMainPushResult(status=ReportStatus.SKIPPED, errors=errors, skipped_reason="; ".join(errors))
 
         actions: list[str] = []
+        commit_sha: str | None = None
+        local_commit_created = False
         if self.dry_run:
             return DirectMainPushResult(status=ReportStatus.SKIPPED, actions=["dry-run"], skipped_reason="dry-run is active")
 
@@ -76,6 +78,7 @@ class PushService:
             commit_sha = self.git_tool.commit_direct_main(message)
             if not commit_sha:
                 raise RuntimeError("no direct-main changes to commit")
+            local_commit_created = True
             actions.append(f"commit {commit_sha}")
             self._run_required_tests()
             if self.git_tool.status_porcelain():
@@ -87,6 +90,7 @@ class PushService:
             return DirectMainPushResult(
                 status=ReportStatus.PASSED,
                 pushed=True,
+                local_commit_created=True,
                 branch=self.config.default_branch,
                 commit_sha=commit_sha,
                 actions=actions,
@@ -95,8 +99,11 @@ class PushService:
             return DirectMainPushResult(
                 status=ReportStatus.FAILED,
                 branch=self.config.default_branch,
+                local_commit_created=local_commit_created,
+                commit_sha=commit_sha,
                 actions=actions,
                 errors=[str(exc)],
+                recommended_recovery=self._recommended_recovery(local_commit_created),
             )
 
     def _preflight_errors(
@@ -154,6 +161,12 @@ class PushService:
             result = self.test_tool.run_command(command)
             if not result.ok:
                 raise RuntimeError(f"required test failed before direct-main push: {command}")
+
+    @staticmethod
+    def _recommended_recovery(local_commit_created: bool) -> str:
+        if local_commit_created:
+            return "A local direct-main commit was created but not pushed; inspect it, then reset local branch to origin/main after inspection if needed."
+        return "Inspect the working tree and cherry-pick state; abort cherry-pick or reset local branch only after human review."
 
     @staticmethod
     def _commit_message(task: AgentTask, gate: GateDecision, audit_id: str) -> str:
