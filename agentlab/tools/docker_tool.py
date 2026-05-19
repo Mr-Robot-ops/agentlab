@@ -5,12 +5,14 @@ from pathlib import Path
 from agentlab.config import AppConfig
 from agentlab.models import CommandResult
 from agentlab.tools.common import ToolError, run_subprocess
+from agentlab.tools.docker_safety import DockerSafetyScanner
 
 
 class DockerTool:
     def __init__(self, repo_path: str | Path, config: AppConfig) -> None:
         self.repo_path = Path(repo_path).resolve()
         self.config = config
+        self.safety = DockerSafetyScanner(self.repo_path)
 
     def docker_build(self, tag: str = "agentlab-local:latest", dockerfile: str = "Dockerfile") -> CommandResult:
         if not (self.repo_path / dockerfile).exists():
@@ -26,6 +28,14 @@ class DockerTool:
     def docker_compose_config(self, compose_file: str = "docker-compose.yml") -> CommandResult:
         if not (self.repo_path / compose_file).exists():
             return CommandResult(command="docker compose config", cwd=str(self.repo_path), exit_code=0, stderr="compose file not present")
+        findings = self.safety.scan_compose_file(compose_file)
+        if any(finding.blocked for finding in findings):
+            return CommandResult(
+                command="docker compose config",
+                cwd=str(self.repo_path),
+                exit_code=126,
+                stderr="compose safety policy blocked: " + "; ".join(finding.title for finding in findings if finding.blocked),
+            )
         return run_subprocess(
             ["docker", "compose", "-f", compose_file, "config"],
             cwd=self.repo_path,
@@ -33,6 +43,14 @@ class DockerTool:
         )
 
     def docker_compose_up(self, compose_file: str = "docker-compose.yml") -> CommandResult:
+        findings = self.safety.scan_compose_file(compose_file)
+        if any(finding.blocked for finding in findings):
+            return CommandResult(
+                command="docker compose up",
+                cwd=str(self.repo_path),
+                exit_code=126,
+                stderr="compose safety policy blocked: " + "; ".join(finding.title for finding in findings if finding.blocked),
+            )
         return run_subprocess(
             ["docker", "compose", "-f", compose_file, "up", "-d"],
             cwd=self.repo_path,

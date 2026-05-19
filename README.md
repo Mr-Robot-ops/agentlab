@@ -133,7 +133,7 @@ Linux:
 Aktueller Stand:
 
 ```text
-37 passed
+52 passed
 ```
 
 ### Lokale CLI-Nutzung
@@ -208,6 +208,107 @@ require_lockfiles_for_merge: true
 Dann blockiert der Gatekeeper Merge-Freigaben, wenn Dependency-Manifeste ohne passenden Lockfile erkannt werden.
 
 `provenance` schreibt `run_provenance.json` mit Run-ID, Git-Commit, Dirty-State, redigiertem Config-Hash, Artefakt-Hashes und Policy-Grenzen. Das ist noch keine signierte Attestation, aber ein sinnvoller naechster Schritt Richtung verifizierbarer Runs.
+
+## Post-Gate Integration
+
+Nach Tests, Reviews und Gatekeeper endet `full-flow` nicht mehr bei der Entscheidung. AgentLab erzeugt danach strukturierte Integrationsartefakte:
+
+- `mr_finalization_result.json`
+- `direct_main_push_result.json`
+- `post_merge_monitor.json`
+
+Der Ablauf:
+
+```mermaid
+flowchart LR
+    Plan["Plan"] --> Implement["Implement"]
+    Implement --> MR["MR"]
+    MR --> Tests["Tests"]
+    Tests --> Reviews["Reviews"]
+    Reviews --> Gate["Gatekeeper"]
+    Gate --> Finalizer["MRFinalizer"]
+    Gate --> Push["PushService"]
+    Finalizer --> Monitor["Monitor/Recovery"]
+    Push --> Monitor
+```
+
+### MR Finalization and Auto-Merge
+
+`MRFinalizer` schreibt nach dem Gate einen strukturierten Kommentar in den Merge Request. Dieser Kommentar enthaelt Task, Implementierungsstatus, Teststatus, Review-Verdicts, Risk Score, Diff-Statistiken, Blocker und Policy-Checks.
+
+Auto-Merge wird nur versucht, wenn alle Bedingungen gleichzeitig erfuellt sind:
+
+- `auto_merge_enabled: true`
+- Gate ist erlaubt
+- Gate-Modus ist `merge_request`
+- keine Gate-Blocker
+- Agent-Branch wurde gepusht
+- ein Merge Request existiert
+
+Warnung: Der sichere Default bleibt:
+
+```yaml
+auto_merge_enabled: false
+push_agent_branches_enabled: false
+```
+
+Beispiel fuer ein bewusst aktiviertes MR-Setup:
+
+```yaml
+push_agent_branches_enabled: true
+auto_merge_enabled: true
+direct_main_push_enabled: false
+```
+
+### Direct Main Push via PushService
+
+Direct-Main-Push laeuft nicht ueber ein LLM und nicht ueber `GitTool.push`. Er ist auf den separaten `PushService` beschraenkt. Dieser Service prueft deterministisch:
+
+- `direct_main_push_enabled: true`
+- Gate-Modus `direct_main_push`
+- Risk Score unter `max_risk_score_for_direct_main_push`
+- keine protected paths
+- keine Secrets
+- Functional Tests passed
+- Build/Security Tests passed
+- beide Reviews approved
+- Rollback-Plan vorhanden
+- kein Dry Run
+- sauberer Workspace
+
+Die aktuelle sichere Zwischenstrategie ist: Default Branch aktualisieren, Agent-Commit per Cherry-Pick ohne Commit uebernehmen, finalen Diff erneut pruefen, required test commands erneut ausfuehren, dann mit Audit-ID/Task-ID/Risk-Score/Gate-Verdict committen und ohne Force Push pushen.
+
+Warnung: Direct-Main-Push bleibt fuer produktive Repos hochsensibel und ist default aus:
+
+```yaml
+direct_main_push_enabled: false
+max_risk_score_for_direct_main_push: 10
+```
+
+Bewusst aktiviertes Beispiel nur fuer sehr kleine Low-Risk-Aenderungen:
+
+```yaml
+direct_main_push_enabled: true
+auto_merge_enabled: false
+push_agent_branches_enabled: false
+max_risk_score_for_direct_main_push: 10
+required_test_commands:
+  - "python -m pytest"
+```
+
+### Docker/Compose Safety Scanner
+
+Vor Compose-Operationen analysiert AgentLab die Compose-Datei lokal. Der Scanner blockiert Services mit:
+
+- `privileged: true`
+- `network_mode: host`
+- `pid: host`
+- `ipc: host`
+- Mounts auf `/`, `/root`, `/home`, `/var/run/docker.sock`, `/etc`, `/var/lib`
+- `cap_add`
+- `devices`
+
+Findings werden in `BuildSecurityReport` aufgenommen und koennen den Gatekeeper blockieren.
 
 ### Image lokal bauen
 
@@ -386,6 +487,9 @@ Vor echter Nutzung muss `task.example.configmap.yaml` durch einen freigegebenen 
 - Build and Security Test Agent: fuehrt Docker-/Compose-Pruefungen nur aus, wenn sie aktiviert sind. Optionale Scanner wie `trivy`, `gitleaks`, `semgrep`, `bandit` und `npm audit` werden genutzt, wenn sie vorhanden sind.
 - Supply Chain Analyzer: erzeugt ein CycloneDX-artiges SBOM, prueft Lockfile-Abdeckung und liefert Findings an den Gatekeeper.
 - Provenance Builder: erzeugt eine SLSA/In-Toto-inspirierte Run-Provenance mit Git-, Config- und Artefakt-Hashes.
+- MRFinalizer: kommentiert Merge Requests mit strukturierten Reports, setzt Labels und darf bei expliziter Policy Auto-Merge ausloesen.
+- PushService: einziger deterministischer Pfad fuer Direct-Main-Push; nutzt keine LLM-Entscheidung und keinen Force Push.
+- Docker/Compose Safety Scanner: blockiert riskante Compose-Optionen vor Build-/Security-Gates.
 - Code Quality Review Agent: prueft Lesbarkeit, Wartbarkeit, Fehlerbehandlung, Testqualitaet und unnoetige Aenderungen.
 - Security and Architecture Review Agent: prueft Secrets, Auth, Injection-Risiken, Dockerfile-Risiken, Dependency-Risiken und Architekturbrueche.
 - Gatekeeper: deterministische Policy Engine. Merge- und Direct-Main-Entscheidungen sind keine reine LLM-Entscheidung.
@@ -490,6 +594,10 @@ Der Preflight prueft unter anderem:
 - LLMs fuehren keine Shell-Kommandos aus.
 - Codeaenderungen laufen nur ueber validierte Unified Patches.
 - Implementation Agent committet nicht auf den Default Branch.
+- Direct-Main-Push ist ausschliesslich ueber `PushService` moeglich und bleibt default deaktiviert.
+- MR-Auto-Merge ist ausschliesslich nach Gatekeeper-Freigabe moeglich und bleibt default deaktiviert.
+- Shell-Kommandos laufen durch die zentrale CommandPolicy.
+- Docker Compose wird vor Compose-Operationen lokal auf gefaehrliche Optionen gescannt.
 - Kein Force Push.
 - Keine Policy-Aenderung waehrend eines Agent-Runs.
 - Kubernetes-Pods laufen als UID `10001`.

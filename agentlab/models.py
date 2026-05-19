@@ -47,6 +47,15 @@ class Verdict(str, Enum):
     BLOCKED = "blocked"
 
 
+class FinalizationAction(str, Enum):
+    COMMENTED = "commented"
+    LABELED = "labeled"
+    AUTO_MERGED = "auto_merged"
+    SKIPPED = "skipped"
+    BLOCKED = "blocked"
+    FAILED = "failed"
+
+
 class FindingSeverity(str, Enum):
     INFO = "info"
     LOW = "low"
@@ -233,6 +242,37 @@ class MergeRequestInfo(StrictModel):
     source_branch: str
     target_branch: str
     labels: list[str] = Field(default_factory=list)
+
+
+class MRFinalizationResult(StrictModel):
+    status: ReportStatus
+    actions: list[FinalizationAction] = Field(default_factory=list)
+    mr: MergeRequestInfo | None = None
+    auto_merge_attempted: bool = False
+    auto_merge_succeeded: bool = False
+    comment_posted: bool = False
+    labels_applied: list[str] = Field(default_factory=list)
+    skipped_reason: str | None = None
+    errors: list[str] = Field(default_factory=list)
+
+
+class PostMergeMonitorResult(StrictModel):
+    status: ReportStatus
+    ref: str | None = None
+    pipeline_status: str | None = None
+    pipeline_url: str | None = None
+    recommendation: str = ""
+    recovery: RollbackReport | None = None
+
+
+class DirectMainPushResult(StrictModel):
+    status: ReportStatus
+    pushed: bool = False
+    branch: str | None = None
+    commit_sha: str | None = None
+    actions: list[str] = Field(default_factory=list)
+    errors: list[str] = Field(default_factory=list)
+    skipped_reason: str | None = None
 
 
 class GateDecision(StrictModel):

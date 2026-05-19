@@ -74,6 +74,14 @@ def test_direct_main_push_disabled_by_default_blocks() -> None:
     assert "direct main push is disabled" in decision.blockers
 
 
+def test_direct_main_push_allowed_when_policy_enabled() -> None:
+    decision = PolicyEngine(config(direct_main_push_enabled=True)).evaluate(
+        **inputs(),
+        direct_main_push=True,
+    )  # type: ignore[arg-type]
+    assert decision.allowed is True
+
+
 def test_protected_paths_block() -> None:
     decision = PolicyEngine(config(auto_merge_enabled=True)).evaluate(
         **inputs(diff_stats=DiffStats(changed_files=["infra/prod/main.tf"], touched_protected_paths=["infra/prod/main.tf"]))

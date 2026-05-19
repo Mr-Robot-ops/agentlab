@@ -52,10 +52,28 @@ class GitTool:
             raise ToolError(result.stderr or "could not determine current branch")
         return result.stdout.strip()
 
+    def status_porcelain(self) -> str:
+        result = self._git(["status", "--porcelain"])
+        if not result.ok:
+            raise ToolError(result.stderr or "git status failed")
+        return result.stdout.strip()
+
+    def rev_parse(self, ref: str = "HEAD") -> str:
+        result = self._git(["rev-parse", ref])
+        if not result.ok:
+            raise ToolError(result.stderr or f"git rev-parse failed for {ref}")
+        return result.stdout.strip()
+
     def checkout(self, ref: str) -> CommandResult:
         if ref.startswith("-"):
             raise ToolError("unsafe git ref")
         return self._git(["checkout", ref])
+
+    def pull_ff_only(self, remote: str = "origin", branch: str | None = None) -> CommandResult:
+        target = branch or self.default_branch
+        if target.startswith("-"):
+            raise ToolError("unsafe git branch")
+        return self._git(["pull", "--ff-only", remote, target])
 
     def create_branch(self, branch: str, base: str | None = None) -> CommandResult:
         if not branch.startswith("agent/") or ".." in branch or branch.endswith(".lock"):
@@ -108,6 +126,14 @@ class GitTool:
     def commit(self, message: str) -> str | None:
         if self.current_branch() == self.default_branch:
             raise ToolError("refusing to commit on default branch")
+        return self._commit(message)
+
+    def commit_direct_main(self, message: str) -> str | None:
+        if self.current_branch() != self.default_branch:
+            raise ToolError("direct main commit must run on default branch")
+        return self._commit(message)
+
+    def _commit(self, message: str) -> str | None:
         if self.dry_run:
             return None
         add = self._git(["add", "-A"])
@@ -133,10 +159,21 @@ class GitTool:
             raise ToolError("only agent branches can be pushed")
         return self._git(["push", remote, branch])
 
-    def cherry_pick(self, commit_sha: str) -> CommandResult:
-        if self.current_branch() == self.default_branch:
+    def push_default_branch(self, remote: str = "origin") -> CommandResult:
+        if self.dry_run:
+            return CommandResult(command="git push default branch (dry-run)", cwd=str(self.repo_path), exit_code=0)
+        if self.current_branch() != self.default_branch:
+            raise ToolError("default branch push must run on default branch")
+        return self._git(["push", remote, self.default_branch])
+
+    def cherry_pick(self, commit_sha: str, *, no_commit: bool = False, allow_default_branch: bool = False) -> CommandResult:
+        if self.current_branch() == self.default_branch and not allow_default_branch:
             raise ToolError("refusing to cherry-pick on default branch")
-        return self._git(["cherry-pick", commit_sha])
+        args = ["cherry-pick"]
+        if no_commit:
+            args.append("--no-commit")
+        args.append(commit_sha)
+        return self._git(args)
 
     def revert(self, commit_sha: str, *, no_commit: bool = False) -> CommandResult:
         if self.current_branch() == self.default_branch:

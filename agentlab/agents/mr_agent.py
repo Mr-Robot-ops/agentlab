@@ -24,7 +24,7 @@ class MergeRequestAgent:
         labels = self.labels(task)
         if mr_id is not None:
             return self.gitlab_tool.update_mr(mr_id, title=title, description=description, labels=",".join(labels))
-        return self.gitlab_tool.create_mr(
+        return self.gitlab_tool.create_or_update_mr(
             source_branch=implementation.branch,
             target_branch=self.config.default_branch,
             title=title,

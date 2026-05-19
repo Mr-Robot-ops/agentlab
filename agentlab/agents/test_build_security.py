@@ -28,8 +28,13 @@ class BuildSecurityTestAgent:
 
     def run(self) -> BuildSecurityReport:
         files = set(self.file_tool.list_files())
-        docker_build = self.docker_tool.docker_build() if self.docker_build_enabled and "Dockerfile" in files else None
         compose_name = "docker-compose.yml" if "docker-compose.yml" in files else "compose.yaml"
+        compose_findings = (
+            self.docker_tool.safety.scan_compose_file(compose_name)
+            if self.docker_compose_enabled and compose_name in files
+            else []
+        )
+        docker_build = self.docker_tool.docker_build() if self.docker_build_enabled and "Dockerfile" in files else None
         compose_config = (
             self.docker_tool.docker_compose_config(compose_name)
             if self.docker_compose_enabled and compose_name in files
@@ -37,7 +42,7 @@ class BuildSecurityTestAgent:
         )
         scanner_commands = self._scanner_commands(files)
         scanner_results = [self.test_tool.run_command(command) for command in scanner_commands]
-        findings: list[Finding] = []
+        findings: list[Finding] = list(compose_findings)
         for result in scanner_results:
             output = (result.stdout + "\n" + result.stderr).lower()
             if result.exit_code != 0:

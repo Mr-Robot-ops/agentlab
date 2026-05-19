@@ -18,11 +18,15 @@ from agentlab.config import AppConfig
 from agentlab.models import (
     AgentTask,
     ArchitectureSummary,
+    DirectMainPushResult,
     GateDecision,
     ImplementationReport,
+    MRFinalizationResult,
     ProvenanceStatement,
     RepoIndex,
     ReportStatus,
+    RollbackReport,
+    PostMergeMonitorResult,
     StewardReport,
     SupplyChainReport,
     TaskPlan,
@@ -33,6 +37,8 @@ from agentlab.policies.risk import assess_risk
 from agentlab.provenance import ProvenanceBuilder
 from agentlab.repo_indexer import RepoIndexer
 from agentlab.repo_policy import apply_repo_policy, load_repo_policy
+from agentlab.services.mr_finalizer import MRFinalizer
+from agentlab.services.push_service import PushService
 from agentlab.steward import BacklogSteward
 from agentlab.supply_chain import SupplyChainAnalyzer
 from agentlab.tools.docker_tool import DockerTool
@@ -63,6 +69,7 @@ class Orchestrator:
         self.repo_index: RepoIndex | None = None
         self.architecture_summary: ArchitectureSummary | None = None
         self.supply_chain_report: SupplyChainReport | None = None
+        self.last_gate_context: dict[str, object] = {}
 
     def _tools(self) -> tuple[GitTool, FileTool, TestTool, DockerTool]:
         repo = self.config.target_repo_path
@@ -234,14 +241,17 @@ class Orchestrator:
                 )
                 return result
             mr_result: dict[str, object]
+            mr_info = None
+            gitlab_tool = None
             if self.config.push_agent_branches_enabled and not self.dry_run:
                 try:
+                    gitlab_tool = GitLabTool(self.config)
                     with self.audit.span(agent="mr_agent", action="create_or_update_mr"):
-                        mr = MergeRequestAgent(self.config, GitLabTool(self.config)).create_or_update(
+                        mr_info = MergeRequestAgent(self.config, gitlab_tool).create_or_update(
                             task=task,
                             implementation=implementation,
                         )
-                    mr_result = {"status": "created", "mr": mr.model_dump(mode="json")}
+                    mr_result = {"status": "created", "mr": mr_info.model_dump(mode="json")}
                 except Exception as exc:
                     mr_result = {"status": "failed", "error": str(exc)}
             else:
@@ -252,7 +262,15 @@ class Orchestrator:
                     metadata={"reason": "push_agent_branches_enabled is false or dry-run is active"},
                 )
                 mr_result = {"status": "skipped", "reason": "push_agent_branches_enabled is false or dry-run is active"}
-            decision = self.review_and_gate(task)
+            direct_main_mode = self.config.direct_main_push_enabled and not self.config.push_agent_branches_enabled
+            decision = self.review_and_gate(task, direct_main_push=direct_main_mode)
+            finalization = self._finalize_mr(task, implementation, decision, mr_info, gitlab_tool)
+            direct_push = (
+                self._direct_main_push(task, implementation, decision)
+                if direct_main_mode
+                else self._skipped_direct_main_push("direct_main_push_enabled is false or MR flow is active")
+            )
+            post_merge = self._post_merge_monitor(gitlab_tool, mr_info, finalization, direct_push)
             provenance = self.provenance() if self.config.provenance_enabled else None
             result = {
                 "run_id": self.run_id,
@@ -260,6 +278,9 @@ class Orchestrator:
                 "implementation": implementation.model_dump(mode="json"),
                 "merge_request": mr_result,
                 "gate": decision.model_dump(mode="json"),
+                "mr_finalization": finalization.model_dump(mode="json"),
+                "direct_main_push": direct_push.model_dump(mode="json") if direct_push else None,
+                "post_merge_monitor": post_merge.model_dump(mode="json"),
                 "provenance": provenance.model_dump(mode="json") if provenance else None,
             }
             self.audit.emit(
@@ -317,7 +338,120 @@ class Orchestrator:
         self.artifacts.write_json("risk_assessment", risk)
         self.artifacts.write_json("diff_stats", diff_stats)
         self.artifacts.write_json("gate_decision", decision)
+        self.last_gate_context = {
+            "risk": risk,
+            "diff_stats": diff_stats,
+            "functional_tests": functional,
+            "build_security": build_security,
+            "quality_review": quality_review,
+            "security_review": security_review,
+            "rollback_plan": rollback_plan,
+        }
         return decision
+
+    def _finalize_mr(
+        self,
+        task: AgentTask,
+        implementation: ImplementationReport,
+        decision: GateDecision,
+        mr_info: object | None,
+        gitlab_tool: GitLabTool | None,
+    ) -> MRFinalizationResult:
+        if gitlab_tool is None or mr_info is None:
+            result = MRFinalizationResult(
+                status=ReportStatus.SKIPPED,
+                skipped_reason="no merge request available; auto-merge skipped",
+            )
+            self.artifacts.write_json("mr_finalization_result", result)
+            return result
+        context = self.last_gate_context
+        with self.audit.span(agent="mr_finalizer", action="finalize"):
+            result = MRFinalizer(self.config, gitlab_tool).finalize(
+                task=task,
+                implementation=implementation,
+                functional_tests=context["functional_tests"],  # type: ignore[arg-type]
+                build_security=context["build_security"],  # type: ignore[arg-type]
+                quality_review=context["quality_review"],  # type: ignore[arg-type]
+                security_review=context["security_review"],  # type: ignore[arg-type]
+                risk=context["risk"],  # type: ignore[arg-type]
+                diff_stats=context["diff_stats"],  # type: ignore[arg-type]
+                gate=decision,
+                mr=mr_info,  # type: ignore[arg-type]
+            )
+        self.artifacts.write_json("mr_finalization_result", result)
+        return result
+
+    def _direct_main_push(
+        self,
+        task: AgentTask,
+        implementation: ImplementationReport,
+        decision: GateDecision,
+    ) -> DirectMainPushResult:
+        git_tool, _, test_tool, _ = self._tools()
+        context = self.last_gate_context
+        with self.audit.span(agent="push_service", action="direct_main_push"):
+            result = PushService(self.config, git_tool, test_tool, dry_run=self.dry_run).push_direct_main(
+                task=task,
+                implementation=implementation,
+                gate=decision,
+                diff_stats=context["diff_stats"],  # type: ignore[arg-type]
+                functional_tests=context["functional_tests"],  # type: ignore[arg-type]
+                build_security=context["build_security"],  # type: ignore[arg-type]
+                quality_review=context["quality_review"],  # type: ignore[arg-type]
+                security_review=context["security_review"],  # type: ignore[arg-type]
+                rollback_plan=context["rollback_plan"],  # type: ignore[arg-type]
+                audit_id=self.run_id,
+            )
+        self.artifacts.write_json("direct_main_push_result", result)
+        return result
+
+    def _skipped_direct_main_push(self, reason: str) -> DirectMainPushResult:
+        result = DirectMainPushResult(status=ReportStatus.SKIPPED, skipped_reason=reason)
+        self.artifacts.write_json("direct_main_push_result", result)
+        return result
+
+    def _post_merge_monitor(
+        self,
+        gitlab_tool: GitLabTool | None,
+        mr_info: object | None,
+        finalization: MRFinalizationResult,
+        direct_push: DirectMainPushResult | None,
+    ) -> PostMergeMonitorResult:
+        if finalization.auto_merge_succeeded and gitlab_tool is not None and mr_info is not None:
+            with self.audit.span(agent="post_merge_monitor", action="wait_for_default_branch_pipeline"):
+                pipeline = gitlab_tool.wait_for_pipeline(ref=self.config.default_branch, timeout_seconds=300)
+            result = PostMergeMonitorResult(
+                status=ReportStatus.PASSED if pipeline.get("status") == "success" else ReportStatus.FAILED,
+                ref=self.config.default_branch,
+                pipeline_status=pipeline.get("status"),
+                pipeline_url=pipeline.get("web_url"),
+                recommendation="Proceed" if pipeline.get("status") == "success" else "Inspect failed pipeline and run recovery.",
+            )
+            if result.status == ReportStatus.FAILED:
+                result = result.model_copy(update={"recovery": self._recovery_report(gitlab_tool, ref=self.config.default_branch)})
+        elif direct_push is not None and getattr(direct_push, "pushed", False) and gitlab_tool is not None:
+            with self.audit.span(agent="post_merge_monitor", action="wait_for_default_branch_pipeline"):
+                pipeline = gitlab_tool.wait_for_pipeline(ref=self.config.default_branch, timeout_seconds=300)
+            result = PostMergeMonitorResult(
+                status=ReportStatus.PASSED if pipeline.get("status") == "success" else ReportStatus.FAILED,
+                ref=self.config.default_branch,
+                pipeline_status=pipeline.get("status"),
+                pipeline_url=pipeline.get("web_url"),
+                recommendation="Proceed" if pipeline.get("status") == "success" else "Inspect failed pipeline and run recovery.",
+            )
+            if result.status == ReportStatus.FAILED:
+                result = result.model_copy(update={"recovery": self._recovery_report(gitlab_tool, ref=self.config.default_branch)})
+        else:
+            result = PostMergeMonitorResult(status=ReportStatus.SKIPPED, recommendation="No merge or direct push was performed.")
+        self.artifacts.write_json("post_merge_monitor", result)
+        return result
+
+    def _recovery_report(self, gitlab_tool: GitLabTool, *, ref: str | None = None) -> RollbackReport:
+        git_tool, _, _, _ = self._tools()
+        with self.audit.span(agent="rollback", action="post_merge_recover"):
+            report = RollbackRecoveryAgent(self.config, git_tool, gitlab_tool).recover(ref=ref)
+        self.artifacts.write_json("recovery_report", report)
+        return report
 
     def review_existing_mr(self, mr_id: int) -> dict[str, object]:
         gitlab_tool = GitLabTool(self.config)
