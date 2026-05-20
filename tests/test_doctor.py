@@ -85,6 +85,21 @@ def fake_git_config_run(values: dict[str, str]):
     return run
 
 
+class FakeSchedulerGitLab:
+    def __init__(self, *, fail: Exception | None = None) -> None:
+        self.fail = fail
+
+    def get_default_branch_head(self) -> str:
+        if self.fail:
+            raise self.fail
+        return "abc"
+
+    def list_open_agent_mrs(self) -> list[object]:
+        if self.fail:
+            raise self.fail
+        return []
+
+
 def test_doctor_detects_missing_token_and_prints_fix(tmp_path: Path) -> None:
     config = write_config(tmp_path)
 
@@ -151,6 +166,7 @@ def test_doctor_warns_for_missing_git_author_identity_in_safe_dry_run(tmp_path: 
         http_get=fake_http_get,
         which=lambda name: "git",
         run_command=fake_git_config_run({}),
+        gitlab_tool_factory=lambda cfg: FakeSchedulerGitLab(),
     ).run()
 
     check = next(check for check in report["checks"] if check["name"] == "git_author_identity")
@@ -248,3 +264,88 @@ def test_doctor_fails_when_scheduler_action_without_auto_approve(tmp_path: Path)
 
     check = next(check for check in report["checks"] if check["name"] == "schedule")
     assert check["status"] == "failed"
+
+
+def test_doctor_fails_scheduler_gitlab_check_on_404(tmp_path: Path) -> None:
+    config = write_config(tmp_path, project_id="re/project")
+    with config.open("a", encoding="utf-8") as handle:
+        handle.write("schedule:\n  enabled: true\n  action:\n    enabled: false\n")
+
+    report = Doctor(
+        config,
+        environ={
+            "GITLAB_TOKEN": "token",
+            "GIT_CONFIG_COUNT": "3",
+            "GIT_CONFIG_KEY_0": "credential.helper",
+            "GIT_CONFIG_VALUE_0": "helper",
+            "GIT_CONFIG_KEY_1": "user.name",
+            "GIT_CONFIG_VALUE_1": "AgentLab Bot",
+            "GIT_CONFIG_KEY_2": "user.email",
+            "GIT_CONFIG_VALUE_2": "agentlab-bot@example.local",
+        },
+        http_get=fake_http_get,
+        which=lambda name: "git",
+        run_command=fake_git_config_run({}),
+        gitlab_tool_factory=lambda cfg: FakeSchedulerGitLab(fail=RuntimeError("404 Project Not Found")),
+    ).run()
+
+    check = next(check for check in report["checks"] if check["name"] == "scheduler_gitlab")
+    assert check["status"] == "failed"
+    assert "project_id=re/project" in check["message"]
+    assert 'project_id: "5"' in check["remediation"]
+    assert "token" not in check["message"]
+
+
+def test_doctor_warns_for_non_numeric_project_id_when_schedule_enabled(tmp_path: Path) -> None:
+    config = write_config(tmp_path, project_id="re%2Fproject")
+    with config.open("a", encoding="utf-8") as handle:
+        handle.write("schedule:\n  enabled: true\n  action:\n    enabled: false\n")
+
+    report = Doctor(
+        config,
+        environ={
+            "GITLAB_TOKEN": "token",
+            "GIT_CONFIG_COUNT": "3",
+            "GIT_CONFIG_KEY_0": "credential.helper",
+            "GIT_CONFIG_VALUE_0": "helper",
+            "GIT_CONFIG_KEY_1": "user.name",
+            "GIT_CONFIG_VALUE_1": "AgentLab Bot",
+            "GIT_CONFIG_KEY_2": "user.email",
+            "GIT_CONFIG_VALUE_2": "agentlab-bot@example.local",
+        },
+        http_get=fake_http_get,
+        which=lambda name: "git",
+        run_command=fake_git_config_run({}),
+        gitlab_tool_factory=lambda cfg: FakeSchedulerGitLab(),
+    ).run()
+
+    check = next(check for check in report["checks"] if check["name"] == "scheduler_project_id")
+    assert check["status"] == "warning"
+    assert 'project_id: "5"' in check["remediation"]
+
+
+def test_doctor_does_not_warn_for_numeric_project_id_when_schedule_enabled(tmp_path: Path) -> None:
+    config = write_config(tmp_path, project_id="5")
+    with config.open("a", encoding="utf-8") as handle:
+        handle.write("schedule:\n  enabled: true\n  action:\n    enabled: false\n")
+
+    report = Doctor(
+        config,
+        environ={
+            "GITLAB_TOKEN": "token",
+            "GIT_CONFIG_COUNT": "3",
+            "GIT_CONFIG_KEY_0": "credential.helper",
+            "GIT_CONFIG_VALUE_0": "helper",
+            "GIT_CONFIG_KEY_1": "user.name",
+            "GIT_CONFIG_VALUE_1": "AgentLab Bot",
+            "GIT_CONFIG_KEY_2": "user.email",
+            "GIT_CONFIG_VALUE_2": "agentlab-bot@example.local",
+        },
+        http_get=fake_http_get,
+        which=lambda name: "git",
+        run_command=fake_git_config_run({}),
+        gitlab_tool_factory=lambda cfg: FakeSchedulerGitLab(),
+    ).run()
+
+    assert not any(check["name"] == "scheduler_project_id" for check in report["checks"])
+    assert any(check["name"] == "scheduler_gitlab" and check["status"] == "passed" for check in report["checks"])

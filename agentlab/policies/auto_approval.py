@@ -51,13 +51,13 @@ class AutoApprovalPolicy:
         updated_tasks = []
 
         for task in plan.tasks:
-            approved, reasons, updated_task = self._evaluate(task)
+            approved, reasons, details, updated_task = self._evaluate(task)
             updated_tasks.append(updated_task)
-            evaluated.append({"task_id": task.id, "approved": approved, "reasons": reasons})
+            evaluated.append({"task_id": task.id, "approved": approved, "reasons": reasons, "details": details})
             if approved:
                 approved_ids.append(task.id)
             else:
-                rejected.append({"task_id": task.id, "reasons": reasons})
+                rejected.append({"task_id": task.id, "reasons": reasons, "details": details})
 
         approved_tasks = [task for task in updated_tasks if task.approved]
         selected = self.select_task(approved_tasks)
@@ -87,10 +87,11 @@ class AutoApprovalPolicy:
             ),
         )[0]
 
-    def _evaluate(self, task: AgentTask) -> tuple[bool, list[str], AgentTask]:
+    def _evaluate(self, task: AgentTask) -> tuple[bool, list[str], dict[str, Any], AgentTask]:
         reasons: list[str] = []
+        details = self._details(task)
         if task.approved:
-            return True, ["already_approved"], self._with_metadata(task, False, ["already_approved"])
+            return True, ["already_approved"], details, self._with_metadata(task, False, ["already_approved"])
 
         if self.config.direct_main_push_enabled or self.config.auto_merge_enabled:
             reasons.append("unsafe_flow_flags_enabled")
@@ -122,7 +123,38 @@ class AutoApprovalPolicy:
             reasons.append("default_forbidden_actions_applied")
         updated = updated.model_copy(update={"approved": approved})
         updated = self._with_metadata(updated, approved, reasons)
-        return approved, reasons or ["approved_by_policy"], updated
+        return approved, reasons or ["approved_by_policy"], details, updated
+
+    def _details(self, task: AgentTask) -> dict[str, Any]:
+        matched_allowed = {
+            path: pattern
+            for path in task.affected_files
+            if (pattern := self._first_match(path, self.policy.allowed_paths)) is not None
+        }
+        blocked_matches = [
+            {"path": path, "pattern": pattern}
+            for path in task.affected_files
+            for pattern in [self._first_match(path, self.policy.blocked_paths)]
+            if pattern is not None
+        ]
+        disallowed = [path for path in task.affected_files if path not in matched_allowed]
+        return {
+            "affected_files": list(task.affected_files),
+            "disallowed_paths": disallowed,
+            "allowed_paths": list(self.policy.allowed_paths),
+            "matched_allowed_paths": matched_allowed,
+            "blocked_paths_matched": blocked_matches,
+            "risk_score": task.risk_score,
+            "max_risk_score": self.policy.max_risk_score,
+            "risk_level": task.risk_level.value,
+            "allowed_risk_levels": [RiskLevel.LOW.value, RiskLevel.MEDIUM.value],
+            "task_type": task.task_type.value,
+            "allowed_task_types": list(self.policy.allowed_task_types),
+            "max_changed_files": self.policy.max_changed_files,
+            "changed_files_count": len(task.affected_files),
+            "require_tests_for_code": self.policy.require_tests_for_code,
+            "test_requirements": list(task.test_requirements),
+        }
 
     def _with_metadata(self, task: AgentTask, approved: bool, reasons: list[str]) -> AgentTask:
         metadata = {
@@ -144,3 +176,11 @@ class AutoApprovalPolicy:
     def _matches_any(path: str, patterns: list[str]) -> bool:
         normalized = path.replace("\\", "/")
         return any(fnmatchcase(normalized, pattern) for pattern in patterns)
+
+    @staticmethod
+    def _first_match(path: str, patterns: list[str]) -> str | None:
+        normalized = path.replace("\\", "/")
+        for pattern in patterns:
+            if fnmatchcase(normalized, pattern):
+                return pattern
+        return None
