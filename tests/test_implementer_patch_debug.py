@@ -27,6 +27,7 @@ from agentlab.models import (
 from agentlab.orchestrator import Orchestrator
 from agentlab.tools.common import ToolError
 from agentlab.tools.file_tool import FileTool, PatchApplyError, UnifiedDiffValidationError, validate_unified_diff_structure
+from agentlab.tools.ollama_client import OllamaSchemaValidationError
 
 
 PATCH = """diff --git a/README.md b/README.md
@@ -130,6 +131,32 @@ class FakeOllama:
         proposal = self.proposals[self.calls]
         self.calls += 1
         return proposal, proposal.model_dump_json()
+
+
+class RawStructuredOllama:
+    def __init__(self, raw_response: str) -> None:
+        self.raw_response = raw_response
+        self.calls = 0
+        self.response_models: list[type[Any]] = []
+
+    def chat_json_with_raw(self, **kwargs: Any) -> tuple[Any, str]:
+        self.calls += 1
+        self.response_models.append(kwargs["response_model"])
+        model = kwargs["response_model"]
+        return model.model_validate_json(self.raw_response), self.raw_response
+
+
+class SchemaErrorOllama:
+    def __init__(self, raw_response: str, validation_error: str = "validation failed") -> None:
+        self.raw_response = raw_response
+        self.validation_error = validation_error
+
+    def chat_json_with_raw(self, **kwargs: Any) -> tuple[Any, str]:
+        raise OllamaSchemaValidationError(
+            model_name=kwargs["response_model"].__name__,
+            validation_error=self.validation_error,
+            raw_response=self.raw_response,
+        )
 
 
 def config(repo: Path) -> AppConfig:
@@ -312,6 +339,101 @@ def test_docs_task_uses_structured_edit_instead_of_patch(tmp_path: Path) -> None
     assert "structured_edit_raw_response.json" in report.patch_artifacts
     assert "structured_edit_proposal.json" in report.patch_artifacts
     assert "structured_edit_apply_report.json" in report.patch_artifacts
+
+
+def test_structured_edit_accepts_file_path_tool_aliases_and_writes_normalized_artifact(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    store = ArtifactStore(tmp_path / "run", "run")
+    git = FakeGitTool()
+    raw = json.dumps(
+        {
+            "task_id": "document-privileged-container-boundaries",
+            "summary": "structured docs",
+            "edits": [
+                {
+                    "file_path": "README.md",
+                    "tool": "replace",
+                    "old_text": "# AgentLab\n",
+                    "new_text": "# AgentLab\n\nMore docs\n",
+                }
+            ],
+            "expected_tests": [],
+            "risk_score": 1,
+            "rollback": "Revert README.md changes.",
+            "metadata": {},
+        }
+    )
+
+    report = ImplementationAgent(config(repo), git, FileTool(repo, config(repo)), RawStructuredOllama(raw), artifacts=store).implement(docs_task())
+
+    assert report.status == ReportStatus.PASSED
+    assert report.implementation_mode == "structured_edit"
+    assert git.committed is True
+    proposal_artifact = json.loads(read_artifact(store, "structured_edit_proposal.json"))
+    assert proposal_artifact["edits"][0]["path"] == "README.md"
+    assert proposal_artifact["edits"][0]["operation"] == "replace_text"
+    assert "file_path" not in proposal_artifact["edits"][0]
+    assert "tool" not in proposal_artifact["edits"][0]
+
+
+def test_structured_edit_schema_error_writes_artifacts_and_does_not_commit_or_push(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    store = ArtifactStore(tmp_path / "run", "run")
+    git = FakeGitTool()
+    raw = json.dumps(
+        {
+            "task_id": "document-privileged-container-boundaries",
+            "summary": "bad",
+            "edits": [{"file_path": "README.md", "tool": "replace_text", "new_text": "missing old"}],
+            "rollback": "revert",
+        }
+    )
+
+    report = ImplementationAgent(config(repo), git, FileTool(repo, config(repo)), SchemaErrorOllama(raw), artifacts=store).implement(docs_task())
+
+    assert report.status == ReportStatus.FAILED
+    assert report.implementation_mode == "structured_edit"
+    assert report.failure_stage == "structured_edit_schema_validation"
+    assert report.failure_reason == "schema_validation_failed"
+    assert report.no_changes_committed is True
+    assert report.no_branch_pushed is True
+    assert git.committed is False
+    assert git.pushed is False
+    assert "structured_edit_raw_response.json" in report.patch_artifacts
+    assert "structured_edit_schema_error.json" in report.patch_artifacts
+    assert "StructuredEditProposal schema validation failed: edits[0] used file_path/tool; expected path/operation" in report.errors
+    schema_error = json.loads(read_artifact(store, "structured_edit_schema_error.json"))
+    assert schema_error["normalized_attempt"]["edits"][0]["path"] == "README.md"
+    assert schema_error["normalized_attempt"]["edits"][0]["operation"] == "replace_text"
+    assert schema_error["expected_schema_hint"]["edit_path_field"] == "path"
+
+
+def test_normalized_structured_edit_can_push_when_enabled(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    cfg = config(repo).model_copy(update={"push_agent_branches_enabled": True})
+    git = FakeGitTool()
+    raw = json.dumps(
+        {
+            "task_id": "document-privileged-container-boundaries",
+            "summary": "structured docs",
+            "edits": [
+                {
+                    "file_path": "README.md",
+                    "tool": "replaceText",
+                    "old_text": "# AgentLab\n",
+                    "new_text": "# AgentLab\n\nMore docs\n",
+                }
+            ],
+            "rollback": "Revert README.md changes.",
+        }
+    )
+
+    report = ImplementationAgent(cfg, git, FileTool(repo, cfg), RawStructuredOllama(raw)).implement(docs_task())
+
+    assert report.status == ReportStatus.PASSED
+    assert git.committed is True
+    assert git.pushed is True
+    assert report.pushed is True
 
 
 def test_structured_edit_outside_affected_files_is_rejected_without_commit_or_push(tmp_path: Path) -> None:

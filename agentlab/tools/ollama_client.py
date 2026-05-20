@@ -11,6 +11,14 @@ from agentlab.config import OllamaConfig
 T = TypeVar("T", bound=BaseModel)
 
 
+class OllamaSchemaValidationError(RuntimeError):
+    def __init__(self, *, model_name: str, validation_error: str | None, raw_response: str) -> None:
+        super().__init__(f"Ollama response failed schema validation for {model_name}: {validation_error}")
+        self.model_name = model_name
+        self.validation_error = validation_error or ""
+        self.raw_response = raw_response
+
+
 class OllamaClient:
     def __init__(self, config: OllamaConfig, *, timeout_seconds: int = 120) -> None:
         self.config = config
@@ -66,7 +74,11 @@ class OllamaClient:
                         ),
                     }
                 )
-        raise RuntimeError(f"Ollama response failed schema validation: {last_error}; last response: {last_content}")
+        raise OllamaSchemaValidationError(
+            model_name=response_model.__name__,
+            validation_error=last_error,
+            raw_response=last_content,
+        )
 
     def _chat(self, *, model: str, messages: list[dict[str, str]]) -> str:
         payload: dict[str, Any] = {
