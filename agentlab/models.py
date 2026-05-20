@@ -232,6 +232,13 @@ class ImplementationReport(StrictModel):
     risk_score: int = Field(default=0, ge=0)
     tests_recommended: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+    failure_stage: str | None = None
+    failure_reason: str | None = None
+    patch_artifacts: list[str] = Field(default_factory=list)
+    retry_attempted: bool = False
+    retry_succeeded: bool = False
+    no_changes_committed: bool = False
+    no_branch_pushed: bool = False
 
 
 class MergeRequestInfo(StrictModel):

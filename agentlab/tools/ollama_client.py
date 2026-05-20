@@ -25,15 +25,35 @@ class OllamaClient:
         response_model: type[T],
         retries: int = 2,
     ) -> T:
+        parsed, _ = self.chat_json_with_raw(
+            model=model,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            response_model=response_model,
+            retries=retries,
+        )
+        return parsed
+
+    def chat_json_with_raw(
+        self,
+        *,
+        model: str,
+        system_prompt: str,
+        user_prompt: str,
+        response_model: type[T],
+        retries: int = 2,
+    ) -> tuple[T, str]:
         messages: list[dict[str, str]] = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ]
         last_error: str | None = None
+        last_content = ""
         for attempt in range(retries + 1):
             content = self._chat(model=model, messages=messages)
+            last_content = content
             try:
-                return response_model.model_validate_json(content)
+                return response_model.model_validate_json(content), content
             except ValidationError as exc:
                 last_error = str(exc)
                 messages.append({"role": "assistant", "content": content})
@@ -46,7 +66,7 @@ class OllamaClient:
                         ),
                     }
                 )
-        raise RuntimeError(f"Ollama response failed schema validation: {last_error}")
+        raise RuntimeError(f"Ollama response failed schema validation: {last_error}; last response: {last_content}")
 
     def _chat(self, *, model: str, messages: list[dict[str, str]]) -> str:
         payload: dict[str, Any] = {

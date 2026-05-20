@@ -20,19 +20,12 @@ class ArtifactStore:
 
     def write_json(self, name: str, payload: Any) -> ArtifactRecord:
         safe_name = self._safe_name(name)
-        path = self.artifacts_dir / safe_name
         serializable = self._payload(payload)
-        path.write_text(serializable, encoding="utf-8")
-        record = ArtifactRecord(
-            name=safe_name,
-            path=str(path),
-            sha256=hashlib.sha256(serializable.encode("utf-8")).hexdigest(),
-        )
-        manifest = self.read_manifest()
-        kept = [item for item in manifest.artifacts if item.name != safe_name]
-        manifest = manifest.model_copy(update={"artifacts": [*kept, record]})
-        self.manifest_path.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
-        return record
+        return self._write(safe_name, serializable)
+
+    def write_text(self, name: str, content: str) -> ArtifactRecord:
+        safe_name = self._safe_name(name, require_json=False)
+        return self._write(safe_name, redact_secrets(content))
 
     def read_manifest(self) -> ArtifactManifest:
         if not self.manifest_path.exists():
@@ -46,9 +39,23 @@ class ArtifactStore:
             data = payload
         return _json(data)
 
+    def _write(self, safe_name: str, content: str) -> ArtifactRecord:
+        path = self.artifacts_dir / safe_name
+        path.write_text(content, encoding="utf-8")
+        record = ArtifactRecord(
+            name=safe_name,
+            path=str(path),
+            sha256=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+        )
+        manifest = self.read_manifest()
+        kept = [item for item in manifest.artifacts if item.name != safe_name]
+        manifest = manifest.model_copy(update={"artifacts": [*kept, record]})
+        self.manifest_path.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
+        return record
+
     @staticmethod
-    def _safe_name(name: str) -> str:
-        if not name.endswith(".json"):
+    def _safe_name(name: str, *, require_json: bool = True) -> str:
+        if require_json and not name.endswith(".json"):
             name = f"{name}.json"
         if "/" in name or "\\" in name or ".." in name:
             raise ValueError(f"unsafe artifact name: {name}")
