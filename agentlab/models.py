@@ -122,6 +122,12 @@ FILE_EDIT_OPERATION_NORMALIZATION = {
     "append_file": "append_to_file",
     "write_file": "replace_file",
     "overwrite_file": "replace_file",
+    "insertBefore": "insert_before",
+    "before": "insert_before",
+    "insert_before_anchor": "insert_before",
+    "insertAfter": "insert_after",
+    "after": "insert_after",
+    "insert_after_anchor": "insert_after",
 }
 
 
@@ -131,7 +137,7 @@ def _normalize_file_edit_operation(value: Any) -> Any:
 
 class FileEdit(StrictModel):
     path: str
-    operation: Literal["replace_file", "append_to_file", "replace_text"]
+    operation: Literal["replace_file", "append_to_file", "replace_text", "insert_before", "insert_after"]
     content: str | None = None
     old_text: str | None = None
     new_text: str | None = None
@@ -183,6 +189,8 @@ class FileEdit(StrictModel):
             raise ValueError(f"{self.operation} requires content")
         if self.operation == "replace_text" and (self.old_text is None or self.new_text is None):
             raise ValueError("replace_text requires old_text and new_text")
+        if self.operation in {"insert_before", "insert_after"} and (self.anchor is None or self.content is None):
+            raise ValueError(f"{self.operation} requires anchor and content")
         return self
 
 
