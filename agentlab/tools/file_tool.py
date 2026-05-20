@@ -11,6 +11,15 @@ from agentlab.policies.risk import detect_secret_content, detect_secret_paths
 from agentlab.tools.common import ToolError, ensure_within, run_subprocess
 
 
+class PatchApplyError(ToolError):
+    def __init__(self, *, command: list[str], stderr: str, patch: str, check: bool) -> None:
+        super().__init__(stderr or ("git apply --check failed" if check else "git apply failed"))
+        self.command = command
+        self.stderr = stderr
+        self.patch = patch
+        self.check = check
+
+
 class FileTool:
     def __init__(self, repo_path: str | Path, config: AppConfig, *, dry_run: bool = False) -> None:
         self.repo_path = Path(repo_path).resolve()
@@ -110,22 +119,24 @@ class FileTool:
             raise ToolError("refusing to apply patch that touches protected paths")
         if self.dry_run:
             return stats
+        check_command = ["git", "apply", "--check", "--whitespace=nowarn", "-"]
         check = run_subprocess(
-            ["git", "apply", "--check", "--whitespace=nowarn", "-"],
+            check_command,
             cwd=self.repo_path,
             timeout_seconds=self.config.command_timeout_seconds,
             input_text=proposal.patch,
         )
         if not check.ok:
-            raise ToolError(check.stderr or "git apply --check failed")
+            raise PatchApplyError(command=check_command, stderr=check.stderr or "git apply --check failed", patch=proposal.patch, check=True)
+        apply_command = ["git", "apply", "--whitespace=nowarn", "-"]
         applied = run_subprocess(
-            ["git", "apply", "--whitespace=nowarn", "-"],
+            apply_command,
             cwd=self.repo_path,
             timeout_seconds=self.config.command_timeout_seconds,
             input_text=proposal.patch,
         )
         if not applied.ok:
-            raise ToolError(applied.stderr or "git apply failed")
+            raise PatchApplyError(command=apply_command, stderr=applied.stderr or "git apply failed", patch=proposal.patch, check=False)
         return stats
 
     def _validate_paths(self, paths: list[str]) -> None:

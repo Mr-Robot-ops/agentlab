@@ -421,6 +421,43 @@ Typische Fixes:
 - `required_test_commands are not allowed`: Command in `allowed_commands` aufnehmen oder entfernen.
 - Docker nicht verfuegbar: Docker-Checks deaktiviert lassen oder externe Build-Gates nutzen.
 
+### Patch apply failed / corrupt patch at line X
+
+Wenn `implementation_report.json` mit `failure_stage: "patch_apply"` und `failure_reason: "corrupt_patch"`
+endet, war der Kubernetes-Run selbst gesund; der Implementer hat einen syntaktisch kaputten Unified Diff erzeugt.
+Die Runs bleiben dabei fail-safe: ohne gueltigen Patch wird kein Commit erstellt und kein Branch gepusht.
+
+Die Debug-Artefakte liegen im Run-Verzeichnis unter:
+
+```text
+<workspace_root>/<run_id>/artifacts/
+```
+
+Wichtige Dateien:
+
+- `implementation_report.json`: Status, `failure_stage`, `failure_reason`, `retry_attempted`,
+  `no_changes_committed`, `no_branch_pushed` und `patch_artifacts`.
+- `implementer_raw_response.json` oder `implementer_raw_response.txt`: rohe Modellantwort, redacted.
+- `patch_proposal.json`: geparstes PatchProposal, redacted.
+- `raw_patch.diff`: urspruenglicher Unified Diff, redacted.
+- `patch_apply_error.txt` und `patch_apply_stderr.txt`: Fehler aus `git apply` / `git apply --check`.
+- `patch_apply_command.json`: ausgefuehrtes Apply-Kommando ohne Patchinhalt.
+- `patch_excerpt.txt`: erste 80 Zeilen des Patches.
+- Bei Reparaturversuchen: entsprechende `repair_*` Artefakte.
+
+Zum Gegencheck, dass nichts committed oder gepusht wurde:
+
+```bash
+jq '.commit_sha, .pushed, .no_changes_committed, .no_branch_pushed' \
+  <workspace_root>/<run_id>/artifacts/implementation_report.json
+git -C <target_repo_path> log --oneline --decorate -5
+git -C <target_repo_path> status --short
+```
+
+AgentLab versucht bei `corrupt patch` genau eine Format-Reparatur des Patches und prueft danach erneut mit
+`git apply --check`. Wenn die Reparatur ebenfalls fehlschlaegt, bleibt der Run fehlgeschlagen. Nach Verbesserungen
+am Implementer-Patch-Repair kann derselbe Task erneut gestartet werden.
+
 Lokale Tests:
 
 ```bash
