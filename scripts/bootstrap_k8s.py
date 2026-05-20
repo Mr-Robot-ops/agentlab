@@ -219,6 +219,14 @@ spec:
                 secretKeyRef:
                   name: agentlab-secrets
                   key: GITLAB_TOKEN
+            - name: GIT_TERMINAL_PROMPT
+              value: "0"
+            - name: GIT_CONFIG_COUNT
+              value: "1"
+            - name: GIT_CONFIG_KEY_0
+              value: credential.helper
+            - name: GIT_CONFIG_VALUE_0
+              value: '!f() {{ echo username=oauth2; echo password=$GITLAB_TOKEN; }}; f'
             - name: HOME
               value: /home/agentlab
           securityContext:
@@ -251,7 +259,7 @@ spec:
           secret:
             secretName: agentlab-secrets
             optional: true
-            defaultMode: 0600
+            defaultMode: 0440
         - name: home
           emptyDir:
             sizeLimit: 256Mi
@@ -285,6 +293,11 @@ kubectl -n {namespace} create secret generic agentlab-secrets \\
   --from-literal=GITLAB_TOKEN="glpat-..." \\
   --from-literal=netrc=$'machine gitlab.local\\n  login oauth2\\n  password glpat-...'
 ```
+
+The jobs also configure Git with `GIT_TERMINAL_PROMPT=0` and an HTTPS credential helper that reads
+`GITLAB_TOKEN` from the Secret env. This prevents interactive clone prompts in non-root pods and avoids
+writing the token into ConfigMaps or generated job YAML. The `.netrc` Secret mount remains optional and is
+group-readable for the pod `fsGroup`.
 
 Run the doctor job:
 

@@ -33,6 +33,14 @@ spec:
                 secretKeyRef:
                   name: agentlab-secrets
                   key: GITLAB_TOKEN
+            - name: GIT_TERMINAL_PROMPT
+              value: "0"
+            - name: GIT_CONFIG_COUNT
+              value: "1"
+            - name: GIT_CONFIG_KEY_0
+              value: credential.helper
+            - name: GIT_CONFIG_VALUE_0
+              value: '!f() { echo username=oauth2; echo password=$GITLAB_TOKEN; }; f'
             - name: HOME
               value: /home/agentlab
           securityContext:
@@ -79,7 +87,7 @@ spec:
           secret:
             secretName: agentlab-secrets
             optional: true
-            defaultMode: 0600
+            defaultMode: 0440
         - name: home
           emptyDir:
             sizeLimit: 256Mi

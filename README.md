@@ -47,6 +47,11 @@ kubectl -n agentlab create secret generic agentlab-secrets \
   --from-literal=netrc=$'machine gitlab.local\n  login oauth2\n  password glpat-...'
 ```
 
+Kubernetes Jobs setzen zusaetzlich `GIT_TERMINAL_PROMPT=0` und einen Git `credential.helper`, der das
+Passwort erst im Pod aus der Secret-Env `GITLAB_TOKEN` liest. Dadurch funktionieren HTTPS-Clones in
+Non-Root-Pods, ohne Token in ConfigMaps oder generierte Job-YAML zu schreiben. Das `.netrc`-Secret bleibt
+als Fallback moeglich und wird group-readable fuer `fsGroup: 10001` gemountet.
+
 3. Manifeste anwenden:
 
 ```bash
@@ -323,7 +328,8 @@ Die generierten Jobs sind kurzlebig und nutzen:
 - PVC fuer `/var/lib/agentlab/runs`
 - ConfigMap-Mount fuer `/etc/agentlab/config.yaml`
 - Secret-env fuer `GITLAB_TOKEN`
-- optionales Secret-Volume fuer `.netrc`
+- Git `credential.helper` mit `GITLAB_TOKEN` fuer HTTPS-Clones ohne Prompt
+- optionales Secret-Volume fuer `.netrc` mit group-readable Rechten
 
 Die Jobs:
 
@@ -407,6 +413,10 @@ Typische Fixes:
 
 - `FAIL: GITLAB_TOKEN fehlt`: Token als Env, `.env.agentlab` oder Kubernetes Secret bereitstellen.
 - `GitLab project was not found`: `project_id` pruefen; `group/project` ist erlaubt.
+- `fatal: could not read Username for 'https://gitlab...'`: Kubernetes Jobs muessen `GIT_TERMINAL_PROMPT=0`
+  und den generierten Git `credential.helper` enthalten; der Helper liest das Passwort aus `GITLAB_TOKEN`.
+  Bei `.netrc`-Fallback muss das Secret fuer den Non-Root-Pod lesbar sein, z. B. group-readable mit
+  `fsGroup: 10001`.
 - `Ollama API is not reachable`: `ollama.base_url` und Netzwerkpfad pruefen.
 - `required_test_commands are not allowed`: Command in `allowed_commands` aufnehmen oder entfernen.
 - Docker nicht verfuegbar: Docker-Checks deaktiviert lassen oder externe Build-Gates nutzen.
