@@ -54,6 +54,8 @@ class Doctor:
             self._check_target_repo_source()
             self._check_git()
             self._check_token()
+            self._check_git_credential_helper()
+            self._check_git_author_identity()
             self._check_gitlab_api()
             self._check_ollama()
             self._check_required_commands()
@@ -127,6 +129,67 @@ class Doctor:
             self._passed("gitlab_token", f"{self.config.gitlab_token_env} is set")
         else:
             self._failed("gitlab_token", f"{self.config.gitlab_token_env} fehlt", TOKEN_FIX)
+
+    def _check_git_credential_helper(self) -> None:
+        helper = self._git_config_value("credential.helper")
+        if helper:
+            self._passed("git_credential_helper", "git credential.helper is configured")
+        else:
+            self._warning(
+                "git_credential_helper",
+                "git credential.helper is not configured",
+                "Set a Git credential helper or Kubernetes GIT_CONFIG_* env that reads the password from GITLAB_TOKEN.",
+            )
+
+    def _check_git_author_identity(self) -> None:
+        missing = []
+        if not self._git_config_value("user.name"):
+            missing.append("user.name")
+        if not self._git_config_value("user.email"):
+            missing.append("user.email")
+        if not missing:
+            self._passed("git_author_identity", "git user.name and user.email are configured")
+            return
+        message = "git author identity is missing: " + ", ".join(missing)
+        remediation = (
+            "Set GIT_CONFIG_KEY_N/GIT_CONFIG_VALUE_N for user.name and user.email, or run "
+            "`git config user.name \"AgentLab Bot\"` and `git config user.email \"agentlab-bot@example.local\"`."
+        )
+        if self._write_mode_enabled():
+            self._failed("git_author_identity", message, remediation)
+        else:
+            self._warning("git_author_identity", message, remediation)
+
+    def _git_config_value(self, key: str) -> str | None:
+        value = self._git_config_env_value(key)
+        if value:
+            return value
+        if not self.which("git"):
+            return None
+        assert self.config is not None
+        cwd = self.config.target_repo_path if self.config.target_repo_path.exists() else self.config_path.parent
+        try:
+            result = self.run_command(["git", "config", "--get", key], cwd=cwd, timeout_seconds=30)
+        except Exception:
+            return None
+        if result.ok and result.stdout.strip():
+            return result.stdout.strip()
+        return None
+
+    def _git_config_env_value(self, key: str) -> str | None:
+        try:
+            count = int(self.environ.get("GIT_CONFIG_COUNT", "0"))
+        except ValueError:
+            return None
+        for index in range(count):
+            if self.environ.get(f"GIT_CONFIG_KEY_{index}") == key:
+                value = self.environ.get(f"GIT_CONFIG_VALUE_{index}", "")
+                return value if value.strip() else None
+        return None
+
+    def _write_mode_enabled(self) -> bool:
+        assert self.config is not None
+        return bool(self.config.push_agent_branches_enabled or self.config.direct_main_push_enabled or self.config.auto_merge_enabled)
 
     def _check_gitlab_api(self) -> None:
         assert self.config is not None

@@ -49,8 +49,11 @@ kubectl -n agentlab create secret generic agentlab-secrets \
 
 Kubernetes Jobs setzen zusaetzlich `GIT_TERMINAL_PROMPT=0` und einen Git `credential.helper`, der das
 Passwort erst im Pod aus der Secret-Env `GITLAB_TOKEN` liest. Dadurch funktionieren HTTPS-Clones in
-Non-Root-Pods, ohne Token in ConfigMaps oder generierte Job-YAML zu schreiben. Das `.netrc`-Secret bleibt
-als Fallback moeglich und wird group-readable fuer `fsGroup: 10001` gemountet.
+Non-Root-Pods, ohne Token in ConfigMaps oder generierte Job-YAML zu schreiben. Die Jobs setzen ausserdem eine
+generische Git Commit Identity (`AgentLab Bot <agentlab-bot@example.local>`), damit erfolgreiche Agent-Branches
+committen koennen. Mit `--git-author-name` und `--git-author-email` kann diese Identity beim Bootstrap explizit
+ueberschrieben werden. Das `.netrc`-Secret bleibt als Fallback moeglich und wird group-readable fuer
+`fsGroup: 10001` gemountet.
 
 3. Manifeste anwenden:
 
@@ -329,6 +332,7 @@ Die generierten Jobs sind kurzlebig und nutzen:
 - ConfigMap-Mount fuer `/etc/agentlab/config.yaml`
 - Secret-env fuer `GITLAB_TOKEN`
 - Git `credential.helper` mit `GITLAB_TOKEN` fuer HTTPS-Clones ohne Prompt
+- Git `user.name` / `user.email` fuer Agent-Commits mit generischen Defaults
 - optionales Secret-Volume fuer `.netrc` mit group-readable Rechten
 
 Die Jobs:
@@ -417,6 +421,10 @@ Typische Fixes:
   und den generierten Git `credential.helper` enthalten; der Helper liest das Passwort aus `GITLAB_TOKEN`.
   Bei `.netrc`-Fallback muss das Secret fuer den Non-Root-Pod lesbar sein, z. B. group-readable mit
   `fsGroup: 10001`.
+- `Author identity unknown`: Kubernetes Jobs muessen `GIT_CONFIG_KEY_N` / `GIT_CONFIG_VALUE_N` fuer
+  `user.name` und `user.email` enthalten. Der Bootstrap setzt standardmaessig `AgentLab Bot`
+  und `agentlab-bot@example.local`; eigene Werte koennen mit `--git-author-name` und `--git-author-email`
+  gerendert werden.
 - `Ollama API is not reachable`: `ollama.base_url` und Netzwerkpfad pruefen.
 - `required_test_commands are not allowed`: Command in `allowed_commands` aufnehmen oder entfernen.
 - Docker nicht verfuegbar: Docker-Checks deaktiviert lassen oder externe Build-Gates nutzen.

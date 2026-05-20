@@ -12,6 +12,7 @@ try:
         render_agentlab_config,
         validate_mode,
         write_file,
+        yaml_string,
     )
 except ImportError:  # pragma: no cover - used when executed as a script
     from bootstrap_common import (  # type: ignore
@@ -22,6 +23,7 @@ except ImportError:  # pragma: no cover - used when executed as a script
         render_agentlab_config,
         validate_mode,
         write_file,
+        yaml_string,
     )
 
 
@@ -53,6 +55,8 @@ def generate_k8s(
     mode: str = "safe-dry-run",
     allow_dangerous_mode: bool = False,
     emit_komodo: bool = False,
+    git_author_name: str = "AgentLab Bot",
+    git_author_email: str = "agentlab-bot@example.local",
 ) -> Path:
     mode = validate_mode(mode, allow_dangerous_mode=allow_dangerous_mode)
     project_value = project_identifier(project=project, project_id=project_id, target_repo_url=target_repo_url)
@@ -79,7 +83,14 @@ def generate_k8s(
         "README.generated.md": render_readme(namespace),
     }
     for job_name, command in JOB_COMMANDS.items():
-        files[f"job-{job_name}.yaml"] = render_job(namespace=namespace, image=image, job_name=job_name, command=command)
+        files[f"job-{job_name}.yaml"] = render_job(
+            namespace=namespace,
+            image=image,
+            job_name=job_name,
+            command=command,
+            git_author_name=git_author_name,
+            git_author_email=git_author_email,
+        )
     for name, content in files.items():
         write_file(out / name, content)
     if emit_komodo:
@@ -168,7 +179,34 @@ resources:
 """
 
 
-def render_job(*, namespace: str, image: str, job_name: str, command: list[str]) -> str:
+def git_config_env(git_author_name: str, git_author_email: str) -> list[tuple[str, str]]:
+    configs = [
+        ("credential.helper", "!f() { echo username=oauth2; echo password=$GITLAB_TOKEN; }; f"),
+        ("user.name", git_author_name),
+        ("user.email", git_author_email),
+    ]
+    env = [("GIT_CONFIG_COUNT", str(len(configs)))]
+    for index, (key, value) in enumerate(configs):
+        env.append((f"GIT_CONFIG_KEY_{index}", key))
+        env.append((f"GIT_CONFIG_VALUE_{index}", value))
+    return env
+
+
+def render_git_config_env(git_author_name: str, git_author_email: str) -> str:
+    return "\n".join(
+        f"            - name: {name}\n              value: {yaml_string(value)}" for name, value in git_config_env(git_author_name, git_author_email)
+    )
+
+
+def render_job(
+    *,
+    namespace: str,
+    image: str,
+    job_name: str,
+    command: list[str],
+    git_author_name: str = "AgentLab Bot",
+    git_author_email: str = "agentlab-bot@example.local",
+) -> str:
     args = ", ".join(f'"{item}"' for item in command)
     task_mount = ""
     task_volume = ""
@@ -221,12 +259,7 @@ spec:
                   key: GITLAB_TOKEN
             - name: GIT_TERMINAL_PROMPT
               value: "0"
-            - name: GIT_CONFIG_COUNT
-              value: "1"
-            - name: GIT_CONFIG_KEY_0
-              value: credential.helper
-            - name: GIT_CONFIG_VALUE_0
-              value: '!f() {{ echo username=oauth2; echo password=$GITLAB_TOKEN; }}; f'
+{render_git_config_env(git_author_name, git_author_email)}
             - name: HOME
               value: /home/agentlab
           securityContext:
@@ -294,10 +327,11 @@ kubectl -n {namespace} create secret generic agentlab-secrets \\
   --from-literal=netrc=$'machine gitlab.local\\n  login oauth2\\n  password glpat-...'
 ```
 
-The jobs also configure Git with `GIT_TERMINAL_PROMPT=0` and an HTTPS credential helper that reads
-`GITLAB_TOKEN` from the Secret env. This prevents interactive clone prompts in non-root pods and avoids
-writing the token into ConfigMaps or generated job YAML. The `.netrc` Secret mount remains optional and is
-group-readable for the pod `fsGroup`.
+The jobs also configure Git with `GIT_TERMINAL_PROMPT=0`, an HTTPS credential helper that reads
+`GITLAB_TOKEN` from the Secret env, and a generic commit identity (`AgentLab Bot <agentlab-bot@example.local>`).
+This prevents interactive clone prompts in non-root pods, allows agent branch commits, and avoids writing the
+token into ConfigMaps or generated job YAML. The `.netrc` Secret mount remains optional and is group-readable
+for the pod `fsGroup`.
 
 Run the doctor job:
 
@@ -342,6 +376,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", default="safe-dry-run")
     parser.add_argument("--allow-dangerous-mode", action="store_true")
     parser.add_argument("--emit-komodo", action="store_true")
+    parser.add_argument("--git-author-name", default="AgentLab Bot")
+    parser.add_argument("--git-author-email", default="agentlab-bot@example.local")
     return parser
 
 
@@ -365,6 +401,8 @@ def main(argv: list[str] | None = None) -> int:
             mode=args.mode,
             allow_dangerous_mode=args.allow_dangerous_mode,
             emit_komodo=args.emit_komodo,
+            git_author_name=args.git_author_name,
+            git_author_email=args.git_author_email,
         )
     except ValueError as exc:
         parser.error(str(exc))

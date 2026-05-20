@@ -56,6 +56,9 @@ def write_config(tmp_path: Path, **overrides: object) -> Path:
         [
             f'docker_build_enabled: {str(values["docker_build_enabled"]).lower()}',
             f'docker_compose_enabled: {str(values["docker_compose_enabled"]).lower()}',
+            f'push_agent_branches_enabled: {str(values.get("push_agent_branches_enabled", False)).lower()}',
+            f'direct_main_push_enabled: {str(values.get("direct_main_push_enabled", False)).lower()}',
+            f'auto_merge_enabled: {str(values.get("auto_merge_enabled", False)).lower()}',
         ]
     )
     path = tmp_path / "config.yaml"
@@ -67,6 +70,19 @@ def fake_http_get(url: str, **_: object) -> FakeResponse:
     if "/api/v4/projects/" in url:
         return FakeResponse(200, {"path_with_namespace": "group/project"})
     return FakeResponse(200, {"models": [{"name": "qwen3.6:35b"}]})
+
+
+def fake_git_config_run(values: dict[str, str]):
+    def run(command, **kwargs):
+        if command[:3] == ["git", "config", "--get"]:
+            key = command[3]
+            value = values.get(key)
+            if value is None:
+                return CommandResult(command=" ".join(command), cwd=".", exit_code=1, stderr="")
+            return CommandResult(command=" ".join(command), cwd=".", exit_code=0, stdout=value + "\n")
+        return CommandResult(command=" ".join(command), cwd=".", exit_code=0)
+
+    return run
 
 
 def test_doctor_detects_missing_token_and_prints_fix(tmp_path: Path) -> None:
@@ -124,3 +140,59 @@ def test_doctor_checks_docker_when_enabled(tmp_path: Path) -> None:
 
     assert any(check["name"] == "docker" and check["status"] == "passed" for check in report["checks"])
     assert any(check["name"] == "docker_compose" and check["status"] == "passed" for check in report["checks"])
+
+
+def test_doctor_warns_for_missing_git_author_identity_in_safe_dry_run(tmp_path: Path) -> None:
+    config = write_config(tmp_path)
+
+    report = Doctor(
+        config,
+        environ={"GITLAB_TOKEN": "token", "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": "helper"},
+        http_get=fake_http_get,
+        which=lambda name: "git",
+        run_command=fake_git_config_run({}),
+    ).run()
+
+    check = next(check for check in report["checks"] if check["name"] == "git_author_identity")
+    assert check["status"] == "warning"
+
+
+def test_doctor_fails_for_missing_git_author_identity_in_write_mode(tmp_path: Path) -> None:
+    config = write_config(tmp_path, push_agent_branches_enabled=True)
+
+    report = Doctor(
+        config,
+        environ={"GITLAB_TOKEN": "token", "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "credential.helper", "GIT_CONFIG_VALUE_0": "helper"},
+        http_get=fake_http_get,
+        which=lambda name: "git",
+        run_command=fake_git_config_run({}),
+    ).run()
+
+    check = next(check for check in report["checks"] if check["name"] == "git_author_identity")
+    assert check["status"] == "failed"
+    assert report["exit_code"] == 2
+
+
+def test_doctor_passes_when_git_author_identity_is_configured(tmp_path: Path) -> None:
+    config = write_config(tmp_path, push_agent_branches_enabled=True)
+    environ = {
+        "GITLAB_TOKEN": "token",
+        "GIT_CONFIG_COUNT": "3",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_VALUE_0": "!f() { echo password=$GITLAB_TOKEN; }; f",
+        "GIT_CONFIG_KEY_1": "user.name",
+        "GIT_CONFIG_VALUE_1": "AgentLab Bot",
+        "GIT_CONFIG_KEY_2": "user.email",
+        "GIT_CONFIG_VALUE_2": "agentlab-bot@example.local",
+    }
+
+    report = Doctor(
+        config,
+        environ=environ,
+        http_get=fake_http_get,
+        which=lambda name: "git",
+        run_command=fake_git_config_run({}),
+    ).run()
+
+    assert any(check["name"] == "git_credential_helper" and check["status"] == "passed" for check in report["checks"])
+    assert any(check["name"] == "git_author_identity" and check["status"] == "passed" for check in report["checks"])
