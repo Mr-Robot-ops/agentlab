@@ -460,6 +460,23 @@ AgentLab versucht bei `corrupt patch` genau eine Format-Reparatur des Patches un
 `git apply --check`. Wenn die Reparatur ebenfalls fehlschlaegt, bleibt der Run fehlgeschlagen. Nach Verbesserungen
 am Implementer-Patch-Repair kann derselbe Task erneut gestartet werden.
 
+### Docs task fails with corrupt patch
+
+Raw Unified Diffs von LLMs sind fuer Markdown-Aenderungen fragil. Docs- und Markdown-Tasks verwenden deshalb
+bevorzugt `implementation_mode: "structured_edit"` statt `PatchProposal`. Der Implementer liefert strukturierte
+Operationen wie `replace_text`, `append_to_file` oder `replace_file`; AgentLab schreibt die Datei selbst und prueft
+danach Diff, Risk, Protected Paths und Secrets.
+
+Relevante Artefakte:
+
+- `structured_edit_raw_response.json`: rohe Modellantwort, redacted.
+- `structured_edit_proposal.json`: geparstes StructuredEditProposal, redacted.
+- `structured_edit_apply_report.json`: angewendete Operationen, geaenderte Dateien und Fallback-Metadaten.
+- `structured_edit_error.json`: Fehlergrund, falls die strukturierte Anwendung scheitert.
+
+Bei Fehlern zuerst `implementation_report.json` pruefen, insbesondere `implementation_mode`, `failure_stage`,
+`failure_reason`, `fallback_attempted`, `no_changes_committed` und `no_branch_pushed`.
+
 Lokale Tests:
 
 ```bash
