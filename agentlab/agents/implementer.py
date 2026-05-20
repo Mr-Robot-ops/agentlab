@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import uuid
 from typing import Any
 
 from agentlab.artifacts import ArtifactStore
+from agentlab.branching import agent_branch_name
 from agentlab.config import AppConfig
 from agentlab.models import AgentTask, DiffStats, ImplementationReport, PatchProposal, ReportStatus, StructuredEditProposal, TaskType
 from agentlab.policies.risk import assess_risk
@@ -27,6 +29,12 @@ class StructuredEditSchemaError(ToolError):
         self.reason = "schema_validation_failed"
 
 
+class GitPushError(ToolError):
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 class ImplementationAgent:
     name = "implementer"
 
@@ -40,6 +48,7 @@ class ImplementationAgent:
         dry_run: bool = False,
         repo_context: dict[str, Any] | None = None,
         artifacts: ArtifactStore | None = None,
+        run_id: str | None = None,
     ) -> None:
         self.config = config
         self.git_tool = git_tool
@@ -48,15 +57,18 @@ class ImplementationAgent:
         self.dry_run = dry_run
         self.repo_context = repo_context or {}
         self.artifacts = artifacts
+        self.run_id = run_id or (artifacts.run_id if artifacts is not None else uuid.uuid4().hex)
 
     def implement(self, task: AgentTask) -> ImplementationReport:
-        branch = f"agent/{task.id}"
+        branch = agent_branch_name(task.id, self.run_id)
         errors: list[str] = []
         patch_artifacts: list[str] = []
         retry_attempted = False
         retry_succeeded = False
         commit_created = False
         branch_pushed = False
+        commit_sha: str | None = None
+        pushed = False
         first_patch_failure: PatchApplyError | UnifiedDiffValidationError | None = None
         implementation_mode = "structured_edit" if self._is_docs_task(task) else "patch"
         fallback_attempted = False
@@ -169,11 +181,10 @@ class ImplementationAgent:
                 raise ToolError("risk assessment blocked patch: " + ", ".join(risk.reasons))
             commit_sha = self.git_tool.commit(f"agent: {task.title}")
             commit_created = commit_sha is not None
-            pushed = False
             if self.config.push_agent_branches_enabled and not self.dry_run:
                 push = self.git_tool.push(branch)
                 if not push.ok:
-                    raise ToolError(push.stderr or "git push failed")
+                    raise GitPushError(self._push_failure_reason(push.stderr), self._short_error(push.stderr or "git push failed"))
                 pushed = True
                 branch_pushed = True
             return ImplementationReport(
@@ -277,6 +288,28 @@ class ImplementationAgent:
                 fallback_succeeded=fallback_succeeded,
                 fallback_reason=fallback_reason,
             )
+        except GitPushError as exc:
+            errors.append(str(exc))
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                applied=not self.dry_run,
+                pushed=False,
+                commit_sha=commit_sha,
+                errors=errors,
+                failure_stage="git_push",
+                failure_reason=exc.reason,
+                patch_artifacts=patch_artifacts,
+                retry_attempted=retry_attempted,
+                retry_succeeded=retry_succeeded,
+                no_changes_committed=not commit_created,
+                no_branch_pushed=not branch_pushed,
+                implementation_mode=implementation_mode,  # type: ignore[arg-type]
+                fallback_attempted=fallback_attempted,
+                fallback_succeeded=fallback_succeeded,
+                fallback_reason=fallback_reason,
+            )
         except Exception as exc:
             errors.append(str(exc))
             failure_stage = None
@@ -289,6 +322,8 @@ class ImplementationAgent:
                 branch=branch,
                 status=ReportStatus.FAILED,
                 errors=errors,
+                pushed=False,
+                commit_sha=commit_sha,
                 failure_stage=failure_stage,
                 failure_reason=failure_reason,
                 patch_artifacts=patch_artifacts,
@@ -726,6 +761,18 @@ class ImplementationAgent:
             or "please tell me who you are" in text
             or "unable to auto-detect email address" in text
         )
+
+    @staticmethod
+    def _push_failure_reason(stderr: str) -> str:
+        text = stderr.lower()
+        if "non-fast-forward" in text or "fetch first" in text:
+            return "non_fast_forward"
+        return "push_failed"
+
+    @staticmethod
+    def _short_error(text: str, limit: int = 1200) -> str:
+        compact = "\n".join(line.rstrip() for line in text.strip().splitlines() if line.strip())
+        return compact[:limit]
 
     @staticmethod
     def _structured_normalized_attempt(raw_response: str) -> object | None:

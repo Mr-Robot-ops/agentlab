@@ -248,7 +248,8 @@ AgentLab ist kein Rewrite-Tool. Es arbeitet in kleinen, pruefbaren Schritten:
 - RepoIndexer erstellt einen deterministischen Whole-Repo-Index.
 - BacklogSteward erzeugt priorisierte Wartungsaufgaben.
 - Planning Agent plant Aufgaben, ohne Code zu aendern.
-- Implementation Agent erzeugt validierte Patches und lokale Commits auf `agent/<task-id>`.
+- Implementation Agent erzeugt validierte Patches und lokale Commits auf eindeutigen Branches
+  `agent/<task-id>-<run-id-short>`.
 - Functional Test Agent und Build/Security Test Agent fuehren erlaubte Tests und Scanner aus.
 - Code Quality Review Agent und Security/Architecture Review Agent pruefen Diffs.
 - Gatekeeper nutzt eine deterministische Policy Engine.
