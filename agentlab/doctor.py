@@ -63,6 +63,7 @@ class Doctor:
             self._check_repo_policy()
             self._check_dangerous_flags()
             self._check_auto_approve()
+            self._check_schedule()
         exit_code = self.exit_code()
         status = "failed" if exit_code == 2 else "warning" if exit_code == 1 else "passed"
         return {
@@ -343,6 +344,32 @@ class Doctor:
             )
             return
         self._passed("auto_approve", "auto_approve is enabled with constrained paths")
+
+    def _check_schedule(self) -> None:
+        assert self.config is not None
+        schedule = self.config.schedule
+        if not schedule.enabled:
+            self._passed("schedule", "schedule is disabled")
+            return
+        if schedule.action.enabled and self.config.direct_main_push_enabled:
+            self._failed("schedule", "scheduler action cannot run with direct_main_push_enabled", "Use MR-flow branch pushes for scheduler action.")
+            return
+        if schedule.action.enabled and self.config.auto_merge_enabled:
+            self._failed("schedule", "scheduler action cannot run with auto_merge_enabled", "Keep scheduler-created MRs reviewable; disable auto_merge_enabled.")
+            return
+        if schedule.action.enabled and not self.config.auto_approve.enabled:
+            self._failed("schedule", "scheduler action is enabled but auto_approve is disabled", "Enable auto_approve or disable schedule.action.")
+            return
+        if schedule.action.enabled and not self.config.push_agent_branches_enabled:
+            self._failed("schedule", "scheduler action is enabled but push_agent_branches_enabled is false", "Use mr-flow mode for scheduler action.")
+            return
+        if schedule.action.enabled and schedule.limits.min_hours_between_action_runs < 2:
+            self._warning("schedule", "scheduler action cooldown is below 2 hours", "Use a conservative action cooldown to avoid MR spam.")
+            return
+        self._passed(
+            "schedule",
+            f"schedule enabled: watch={schedule.watch.cron}, plan={schedule.plan.cron}, action={schedule.action.cron}",
+        )
 
     def _passed(self, name: str, message: str) -> None:
         self.checks.append(PreflightCheck(name=name, status="passed", message=message))
