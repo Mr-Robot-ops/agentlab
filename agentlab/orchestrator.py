@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+import time
 from pathlib import Path
 
 from agentlab.artifacts import ArtifactStore
@@ -103,19 +104,35 @@ class Orchestrator:
         repo_index, architecture = self.index_repository()
         supply_chain = self.supply_chain() if self.config.supply_chain_enabled else None
         git_tool, file_tool, _, _ = self._tools()
-        with self.audit.span(agent="implementer", action="implement", input_payload=task.model_dump(mode="json")):
-            result = ImplementationAgent(
-                self.config,
-                git_tool,
-                file_tool,
-                self.ollama,
-                dry_run=self.dry_run,
-                repo_context={
-                    "architecture": architecture.model_dump(mode="json"),
-                    "repo_index_summary": self._repo_index_summary(repo_index),
-                    "supply_chain_summary": self._supply_chain_summary(supply_chain) if supply_chain else None,
-                },
-            ).implement(task)
+        start = time.monotonic()
+        self.audit.emit(agent="implementer", action="implement", status="started", input_payload=task.model_dump(mode="json"))
+        result = ImplementationAgent(
+            self.config,
+            git_tool,
+            file_tool,
+            self.ollama,
+            dry_run=self.dry_run,
+            repo_context={
+                "architecture": architecture.model_dump(mode="json"),
+                "repo_index_summary": self._repo_index_summary(repo_index),
+                "supply_chain_summary": self._supply_chain_summary(supply_chain) if supply_chain else None,
+            },
+            artifacts=self.artifacts,
+        ).implement(task)
+        self.audit.emit(
+            agent="implementer",
+            action="implement",
+            status="succeeded" if result.status == ReportStatus.PASSED else "failed",
+            duration_seconds=time.monotonic() - start,
+            metadata={
+                "implementation_status": result.status.value,
+                "implementation_error_count": len(result.errors),
+                "failure_stage": result.failure_stage,
+                "failure_reason": result.failure_reason,
+            },
+            error="; ".join(result.errors) if result.status != ReportStatus.PASSED and result.errors else None,
+            output_payload=result.model_dump(mode="json"),
+        )
         self.artifacts.write_json("implementation_report", result)
         return result
 
