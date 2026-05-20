@@ -11,6 +11,7 @@ from agentlab.doctor import format_doctor, report_json, run_doctor
 from agentlab.models import AgentTask
 from agentlab.orchestrator import Orchestrator
 from agentlab.preflight import PreflightChecker
+from agentlab.scheduler import Scheduler
 from agentlab.status import TERMINAL_STATES, format_status, list_run_statuses, read_run_status
 
 app = typer.Typer(help="AgentLab GitLab agent orchestration CLI.")
@@ -83,6 +84,24 @@ def run_task(
 def full_flow(config: Path = typer.Option(..., "--config", exists=True, readable=True)) -> None:
     cfg = load_config(config)
     _json_echo(Orchestrator(cfg).full_flow())
+
+
+@app.command("scheduler-watch")
+def scheduler_watch(config: Path = typer.Option(..., "--config", exists=True, readable=True)) -> None:
+    cfg = load_config(config)
+    _json_echo(Scheduler(cfg).watch())
+
+
+@app.command("scheduler-plan")
+def scheduler_plan(config: Path = typer.Option(..., "--config", exists=True, readable=True)) -> None:
+    cfg = load_config(config)
+    _json_echo(Scheduler(cfg).plan())
+
+
+@app.command("scheduler-action")
+def scheduler_action(config: Path = typer.Option(..., "--config", exists=True, readable=True)) -> None:
+    cfg = load_config(config)
+    _json_echo(Scheduler(cfg).action())
 
 
 @app.command("review-mr")
