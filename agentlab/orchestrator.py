@@ -118,6 +118,7 @@ class Orchestrator:
                 "supply_chain_summary": self._supply_chain_summary(supply_chain) if supply_chain else None,
             },
             artifacts=self.artifacts,
+            run_id=self.run_id,
         ).implement(task)
         self.audit.emit(
             agent="implementer",
