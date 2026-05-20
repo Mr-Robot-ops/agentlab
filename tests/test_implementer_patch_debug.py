@@ -85,6 +85,15 @@ class FakeGitTool:
         return CommandResult(command=f"git push origin {branch}", cwd=".", exit_code=0)
 
 
+class MissingIdentityGitTool(FakeGitTool):
+    def commit(self, message: str) -> str:
+        raise ToolError(
+            "Author identity unknown\n\n"
+            "*** Please tell me who you are.\n\n"
+            "fatal: unable to auto-detect email address"
+        )
+
+
 class FakeFileTool:
     def __init__(self, *, fail_times: int = 0) -> None:
         self.fail_times = fail_times
@@ -590,6 +599,22 @@ def test_structured_repair_failure_does_not_commit_or_push(tmp_path: Path) -> No
     assert report.no_changes_committed is True
     assert report.no_branch_pushed is True
     assert "structured_edit_repair_error.json" in report.patch_artifacts
+
+
+def test_commit_missing_identity_sets_git_commit_failure_reason(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    git = MissingIdentityGitTool()
+
+    report = ImplementationAgent(config(repo), git, FileTool(repo, config(repo)), FakeOllama([structured_proposal()])).implement(docs_task())
+
+    assert report.status == ReportStatus.FAILED
+    assert report.failure_stage == "git_commit"
+    assert report.failure_reason == "git_author_identity_missing"
+    assert report.commit_sha is None
+    assert report.pushed is False
+    assert report.no_changes_committed is True
+    assert report.no_branch_pushed is True
+    assert "Author identity unknown" in report.errors[0]
 
 
 def test_normalized_structured_edit_can_push_when_enabled(tmp_path: Path) -> None:

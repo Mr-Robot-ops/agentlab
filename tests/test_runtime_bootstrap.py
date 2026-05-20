@@ -18,6 +18,12 @@ def config_from_configmap(output_dir):
     return yaml.safe_load(configmap["data"]["config.yaml"])
 
 
+def env_from_job(output_dir, job_name="job-dry-run.yaml"):
+    job = yaml.safe_load((output_dir / job_name).read_text(encoding="utf-8"))
+    container = job["spec"]["template"]["spec"]["containers"][0]
+    return {item["name"]: item for item in container["env"]}
+
+
 def test_kubernetes_bootstrap_generates_expected_files_without_secrets(tmp_path):
     out = generate_k8s(
         namespace="agentlab",
@@ -147,17 +153,59 @@ def test_kubernetes_jobs_configure_noninteractive_gitlab_https_auth(tmp_path):
     env = {item["name"]: item for item in container["env"]}
 
     assert env["GIT_TERMINAL_PROMPT"]["value"] == "0"
-    assert env["GIT_CONFIG_COUNT"]["value"] == "1"
+    assert env["GIT_CONFIG_COUNT"]["value"] == "3"
     assert env["GIT_CONFIG_KEY_0"]["value"] == "credential.helper"
     assert "$GITLAB_TOKEN" in env["GIT_CONFIG_VALUE_0"]["value"]
     assert "glpat-" not in env["GIT_CONFIG_VALUE_0"]["value"]
     assert TOKEN_PLACEHOLDER not in env["GIT_CONFIG_VALUE_0"]["value"]
+    assert env["GIT_CONFIG_KEY_1"]["value"] == "user.name"
+    assert env["GIT_CONFIG_VALUE_1"]["value"] == "AgentLab Bot"
+    assert env["GIT_CONFIG_KEY_2"]["value"] == "user.email"
+    assert env["GIT_CONFIG_VALUE_2"]["value"] == "agentlab-bot@example.local"
 
     git_netrc = next(volume for volume in pod_spec["volumes"] if volume["name"] == "git-netrc")
     default_mode = git_netrc["secret"]["defaultMode"]
     assert default_mode != 0o600
     assert default_mode & 0o040
     assert pod_spec["securityContext"]["fsGroup"] == 10001
+
+
+def test_kubernetes_jobs_use_collision_free_git_config_indices(tmp_path):
+    out = generate_k8s(
+        namespace="agentlab",
+        image="registry.local/agentlab:0.1.0",
+        gitlab_url="https://gitlab.local",
+        target_repo_url="https://gitlab.local/group/project.git",
+        ollama_url="http://ollama.local:11434",
+        output_dir=tmp_path,
+    )
+
+    env = env_from_job(out)
+    count = int(env["GIT_CONFIG_COUNT"]["value"])
+    keys = [env[f"GIT_CONFIG_KEY_{index}"]["value"] for index in range(count)]
+    values = [env[f"GIT_CONFIG_VALUE_{index}"]["value"] for index in range(count)]
+
+    assert keys == ["credential.helper", "user.name", "user.email"]
+    assert len(set(keys)) == count
+    assert any("$GITLAB_TOKEN" in value for value in values)
+
+
+def test_kubernetes_git_author_options_override_defaults(tmp_path):
+    out = generate_k8s(
+        namespace="agentlab",
+        image="registry.local/agentlab:0.1.0",
+        gitlab_url="https://gitlab.local",
+        target_repo_url="https://gitlab.local/group/project.git",
+        ollama_url="http://ollama.local:11434",
+        output_dir=tmp_path,
+        git_author_name="Custom Bot",
+        git_author_email="custom-bot@example.local",
+    )
+
+    env = env_from_job(out, "job-run-task.yaml")
+    assert env["GIT_CONFIG_VALUE_1"]["value"] == "Custom Bot"
+    assert env["GIT_CONFIG_VALUE_2"]["value"] == "custom-bot@example.local"
+    assert env["GIT_CONFIG_VALUE_0"]["value"] == "!f() { echo username=oauth2; echo password=$GITLAB_TOKEN; }; f"
 
 
 def test_kubernetes_kustomization_references_base_resources(tmp_path):
