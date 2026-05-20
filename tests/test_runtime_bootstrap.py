@@ -24,6 +24,13 @@ def env_from_job(output_dir, job_name="job-dry-run.yaml"):
     return {item["name"]: item for item in container["env"]}
 
 
+def pod_parts_from_job(output_dir, job_name):
+    job = yaml.safe_load((output_dir / job_name).read_text(encoding="utf-8"))
+    pod = job["spec"]["template"]["spec"]
+    container = pod["containers"][0]
+    return pod, container
+
+
 def test_kubernetes_bootstrap_generates_expected_files_without_secrets(tmp_path):
     out = generate_k8s(
         namespace="agentlab",
@@ -47,6 +54,9 @@ def test_kubernetes_bootstrap_generates_expected_files_without_secrets(tmp_path)
         "job-plan.yaml",
         "job-run-task.yaml",
         "job-full-flow.yaml",
+        "job-scheduler-watch.yaml",
+        "job-scheduler-plan.yaml",
+        "job-scheduler-action.yaml",
         "kustomization.yaml",
         "README.generated.md",
     }
@@ -57,6 +67,7 @@ def test_kubernetes_bootstrap_generates_expected_files_without_secrets(tmp_path)
     assert "privileged: true" not in content
     assert "glpat-replace-me" in (out / "secret.example.yaml").read_text(encoding="utf-8")
     assert not list(out.glob("cronjob-*.yaml"))
+    assert (out / "job-scheduler-watch.yaml").exists()
 
 
 def test_kubernetes_configmap_safe_defaults_and_connection_values(tmp_path):
@@ -238,9 +249,9 @@ def test_kubernetes_bootstrap_generates_scheduler_cronjobs_when_enabled(tmp_path
     )
 
     for name, cron, command in (
-        ("watch", "*/15 * * * *", "scheduler-watch"),
-        ("plan", "0 8 * * *", "scheduler-plan"),
-        ("action", "30 2 * * *", "scheduler-action"),
+        ("scheduler-watch", "*/15 * * * *", "scheduler-watch"),
+        ("scheduler-plan", "0 8 * * *", "scheduler-plan"),
+        ("scheduler-action", "30 2 * * *", "scheduler-action"),
     ):
         cronjob = yaml.safe_load((out / f"cronjob-{name}.yaml").read_text(encoding="utf-8"))
         assert cronjob["kind"] == "CronJob"
@@ -256,6 +267,57 @@ def test_kubernetes_bootstrap_generates_scheduler_cronjobs_when_enabled(tmp_path
     config = config_from_configmap(out)
     assert config["schedule"]["enabled"] is True
     assert config["schedule"]["watch"]["cron"] == "*/15 * * * *"
+
+
+def test_kubernetes_bootstrap_generates_manual_scheduler_jobs(tmp_path):
+    out = generate_k8s(
+        namespace="agentlab",
+        image="registry.local/agentlab:0.1.0",
+        gitlab_url="https://gitlab.local",
+        target_repo_url="https://gitlab.local/group/project.git",
+        ollama_url="http://ollama.local:11434",
+        output_dir=tmp_path,
+    )
+
+    for name, command in (
+        ("scheduler-watch", "scheduler-watch"),
+        ("scheduler-plan", "scheduler-plan"),
+        ("scheduler-action", "scheduler-action"),
+    ):
+        pod, container = pod_parts_from_job(out, f"job-{name}.yaml")
+        assert container["args"] == [command, "--config", "/etc/agentlab/config.yaml"]
+        assert container["image"] == "registry.local/agentlab:0.1.0"
+        env = {item["name"]: item for item in container["env"]}
+        assert env["GITLAB_TOKEN"]["valueFrom"]["secretKeyRef"]["name"] == "agentlab-secrets"
+        assert env["GIT_TERMINAL_PROMPT"]["value"] == "0"
+        assert env["GIT_CONFIG_COUNT"]["value"] == "3"
+        assert env["GIT_CONFIG_KEY_0"]["value"] == "credential.helper"
+        assert env["GIT_CONFIG_KEY_1"]["value"] == "user.name"
+        assert env["GIT_CONFIG_KEY_2"]["value"] == "user.email"
+        mount_names = {mount["name"] for mount in container["volumeMounts"]}
+        volume_names = {volume["name"] for volume in pod["volumes"]}
+        assert {"config", "git-netrc", "workspace", "runs", "home", "tmp"}.issubset(mount_names)
+        assert {"config", "git-netrc", "workspace", "runs", "home", "tmp"}.issubset(volume_names)
+
+
+def test_scheduler_jobs_share_env_and_mounts_with_run_task(tmp_path):
+    out = generate_k8s(
+        namespace="agentlab",
+        image="registry.local/agentlab:0.1.0",
+        gitlab_url="https://gitlab.local",
+        target_repo_url="https://gitlab.local/group/project.git",
+        ollama_url="http://ollama.local:11434",
+        output_dir=tmp_path,
+    )
+
+    run_pod, run_container = pod_parts_from_job(out, "job-run-task.yaml")
+    watch_pod, watch_container = pod_parts_from_job(out, "job-scheduler-watch.yaml")
+
+    assert {item["name"]: item for item in watch_container["env"]} == {item["name"]: item for item in run_container["env"]}
+    assert {mount["name"] for mount in watch_container["volumeMounts"]} >= {
+        mount["name"] for mount in run_container["volumeMounts"] if mount["name"] != "task"
+    }
+    assert {volume["name"] for volume in watch_pod["volumes"]} >= {volume["name"] for volume in run_pod["volumes"] if volume["name"] != "task"}
 
 
 def test_docker_bootstrap_generates_compose_config_and_readme(tmp_path):

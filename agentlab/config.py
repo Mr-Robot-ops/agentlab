@@ -126,6 +126,22 @@ class ScheduleConfig(BaseModel):
     limits: ScheduleLimitsConfig = Field(default_factory=ScheduleLimitsConfig)
     behavior: ScheduleBehaviorConfig = Field(default_factory=ScheduleBehaviorConfig)
 
+    @model_validator(mode="before")
+    @classmethod
+    def fill_partial_entries(cls, raw: Any) -> Any:
+        if not isinstance(raw, dict):
+            return raw
+        defaults = {
+            "watch": {"enabled": True, "cron": "*/30 * * * *"},
+            "plan": {"enabled": True, "cron": "0 7,19 * * *"},
+            "action": {"enabled": True, "cron": "30 2 * * *"},
+        }
+        merged = dict(raw)
+        for key, default in defaults.items():
+            if isinstance(merged.get(key), dict):
+                merged[key] = {**default, **merged[key]}
+        return merged
+
 
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)

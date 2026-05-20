@@ -97,6 +97,9 @@ def test_path_outside_allowed_paths_is_rejected() -> None:
 
     assert approved.approved is False
     assert "path_not_allowed" in report["rejected_tasks"][0]["reasons"]
+    details = report["rejected_tasks"][0]["details"]
+    assert details["disallowed_paths"] == ["src/app.py"]
+    assert details["allowed_paths"] == ["README.md", "docs/**", "tests/**", "rust-backend/tests/**", "web/src/**/*.test.ts"]
 
 
 def test_task_without_affected_files_is_rejected() -> None:
@@ -135,3 +138,46 @@ def test_multiple_approved_tasks_are_selected_deterministically() -> None:
 
     assert [item.id for item in approved_plan.tasks if item.approved] == ["tests-z", "docs-b", "docs-a"]
     assert report["selected_task_id"] == "docs-a"
+
+
+def test_auto_approval_report_includes_path_match_details() -> None:
+    _, report = apply_one(
+        task(id="mixed-tests", task_type=TaskType.TESTS, affected_files=["rust-backend/src/error.rs", "rust-backend/Cargo.toml"]),
+        config(allowed_paths=["rust-backend/Cargo.toml", "rust-backend/tests/**"]),
+    )
+
+    rejected = report["rejected_tasks"][0]
+    assert rejected["reasons"] == ["path_not_allowed"]
+    assert rejected["details"]["disallowed_paths"] == ["rust-backend/src/error.rs"]
+    assert rejected["details"]["matched_allowed_paths"] == {"rust-backend/Cargo.toml": "rust-backend/Cargo.toml"}
+
+
+def test_auto_approval_report_includes_risk_and_type_details() -> None:
+    _, report = apply_one(
+        task(
+            id="ci-high-risk",
+            task_type=TaskType.CI,
+            risk_level=RiskLevel.HIGH,
+            risk_score=30,
+            affected_files=[".github/workflows/docker-build.yml"],
+        )
+    )
+
+    rejected = report["rejected_tasks"][0]
+    assert "risk_score_above_limit" in rejected["reasons"]
+    assert "risk_level_too_high" in rejected["reasons"]
+    assert "task_type_not_allowed" in rejected["reasons"]
+    details = rejected["details"]
+    assert details["risk_score"] == 30
+    assert details["max_risk_score"] == 3
+    assert details["risk_level"] == "high"
+    assert details["allowed_risk_levels"] == ["low", "medium"]
+    assert details["task_type"] == "ci"
+    assert details["allowed_task_types"] == ["docs", "tests"]
+
+
+def test_auto_approval_report_includes_blocked_path_details() -> None:
+    _, report = apply_one(task(affected_files=["deploy/app.yaml"]), config(allowed_paths=["deploy/**"]))
+
+    details = report["rejected_tasks"][0]["details"]
+    assert details["blocked_paths_matched"] == [{"path": "deploy/app.yaml", "pattern": "deploy/**"}]
