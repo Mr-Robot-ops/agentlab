@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import uuid
 import time
+import uuid
 from pathlib import Path
 
 from agentlab.artifacts import ArtifactStore
@@ -35,6 +35,7 @@ from agentlab.models import (
     TaskPlan,
 )
 from agentlab.preflight import PreflightChecker
+from agentlab.policies.auto_approval import AutoApprovalPolicy
 from agentlab.policies.policy_engine import PolicyEngine
 from agentlab.policies.risk import assess_risk
 from agentlab.provenance import ProvenanceBuilder
@@ -232,13 +233,18 @@ class Orchestrator:
         self.audit.emit(agent="orchestrator", action="full_flow", status="started")
         try:
             plan = self.plan()
-            approved_tasks = [task for task in plan.tasks if task.approved]
+            approved_plan, auto_approval_report = AutoApprovalPolicy(self.config).apply(plan)
+            self.artifacts.write_json("auto_approval_report", auto_approval_report)
+            if self.config.auto_approve.enabled:
+                self.artifacts.write_json("approved_plan", approved_plan)
+            approved_tasks = [task for task in approved_plan.tasks if task.approved]
             if not approved_tasks:
                 result = {
                     "run_id": self.run_id,
                     "status": "blocked",
                     "reason": "no approved task available for implementation",
-                    "plan": plan.model_dump(mode="json"),
+                    "plan": approved_plan.model_dump(mode="json"),
+                    "auto_approval": auto_approval_report,
                 }
                 self.audit.emit(
                     agent="orchestrator",
@@ -248,7 +254,11 @@ class Orchestrator:
                     output_payload=result,
                 )
                 return result
-            task = approved_tasks[0]
+            if self.config.auto_approve.enabled:
+                task = AutoApprovalPolicy.select_task(approved_tasks)
+                assert task is not None
+            else:
+                task = approved_tasks[0]
             implementation = self.run_task(task)
             if implementation.status != ReportStatus.PASSED:
                 result = {"run_id": self.run_id, "status": "failed", "implementation": implementation.model_dump(mode="json")}
