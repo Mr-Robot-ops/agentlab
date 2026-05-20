@@ -7,6 +7,7 @@ from pathlib import Path
 import typer
 
 from agentlab.config import load_config
+from agentlab.doctor import format_doctor, report_json, run_doctor
 from agentlab.models import AgentTask
 from agentlab.orchestrator import Orchestrator
 from agentlab.preflight import PreflightChecker
@@ -110,6 +111,18 @@ def dry_run(config: Path = typer.Option(..., "--config", exists=True, readable=T
     cfg = load_config(config)
     orchestrator = Orchestrator(cfg, dry_run=True)
     _json_echo({"run_id": orchestrator.run_id, "plan": orchestrator.plan().model_dump(mode="json")})
+
+
+@app.command()
+def doctor(
+    config: Path = typer.Option(..., "--config", exists=True, readable=True),
+    json_output: bool = typer.Option(False, "--json", help="Emit machine-readable JSON."),
+) -> None:
+    report = run_doctor(config)
+    typer.echo(report_json(report) if json_output else format_doctor(report))
+    exit_code = int(report["exit_code"])
+    if exit_code:
+        raise typer.Exit(code=exit_code)
 
 
 @app.command()

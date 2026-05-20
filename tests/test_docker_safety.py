@@ -77,3 +77,31 @@ services:
     assert by_title["Host gateway exposed to container"].severity == "medium"
     assert by_title["Secret-like environment variable name"].severity == "high"
     assert by_title["Secret-like env_file referenced"].severity == "high"
+
+
+def test_docker_safety_scanner_handles_compose_scalar_and_mapping_forms(tmp_path: Path) -> None:
+    compose = tmp_path / "docker-compose.yml"
+    compose.write_text(
+        """
+services:
+  app:
+    image: alpine
+    privileged: "true"
+    pid: HOST
+    security_opt: seccomp=unconfined
+    extra_hosts:
+      host.docker.internal: host-gateway
+    env_file:
+      path: secrets.env
+""",
+        encoding="utf-8",
+    )
+
+    findings = DockerSafetyScanner(tmp_path).scan_compose_file()
+    by_title = {finding.title: finding for finding in findings}
+
+    assert by_title["Privileged compose service"].blocked is True
+    assert by_title["Host namespace requested: pid"].blocked is True
+    assert by_title["Unconfined security profile"].blocked is True
+    assert by_title["Host gateway exposed to container"].severity == "medium"
+    assert by_title["Secret-like env_file referenced"].severity == "high"

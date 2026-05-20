@@ -11,9 +11,10 @@ class FakeMR:
         *,
         draft: bool = False,
         has_conflicts: bool = False,
-        state: str = "opened",
+        state: str | None = "opened",
         detailed_merge_status: str | None = "mergeable",
         merge_status: str | None = "can_be_merged",
+        work_in_progress: bool = False,
     ) -> None:
         self.id = 1
         self.iid = 7
@@ -26,6 +27,7 @@ class FakeMR:
         self.state = state
         self.detailed_merge_status = detailed_merge_status
         self.merge_status = merge_status
+        self.work_in_progress = work_in_progress
         self.merged = False
 
     def merge(self, *, squash: bool = True) -> None:
@@ -55,11 +57,15 @@ def tool_for(mr: FakeMR) -> GitLabTool:
     "mr,error",
     [
         (FakeMR(draft=True), "draft"),
+        (FakeMR(work_in_progress=True), "draft"),
         (FakeMR(has_conflicts=True), "conflicts"),
         (FakeMR(state="closed"), "state"),
+        (FakeMR(state=None), "state"),
         (FakeMR(detailed_merge_status="not_open"), "not mergeable"),
         (FakeMR(detailed_merge_status="checking"), "not mergeable"),
+        (FakeMR(detailed_merge_status="unknown"), "not mergeable"),
         (FakeMR(detailed_merge_status=None, merge_status="unchecked"), "not mergeable"),
+        (FakeMR(detailed_merge_status=None, merge_status=None), "unknown"),
     ],
 )
 def test_merge_mr_guarded_blocks_unsafe_states(mr: FakeMR, error: str) -> None:
