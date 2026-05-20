@@ -464,18 +464,27 @@ am Implementer-Patch-Repair kann derselbe Task erneut gestartet werden.
 
 Raw Unified Diffs von LLMs sind fuer Markdown-Aenderungen fragil. Docs- und Markdown-Tasks verwenden deshalb
 bevorzugt `implementation_mode: "structured_edit"` statt `PatchProposal`. Der Implementer liefert strukturierte
-Operationen wie `replace_text`, `append_to_file` oder `replace_file`; AgentLab schreibt die Datei selbst und prueft
-danach Diff, Risk, Protected Paths und Secrets.
+Operationen wie `insert_before`, `insert_after`, `replace_text`, `append_to_file` oder `replace_file`; AgentLab
+schreibt die Datei selbst und prueft danach Diff, Risk, Protected Paths und Secrets. Fuer neue Markdown-Abschnitte
+sollten `insert_before` oder `insert_after` mit einem eindeutigen Anchor verwendet werden. `replace_text` ist fuer
+kleine, exakt kopierte Textstellen gedacht und bleibt bei grossen Markdown-Bloecken absichtlich streng.
 
 Relevante Artefakte:
 
 - `structured_edit_raw_response.json`: rohe Modellantwort, redacted.
 - `structured_edit_proposal.json`: geparstes StructuredEditProposal, redacted.
 - `structured_edit_apply_report.json`: angewendete Operationen, geaenderte Dateien und Fallback-Metadaten.
-- `structured_edit_error.json`: Fehlergrund, falls die strukturierte Anwendung scheitert.
+- `structured_edit_error.json`: Fehlergrund, fehlgeschlagener Edit-Index, Pfad, Operation, Hashes, escaped/repr
+  Excerpts und bis zu drei `candidate_contexts` aus der Ziel-Datei. Damit werden z. B. Unterschiede zwischen einem
+  echten Unicode-Gedankenstrich und literal `\u2014` sichtbar.
+- Bei Reparaturversuchen: `structured_edit_repair_raw_response.json`, `structured_edit_repair_proposal.json`,
+  `structured_edit_repair_apply_report.json` oder `structured_edit_repair_error.json`.
 
 Bei Fehlern zuerst `implementation_report.json` pruefen, insbesondere `implementation_mode`, `failure_stage`,
-`failure_reason`, `fallback_attempted`, `no_changes_committed` und `no_branch_pushed`.
+`failure_reason`, `retry_attempted`, `retry_succeeded`, `fallback_attempted`, `no_changes_committed` und
+`no_branch_pushed`. Bei `old_text_not_found`, `old_text_not_unique`, `anchor_not_found` oder `anchor_not_unique`
+versucht AgentLab genau eine sichere Structured-Edit-Reparatur fuer dieselben `affected_files`; Commit und Push
+passieren nur, wenn die reparierte Anwendung erfolgreich ist.
 
 Lokale Tests:
 

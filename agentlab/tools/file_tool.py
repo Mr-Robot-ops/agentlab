@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 import shutil
 from difflib import SequenceMatcher
 from pathlib import Path, PurePosixPath
@@ -32,6 +33,35 @@ class UnifiedDiffValidationError(ToolError):
             "line_number": self.line_number,
             "offending_line": self.offending_line,
             "reason": self.reason,
+        }
+
+
+class StructuredEditError(ToolError):
+    def __init__(
+        self,
+        *,
+        reason: str,
+        message: str,
+        edit_index: int,
+        path: str,
+        operation: str,
+        details: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.reason = reason
+        self.edit_index = edit_index
+        self.path = path
+        self.operation = operation
+        self.details = details or {}
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "reason": self.reason,
+            "error": str(self),
+            "failing_edit_index": self.edit_index,
+            "path": self.path,
+            "operation": self.operation,
+            **self.details,
         }
 
 
@@ -177,29 +207,94 @@ class FileTool:
 
     def apply_structured_edits(self, proposal: StructuredEditProposal) -> DiffStats:
         planned: dict[str, tuple[Path, str, str]] = {}
-        for edit in proposal.edits:
+        working: dict[str, str] = {}
+        originals: dict[str, str] = {}
+        paths: dict[str, Path] = {}
+        for index, edit in enumerate(proposal.edits):
             path = self._safe_path(edit.path)
             self._validate_paths([edit.path])
-            old_content = path.read_text(encoding="utf-8") if path.exists() else ""
+            if edit.path not in working:
+                originals[edit.path] = path.read_text(encoding="utf-8") if path.exists() else ""
+                working[edit.path] = originals[edit.path]
+                paths[edit.path] = path
+            old_content = working[edit.path]
             if edit.operation == "replace_file":
                 new_content = edit.content or ""
             elif edit.operation == "append_to_file":
                 if not path.exists():
-                    raise ToolError(f"append_to_file target does not exist: {edit.path}")
+                    raise self._structured_error(
+                        edit=edit,
+                        edit_index=index,
+                        reason="target_file_missing",
+                        message=f"append_to_file target does not exist: {edit.path}",
+                        target_text=old_content,
+                    )
                 new_content = old_content + (edit.content or "")
             elif edit.operation == "replace_text":
                 if not path.exists():
-                    raise ToolError(f"replace_text target does not exist: {edit.path}")
+                    raise self._structured_error(
+                        edit=edit,
+                        edit_index=index,
+                        reason="target_file_missing",
+                        message=f"replace_text target does not exist: {edit.path}",
+                        target_text=old_content,
+                    )
                 old_text = edit.old_text or ""
                 count = old_content.count(old_text)
                 if count == 0:
-                    raise ToolError(f"replace_text old_text not found in {edit.path}")
+                    raise self._structured_error(
+                        edit=edit,
+                        edit_index=index,
+                        reason="old_text_not_found",
+                        message=f"replace_text old_text not found in {edit.path}",
+                        target_text=old_content,
+                    )
                 if count > 1:
-                    raise ToolError(f"replace_text old_text occurs multiple times in {edit.path}")
+                    raise self._structured_error(
+                        edit=edit,
+                        edit_index=index,
+                        reason="old_text_not_unique",
+                        message=f"replace_text old_text occurs multiple times in {edit.path}",
+                        target_text=old_content,
+                    )
                 new_content = old_content.replace(old_text, edit.new_text or "", 1)
+            elif edit.operation in {"insert_before", "insert_after"}:
+                if not path.exists():
+                    raise self._structured_error(
+                        edit=edit,
+                        edit_index=index,
+                        reason="target_file_missing",
+                        message=f"{edit.operation} target does not exist: {edit.path}",
+                        target_text=old_content,
+                    )
+                anchor = edit.anchor or ""
+                count = old_content.count(anchor)
+                if count == 0:
+                    raise self._structured_error(
+                        edit=edit,
+                        edit_index=index,
+                        reason="anchor_not_found",
+                        message=f"{edit.operation} anchor not found in {edit.path}",
+                        target_text=old_content,
+                    )
+                if count > 1:
+                    raise self._structured_error(
+                        edit=edit,
+                        edit_index=index,
+                        reason="anchor_not_unique",
+                        message=f"{edit.operation} anchor occurs multiple times in {edit.path}",
+                        target_text=old_content,
+                    )
+                insert_at = old_content.index(anchor)
+                if edit.operation == "insert_after":
+                    insert_at += len(anchor)
+                new_content = old_content[:insert_at] + (edit.content or "") + old_content[insert_at:]
             else:  # pragma: no cover - pydantic validates operation
                 raise ToolError(f"unsupported structured edit operation: {edit.operation}")
-            planned[edit.path] = (path, old_content, new_content)
+            working[edit.path] = new_content
+
+        for relative_path, new_content in working.items():
+            planned[relative_path] = (paths[relative_path], originals[relative_path], new_content)
 
         changed_files = [path for path, (_, old, new) in planned.items() if old != new]
         protected = self._protected_touches(changed_files)
@@ -221,6 +316,41 @@ class FileTool:
         if not check.ok:
             raise ToolError(check.stderr or "git diff --check failed after structured edit")
         return stats
+
+    def _structured_error(
+        self,
+        *,
+        edit: object,
+        edit_index: int,
+        reason: str,
+        message: str,
+        target_text: str,
+    ) -> StructuredEditError:
+        path = getattr(edit, "path")
+        operation = getattr(edit, "operation")
+        old_text = getattr(edit, "old_text", None)
+        anchor = getattr(edit, "anchor", None)
+        target_path = self._safe_path(path)
+        details = {
+            "old_text_excerpt": _excerpt(old_text),
+            "old_text_repr_excerpt": _repr_excerpt(old_text),
+            "old_text_sha256": _sha256(old_text),
+            "anchor_excerpt": _excerpt(anchor),
+            "anchor_repr_excerpt": _repr_excerpt(anchor),
+            "anchor_sha256": _sha256(anchor),
+            "file_sha256": _sha256(target_text),
+            "target_file_exists": target_path.exists(),
+            "target_file_size": target_path.stat().st_size if target_path.exists() else 0,
+            "candidate_contexts": _candidate_contexts(target_text, old_text or anchor or ""),
+        }
+        return StructuredEditError(
+            reason=reason,
+            message=message,
+            edit_index=edit_index,
+            path=path,
+            operation=operation,
+            details=details,
+        )
 
     def _validate_paths(self, paths: list[str]) -> None:
         for path in paths:
@@ -285,3 +415,39 @@ class FileTool:
             touched_protected_paths=protected,
             secrets_touched=secrets_touched,
         )
+
+
+def _sha256(value: str | None) -> str | None:
+    if value is None:
+        return None
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _excerpt(value: str | None, limit: int = 500) -> str | None:
+    if value is None:
+        return None
+    return value[:limit]
+
+
+def _repr_excerpt(value: str | None, limit: int = 500) -> str | None:
+    if value is None:
+        return None
+    return ascii(value[:limit])
+
+
+def _candidate_contexts(text: str, needle: str, *, limit: int = 500) -> list[str]:
+    candidates: list[str] = []
+    headings = [line.strip() for line in needle.splitlines() if line.lstrip().startswith("#")]
+    search_terms = headings or [part.strip() for part in re.split(r"\s+", needle) if len(part.strip()) >= 8][:5]
+    for term in search_terms:
+        index = text.find(term)
+        if index < 0:
+            continue
+        start = max(0, index - limit // 2)
+        end = min(len(text), index + len(term) + limit // 2)
+        context = text[start:end]
+        if context not in candidates:
+            candidates.append(context)
+        if len(candidates) >= 3:
+            break
+    return candidates
