@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from agentlab.config import AppConfig
 from agentlab.models import (
     AgentTask,
@@ -144,6 +146,32 @@ def test_finalizer_blocks_auto_merge_when_pipeline_failed_and_comments_reason() 
     assert "MR pipeline status is not mergeable: failed" in fake.comments[-1][1]
 
 
+@pytest.mark.parametrize("pipeline_status", ["missing", "manual", "canceled", "skipped"])
+def test_finalizer_blocks_auto_merge_for_non_success_terminal_pipeline_states(pipeline_status: str) -> None:
+    fake = FakeGitLabTool(pipeline_status=pipeline_status)
+    gate = GateDecision(allowed=True, mode="merge_request", verdict="allowed", risk_score=10)
+
+    result = MRFinalizer(config(auto_merge_enabled=True), fake).finalize(**inputs(gate))  # type: ignore[arg-type]
+
+    assert result.auto_merge_attempted is False
+    assert fake.merge_called is False
+    assert result.pipeline_status == pipeline_status
+    assert result.skipped_reason == f"MR pipeline status is not mergeable: {pipeline_status}"
+
+
+def test_finalizer_blocks_auto_merge_when_waited_pipeline_does_not_finish() -> None:
+    fake = FakeGitLabTool(pipeline_status="running", wait_status="running")
+    gate = GateDecision(allowed=True, mode="merge_request", verdict="allowed", risk_score=10)
+
+    result = MRFinalizer(config(auto_merge_enabled=True), fake).finalize(**inputs(gate))  # type: ignore[arg-type]
+
+    assert fake.wait_called is True
+    assert result.auto_merge_attempted is False
+    assert fake.merge_called is False
+    assert result.pipeline_status == "running"
+    assert result.skipped_reason == "MR pipeline did not finish before timeout: running"
+
+
 def test_finalizer_blocks_auto_merge_when_mr_is_draft() -> None:
     fake = FakeGitLabTool(readiness={"state": "opened", "draft": True, "has_conflicts": False})
     gate = GateDecision(allowed=True, mode="merge_request", verdict="allowed", risk_score=10)
@@ -152,4 +180,23 @@ def test_finalizer_blocks_auto_merge_when_mr_is_draft() -> None:
 
     assert result.auto_merge_attempted is False
     assert result.skipped_reason == "MR is draft"
+    assert fake.merge_called is False
+
+
+def test_finalizer_blocks_auto_merge_when_mr_state_is_unknown() -> None:
+    fake = FakeGitLabTool(
+        readiness={
+            "state": None,
+            "draft": False,
+            "has_conflicts": False,
+            "detailed_merge_status": "mergeable",
+            "merge_status": "can_be_merged",
+        }
+    )
+    gate = GateDecision(allowed=True, mode="merge_request", verdict="allowed", risk_score=10)
+
+    result = MRFinalizer(config(auto_merge_enabled=True), fake).finalize(**inputs(gate))  # type: ignore[arg-type]
+
+    assert result.auto_merge_attempted is False
+    assert result.skipped_reason == "MR state is not opened: None"
     assert fake.merge_called is False

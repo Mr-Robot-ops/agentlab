@@ -3,9 +3,8 @@ from __future__ import annotations
 import os
 import time
 from typing import Any
-from urllib.parse import quote
 
-from agentlab.config import AppConfig
+from agentlab.config import AppConfig, gitlab_project_api_id
 from agentlab.models import MergeRequestInfo
 
 
@@ -25,7 +24,7 @@ class GitLabTool:
             raise RuntimeError(f"GitLab token env var is not set: {config.gitlab_token_env}")
         self.config = config
         self.client = gitlab.Gitlab(config.gitlab_url, private_token=token)
-        self.project = self.client.projects.get(config.project_id)
+        self.project = self.client.projects.get(gitlab_project_api_id(config.project_id))
 
     def find_open_mr(self, source_branch: str, target_branch: str) -> MergeRequestInfo | None:
         mrs = self.project.mergerequests.list(
@@ -108,7 +107,7 @@ class GitLabTool:
         return {"id": pipeline.id, "status": pipeline.status, "web_url": getattr(pipeline, "web_url", None)}
 
     def get_latest_pipeline_status(self, ref: str) -> dict[str, Any]:
-        project_id = quote(str(self.config.project_id), safe="")
+        project_id = gitlab_project_api_id(self.config.project_id)
         try:
             pipeline = self.client.http_get(f"/projects/{project_id}/pipelines/latest", query_data={"ref": ref})
         except Exception as exc:
@@ -157,18 +156,18 @@ class GitLabTool:
         return {"id": pipeline.id, "status": pipeline.status, "web_url": getattr(pipeline, "web_url", None)}
 
     def get_mr_approval_state(self, mr_iid: int) -> dict[str, Any]:
-        project_id = quote(str(self.config.project_id), safe="")
+        project_id = gitlab_project_api_id(self.config.project_id)
         return self.client.http_get(f"/projects/{project_id}/merge_requests/{mr_iid}/approval_state")
 
     def get_mr_approvals(self, mr_iid: int) -> dict[str, Any]:
-        project_id = quote(str(self.config.project_id), safe="")
+        project_id = gitlab_project_api_id(self.config.project_id)
         return self.client.http_get(f"/projects/{project_id}/merge_requests/{mr_iid}/approvals")
 
     def get_mr_merge_readiness(self, mr_id: int) -> dict[str, Any]:
         mr = self.project.mergerequests.get(mr_id)
         return {
             "state": getattr(mr, "state", None),
-            "draft": bool(getattr(mr, "draft", False)),
+            "draft": bool(getattr(mr, "draft", False) or getattr(mr, "work_in_progress", False)),
             "has_conflicts": bool(getattr(mr, "has_conflicts", False)),
             "detailed_merge_status": getattr(mr, "detailed_merge_status", None),
             "merge_status": getattr(mr, "merge_status", None),
@@ -189,9 +188,9 @@ class GitLabTool:
     @staticmethod
     def _assert_mr_mergeable(mr: Any) -> None:
         state = getattr(mr, "state", None)
-        if state and state != "opened":
+        if state != "opened":
             raise RuntimeError(f"refusing to merge MR with state: {state}")
-        if getattr(mr, "draft", False):
+        if getattr(mr, "draft", False) or getattr(mr, "work_in_progress", False):
             raise RuntimeError("refusing to merge draft MR")
         if getattr(mr, "has_conflicts", False):
             raise RuntimeError("refusing to merge MR with conflicts")

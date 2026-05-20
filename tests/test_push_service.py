@@ -155,12 +155,21 @@ def test_push_service_happy_path_pushes_default_branch() -> None:
     assert result.pushed is True
     assert result.local_commit_created is True
     assert result.commit_sha == "commit123"
-    assert ("status_porcelain", None) in git.calls
-    assert ("checkout", "main") in git.calls
-    assert ("pull_ff_only", "main") in git.calls
+    assert [call[0] for call in git.calls] == [
+        "status_porcelain",
+        "checkout",
+        "pull_ff_only",
+        "cherry_pick",
+        "diff_stats",
+        "commit_direct_main",
+        "status_porcelain",
+        "push_default_branch",
+    ]
+    assert git.calls[1] == ("checkout", "main")
+    assert git.calls[2] == ("pull_ff_only", "main")
     assert ("cherry_pick", ("abc123", True, True)) in git.calls
-    assert any(call[0] == "diff_stats" for call in git.calls)
-    assert any(call[0] == "commit_direct_main" for call in git.calls)
+    assert git.calls[4] == ("diff_stats", ("HEAD", ()))
+    assert git.calls[5][0] == "commit_direct_main"
     assert ("push_default_branch", None) in git.calls
     assert test_tool.commands == ["python -m pytest"]
 
@@ -232,5 +241,21 @@ def test_push_service_final_diff_protected_path_fails_without_commit() -> None:
     assert result.status == ReportStatus.FAILED
     assert result.local_commit_created is False
     assert any("protected paths touched" in error for error in result.errors)
+    assert all(call[0] != "commit_direct_main" for call in git.calls)
+    assert ("push_default_branch", None) not in git.calls
+
+
+def test_push_service_final_diff_secrets_touched_fails_without_commit() -> None:
+    git = FakeGitTool(final_diff=DiffStats(changed_files=["config/.env"], secrets_touched=True))
+
+    result = PushService(
+        config(direct_main_push_enabled=True),
+        git,
+        FakeTestTool(),
+    ).push_direct_main(**inputs())  # type: ignore[arg-type]
+
+    assert result.status == ReportStatus.FAILED
+    assert result.local_commit_created is False
+    assert "secrets touched" in result.errors
     assert all(call[0] != "commit_direct_main" for call in git.calls)
     assert ("push_default_branch", None) not in git.calls

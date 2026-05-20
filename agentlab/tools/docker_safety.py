@@ -46,10 +46,10 @@ class DockerSafetyScanner:
 
     def _scan_service(self, path: str, service: dict[str, Any]) -> list[Finding]:
         findings: list[Finding] = []
-        if service.get("privileged") is True:
+        if service.get("privileged") is True or str(service.get("privileged", "")).lower() == "true":
             findings.append(self._blocked(path, "Privileged compose service", "privileged: true is not allowed."))
         for key in ("network_mode", "pid", "ipc"):
-            if service.get(key) == "host":
+            if str(service.get(key, "")).lower() == "host":
                 findings.append(self._blocked(path, f"Host namespace requested: {key}", f"{key}: host is not allowed."))
         if service.get("cap_add"):
             findings.append(self._blocked(path, "Linux capabilities added", "cap_add requires explicit policy support and is blocked."))
@@ -66,11 +66,11 @@ class DockerSafetyScanner:
                     blocked=False,
                 )
             )
-        for option in service.get("security_opt", []) or []:
+        for option in self._list_values(service.get("security_opt")):
             normalized = str(option).lower()
             if normalized in {"apparmor=unconfined", "seccomp=unconfined"}:
                 findings.append(self._blocked(path, "Unconfined security profile", f"security_opt {option} is not allowed."))
-        for host in service.get("extra_hosts", []) or []:
+        for host in self._list_values(service.get("extra_hosts")):
             if "host-gateway" in str(host).lower():
                 findings.append(
                     self._finding(
@@ -120,7 +120,7 @@ class DockerSafetyScanner:
     def _scan_env_files(self, path: str, env_file: Any) -> list[Finding]:
         if env_file is None:
             return []
-        values = env_file if isinstance(env_file, list) else [env_file]
+        values = self._list_values(env_file)
         findings = []
         for value in values:
             text = str(value).lower()
@@ -135,6 +135,16 @@ class DockerSafetyScanner:
                     )
                 )
         return findings
+
+    @staticmethod
+    def _list_values(value: Any) -> list[Any]:
+        if value is None:
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, dict):
+            return list(value.values())
+        return [value]
 
     @staticmethod
     def _volume_target(volume: Any) -> str:

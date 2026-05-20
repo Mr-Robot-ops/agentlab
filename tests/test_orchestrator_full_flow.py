@@ -35,7 +35,7 @@ class DummyOrchestrator(Orchestrator):
         self.run_id = "run-1"
         self.audit = FakeAudit()
         self.artifacts = FakeArtifacts()
-        self.last_gate_context = {}
+        self.last_gate_context = None
 
     def plan(self) -> TaskPlan:
         return TaskPlan(tasks=[AgentTask(id="t1", title="Task", approved=True)])
@@ -46,7 +46,7 @@ class DummyOrchestrator(Orchestrator):
     def review_and_gate(self, task: AgentTask, *, direct_main_push: bool = False) -> GateDecision:
         return GateDecision(allowed=True, mode="merge_request", verdict="allowed", risk_score=5)
 
-    def provenance(self):  # type: ignore[no-untyped-def]
+    def provenance(self) -> None:
         return None
 
 
@@ -64,7 +64,11 @@ def test_full_flow_skips_auto_merge_when_no_mr_exists() -> None:
     result = orchestrator.full_flow()
 
     assert result["status"] == "passed"
-    assert result["merge_request"]["status"] == "skipped"  # type: ignore[index]
-    assert result["mr_finalization"]["status"] == "skipped"  # type: ignore[index]
+    merge_request = result["merge_request"]
+    mr_finalization = result["mr_finalization"]
+    assert isinstance(merge_request, dict)
+    assert isinstance(mr_finalization, dict)
+    assert merge_request["status"] == "skipped"
+    assert mr_finalization["status"] == "skipped"
     assert "mr_finalization_result" in orchestrator.artifacts.payloads
     assert "direct_main_push_result" in orchestrator.artifacts.payloads
