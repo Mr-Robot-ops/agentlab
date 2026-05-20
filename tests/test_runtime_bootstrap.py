@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import yaml
 
-from scripts.bootstrap_common import derive_project_path_from_repo_url
+from scripts.bootstrap_common import TOKEN_PLACEHOLDER, derive_project_path_from_repo_url
 from scripts.bootstrap_docker import generate_docker
 from scripts.bootstrap_komodo import generate_komodo
 from scripts.bootstrap_k8s import generate_k8s
@@ -129,6 +129,35 @@ def test_kubernetes_jobs_use_security_context_and_secret_env(tmp_path):
     assert container["args"] == ["doctor", "--config", "/etc/agentlab/config.yaml"]
     assert dry_run_job["spec"]["template"]["spec"]["containers"][0]["args"][0] == "dry-run"
     assert container["env"][0]["valueFrom"]["secretKeyRef"]["key"] == "GITLAB_TOKEN"
+
+
+def test_kubernetes_jobs_configure_noninteractive_gitlab_https_auth(tmp_path):
+    out = generate_k8s(
+        namespace="agentlab",
+        image="registry.local/agentlab:0.1.0",
+        gitlab_url="https://gitlab.local",
+        target_repo_url="https://gitlab.local/group/project.git",
+        ollama_url="http://ollama.local:11434",
+        output_dir=tmp_path,
+    )
+
+    job = yaml.safe_load((out / "job-dry-run.yaml").read_text(encoding="utf-8"))
+    pod_spec = job["spec"]["template"]["spec"]
+    container = pod_spec["containers"][0]
+    env = {item["name"]: item for item in container["env"]}
+
+    assert env["GIT_TERMINAL_PROMPT"]["value"] == "0"
+    assert env["GIT_CONFIG_COUNT"]["value"] == "1"
+    assert env["GIT_CONFIG_KEY_0"]["value"] == "credential.helper"
+    assert "$GITLAB_TOKEN" in env["GIT_CONFIG_VALUE_0"]["value"]
+    assert "glpat-" not in env["GIT_CONFIG_VALUE_0"]["value"]
+    assert TOKEN_PLACEHOLDER not in env["GIT_CONFIG_VALUE_0"]["value"]
+
+    git_netrc = next(volume for volume in pod_spec["volumes"] if volume["name"] == "git-netrc")
+    default_mode = git_netrc["secret"]["defaultMode"]
+    assert default_mode != 0o600
+    assert default_mode & 0o040
+    assert pod_spec["securityContext"]["fsGroup"] == 10001
 
 
 def test_kubernetes_kustomization_references_base_resources(tmp_path):
