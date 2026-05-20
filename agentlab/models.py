@@ -5,7 +5,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class StrictModel(BaseModel):
@@ -106,6 +106,40 @@ class PatchProposal(StrictModel):
     summary: str
     patch: str = Field(min_length=1)
     affected_files: list[str] = Field(default_factory=list)
+    expected_tests: list[str] = Field(default_factory=list)
+    risk_score: int = Field(default=0, ge=0)
+    rollback: str = Field(min_length=1)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class FileEdit(StrictModel):
+    path: str
+    operation: Literal["replace_file", "append_to_file", "replace_text"]
+    content: str | None = None
+    old_text: str | None = None
+    new_text: str | None = None
+    anchor: str | None = None
+
+    @field_validator("path")
+    @classmethod
+    def validate_relative_path(cls, value: str) -> str:
+        if Path(value).is_absolute() or ".." in Path(value).parts:
+            raise ValueError(f"unsafe relative path: {value}")
+        return value
+
+    @model_validator(mode="after")
+    def validate_operation_payload(self) -> "FileEdit":
+        if self.operation in {"replace_file", "append_to_file"} and self.content is None:
+            raise ValueError(f"{self.operation} requires content")
+        if self.operation == "replace_text" and (self.old_text is None or self.new_text is None):
+            raise ValueError("replace_text requires old_text and new_text")
+        return self
+
+
+class StructuredEditProposal(StrictModel):
+    task_id: str
+    summary: str
+    edits: list[FileEdit] = Field(default_factory=list)
     expected_tests: list[str] = Field(default_factory=list)
     risk_score: int = Field(default=0, ge=0)
     rollback: str = Field(min_length=1)
@@ -239,6 +273,10 @@ class ImplementationReport(StrictModel):
     retry_succeeded: bool = False
     no_changes_committed: bool = False
     no_branch_pushed: bool = False
+    implementation_mode: Literal["patch", "structured_edit"] = "patch"
+    fallback_attempted: bool = False
+    fallback_succeeded: bool = False
+    fallback_reason: str | None = None
 
 
 class MergeRequestInfo(StrictModel):

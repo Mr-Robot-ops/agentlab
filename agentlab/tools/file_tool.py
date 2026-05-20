@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import os
 import re
 import shutil
+from difflib import SequenceMatcher
 from pathlib import Path, PurePosixPath
 
 from agentlab.config import AppConfig
-from agentlab.models import DiffStats, PatchProposal
+from agentlab.models import DiffStats, StructuredEditProposal, PatchProposal
 from agentlab.policies.risk import detect_secret_content, detect_secret_paths
 from agentlab.tools.common import ToolError, ensure_within, run_subprocess
 
@@ -175,10 +175,57 @@ class FileTool:
             raise PatchApplyError(command=apply_command, stderr=applied.stderr or "git apply failed", patch=proposal.patch, check=False)
         return stats
 
+    def apply_structured_edits(self, proposal: StructuredEditProposal) -> DiffStats:
+        planned: dict[str, tuple[Path, str, str]] = {}
+        for edit in proposal.edits:
+            path = self._safe_path(edit.path)
+            self._validate_paths([edit.path])
+            old_content = path.read_text(encoding="utf-8") if path.exists() else ""
+            if edit.operation == "replace_file":
+                new_content = edit.content or ""
+            elif edit.operation == "append_to_file":
+                if not path.exists():
+                    raise ToolError(f"append_to_file target does not exist: {edit.path}")
+                new_content = old_content + (edit.content or "")
+            elif edit.operation == "replace_text":
+                if not path.exists():
+                    raise ToolError(f"replace_text target does not exist: {edit.path}")
+                old_text = edit.old_text or ""
+                count = old_content.count(old_text)
+                if count == 0:
+                    raise ToolError(f"replace_text old_text not found in {edit.path}")
+                if count > 1:
+                    raise ToolError(f"replace_text old_text occurs multiple times in {edit.path}")
+                new_content = old_content.replace(old_text, edit.new_text or "", 1)
+            else:  # pragma: no cover - pydantic validates operation
+                raise ToolError(f"unsupported structured edit operation: {edit.operation}")
+            planned[edit.path] = (path, old_content, new_content)
+
+        changed_files = [path for path, (_, old, new) in planned.items() if old != new]
+        protected = self._protected_touches(changed_files)
+        secret_paths = detect_secret_paths(changed_files)
+        secrets_touched = bool(secret_paths) or any(detect_secret_content(new) for _, _, new in planned.values())
+        stats = self._structured_diff_stats(planned, protected=protected, secrets_touched=secrets_touched)
+        if stats.secrets_touched:
+            raise ToolError("refusing to apply structured edit that touches secrets")
+        if stats.touched_protected_paths:
+            raise ToolError("refusing to apply structured edit that touches protected paths")
+        if self.dry_run:
+            return stats
+
+        for path, _, new_content in planned.values():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(new_content, encoding="utf-8")
+
+        check = run_subprocess(["git", "diff", "--check"], cwd=self.repo_path, timeout_seconds=self.config.command_timeout_seconds)
+        if not check.ok:
+            raise ToolError(check.stderr or "git diff --check failed after structured edit")
+        return stats
+
     def _validate_paths(self, paths: list[str]) -> None:
         for path in paths:
             safe = self._safe_path(path)
-            if os.name != "nt" and safe.is_symlink():
+            if safe.is_symlink():
                 raise ToolError(f"refusing to touch symlink: {path}")
 
     def _protected_touches(self, paths: list[str]) -> list[str]:
@@ -208,3 +255,33 @@ class FileTool:
         if not unique:
             raise ToolError("patch does not declare changed files")
         return unique
+
+    @staticmethod
+    def _structured_diff_stats(
+        planned: dict[str, tuple[Path, str, str]],
+        *,
+        protected: list[str],
+        secrets_touched: bool,
+    ) -> DiffStats:
+        changed: list[str] = []
+        added = 0
+        deleted = 0
+        for relative_path, (_, old, new) in planned.items():
+            if old == new:
+                continue
+            changed.append(relative_path)
+            old_lines = old.splitlines()
+            new_lines = new.splitlines()
+            matcher = SequenceMatcher(a=old_lines, b=new_lines)
+            for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+                if tag in {"replace", "delete"}:
+                    deleted += i2 - i1
+                if tag in {"replace", "insert"}:
+                    added += j2 - j1
+        return DiffStats(
+            changed_files=changed,
+            added_lines=added,
+            deleted_lines=deleted,
+            touched_protected_paths=protected,
+            secrets_touched=secrets_touched,
+        )
