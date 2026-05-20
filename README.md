@@ -332,6 +332,10 @@ Skips wie `open_agent_mr_limit_reached`, `daily_mr_limit_reached`, `action_coold
 `no_auto_approved_task` sind keine Fehler. Kubernetes-CronJobs werden nur erzeugt, wenn der Bootstrap mit
 `--schedule-enabled` ausgefuehrt wird. Scheduler-Action erzwingt nie Direct-Main-Push oder Auto-Merge.
 
+Eine ausfuehrliche Kubernetes-Test- und Betriebsanleitung steht in [docs/scheduler.md](docs/scheduler.md). Sie
+beschreibt manuelle `job-scheduler-*` Jobs, numerische GitLab `project_id` Werte, `scheduler-reset-state`,
+`default_branch_unchanged` und detaillierte `path_not_allowed` AutoApproval-Reports.
+
 Der Integrationsablauf:
 
 ```mermaid

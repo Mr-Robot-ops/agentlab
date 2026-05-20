@@ -5,7 +5,7 @@ from pathlib import Path
 
 from agentlab.config import AppConfig
 from agentlab.models import AgentTask, RiskLevel, TaskPlan, TaskType
-from agentlab.scheduler import Scheduler, SchedulerStateStore
+from agentlab.scheduler import Scheduler, SchedulerStateStore, reset_scheduler_state, scheduler_status
 
 
 def config(tmp_path: Path, **overrides: object) -> AppConfig:
@@ -69,7 +69,10 @@ class FakeOrchestrator:
 class HelperScheduler(Scheduler):
     def __init__(self, cfg: AppConfig, *, gitlab: FakeGitLab | None = None, result: dict[str, object] | None = None) -> None:
         self.config = cfg
-        self.orchestrator = FakeOrchestrator(cfg, result=result)
+        self.run_id = "run-1"
+        self.run_dir = Path(cfg.workspace_root) / self.run_id
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self._orchestrator = FakeOrchestrator(cfg, result=result)
         self.state_store = SchedulerStateStore(cfg.workspace_root)
         self.artifacts = self.orchestrator.artifacts
         self.fake_gitlab = gitlab or FakeGitLab()
@@ -127,6 +130,19 @@ def test_scheduler_watch_writes_report_and_updates_head(tmp_path: Path) -> None:
     assert state["open_agent_mrs"] == 1
     assert (scheduler.artifacts.artifacts_dir / "scheduler_report.json").exists()
     assert scheduler.orchestrator.full_flow_called is False
+
+
+def test_scheduler_watch_does_not_prepare_workspace(monkeypatch, tmp_path: Path) -> None:
+    def fail_orchestrator(*args, **kwargs):
+        raise AssertionError("watch should not construct Orchestrator")
+
+    monkeypatch.setattr("agentlab.scheduler.Orchestrator", fail_orchestrator)
+    scheduler = Scheduler(config(tmp_path), run_id="watch-only")
+    scheduler._gitlab = lambda: FakeGitLab(head="head1", open_mrs=0)  # type: ignore[method-assign]
+
+    report = scheduler.watch()
+
+    assert report["status"] == "passed"
 
 
 def test_scheduler_plan_skips_when_disabled(tmp_path: Path) -> None:
@@ -199,3 +215,41 @@ def test_scheduler_action_skips_no_auto_approved_task(tmp_path: Path) -> None:
 
     assert report["status"] == "skipped"
     assert report["reason"] == "no_auto_approved_task"
+
+
+def test_scheduler_reset_state_removes_existing_file(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = SchedulerStateStore(cfg.workspace_root)
+    state, _ = store.read()
+    state["last_default_branch_head"] = "abc"
+    store.write(state)
+
+    report = reset_scheduler_state(cfg)
+
+    assert report["status"] == "passed"
+    assert report["existed"] is True
+    assert not store.path.exists()
+
+
+def test_scheduler_reset_state_reports_missing_file(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+
+    report = reset_scheduler_state(cfg)
+
+    assert report["reason"] == "scheduler_state_removed"
+    assert report["existed"] is False
+
+
+def test_scheduler_status_reads_state_without_writing(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    store = SchedulerStateStore(cfg.workspace_root)
+    state, _ = store.read()
+    state["last_default_branch_head"] = "abc"
+    state["open_agent_mrs"] = 2
+    store.write(state)
+
+    report = scheduler_status(cfg)
+
+    assert report["exists"] is True
+    assert report["last_default_branch_head"] == "abc"
+    assert report["open_agent_mrs"] == 2

@@ -34,3 +34,13 @@ def test_readme_keeps_kubernetes_primary_and_local_python_development_scoped() -
     assert "Local Python ist fuer Entwicklung, Debugging, Codex und lokale Tests gedacht" in text
     assert "kein `/var/run/docker.sock` Mount" in text
     assert "Komodo ist optional" in text
+
+
+def test_scheduler_docs_cover_operational_troubleshooting() -> None:
+    text = Path("docs/scheduler.md").read_text(encoding="utf-8")
+
+    assert 'project_id: "5"' in text
+    assert "path_not_allowed" in text
+    assert "disallowed_paths" in text
+    assert "default_branch_unchanged" in text
+    assert "scheduler-reset-state" in text
