@@ -112,6 +112,23 @@ class PatchProposal(StrictModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+FILE_EDIT_PATH_ALIASES = ("file_path", "filepath", "filename", "file")
+FILE_EDIT_OPERATION_ALIASES = ("tool", "op", "action")
+FILE_EDIT_OPERATION_NORMALIZATION = {
+    "replace": "replace_text",
+    "replaceText": "replace_text",
+    "text_replace": "replace_text",
+    "append": "append_to_file",
+    "append_file": "append_to_file",
+    "write_file": "replace_file",
+    "overwrite_file": "replace_file",
+}
+
+
+def _normalize_file_edit_operation(value: Any) -> Any:
+    return FILE_EDIT_OPERATION_NORMALIZATION.get(value, value)
+
+
 class FileEdit(StrictModel):
     path: str
     operation: Literal["replace_file", "append_to_file", "replace_text"]
@@ -119,6 +136,39 @@ class FileEdit(StrictModel):
     old_text: str | None = None
     new_text: str | None = None
     anchor: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_alias_fields(cls, raw: Any) -> Any:
+        if not isinstance(raw, dict):
+            return raw
+        data = dict(raw)
+        path_values = [(key, data[key]) for key in ("path", *FILE_EDIT_PATH_ALIASES) if key in data]
+        if path_values:
+            first_path = path_values[0][1]
+            conflicts = [(key, value) for key, value in path_values if value != first_path]
+            if conflicts:
+                raise ValueError("conflicting path aliases in FileEdit")
+            data["path"] = first_path
+            for key, _ in path_values:
+                if key != "path":
+                    data.pop(key, None)
+
+        operation_values = [(key, data[key]) for key in ("operation", *FILE_EDIT_OPERATION_ALIASES) if key in data]
+        if operation_values:
+            first_operation = _normalize_file_edit_operation(operation_values[0][1])
+            conflicts = [
+                (key, value)
+                for key, value in operation_values
+                if _normalize_file_edit_operation(value) != first_operation
+            ]
+            if conflicts:
+                raise ValueError("conflicting operation aliases in FileEdit")
+            data["operation"] = first_operation
+            for key, _ in operation_values:
+                if key != "operation":
+                    data.pop(key, None)
+        return data
 
     @field_validator("path")
     @classmethod

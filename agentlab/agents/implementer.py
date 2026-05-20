@@ -10,7 +10,7 @@ from agentlab.policies.risk import assess_risk
 from agentlab.tools.common import ToolError
 from agentlab.tools.file_tool import FileTool, PatchApplyError, UnifiedDiffValidationError
 from agentlab.tools.git_tool import GitTool
-from agentlab.tools.ollama_client import OllamaClient
+from agentlab.tools.ollama_client import OllamaClient, OllamaSchemaValidationError
 
 from .base import compact_text, load_prompt
 
@@ -19,6 +19,12 @@ class StructuredEditApplyError(ToolError):
     def __init__(self, reason: str, message: str) -> None:
         super().__init__(message)
         self.reason = reason
+
+
+class StructuredEditSchemaError(ToolError):
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.reason = "schema_validation_failed"
 
 
 class ImplementationAgent:
@@ -72,7 +78,11 @@ class ImplementationAgent:
             if not checkout.ok:
                 raise ToolError(checkout.stderr or "could not create agent branch")
             if implementation_mode == "structured_edit":
-                structured, raw_response = self._structured_proposal(task)
+                try:
+                    structured, raw_response = self._structured_proposal(task)
+                except OllamaSchemaValidationError as exc:
+                    patch_artifacts.extend(self._persist_structured_schema_error(exc))
+                    raise StructuredEditSchemaError(self._structured_schema_message(exc.raw_response)) from exc
                 patch_artifacts.extend(self._persist_structured_inputs(raw_response, structured))
                 try:
                     diff_stats = self._validate_and_apply_structured(task, structured)
@@ -94,7 +104,11 @@ class ImplementationAgent:
                     if self._is_docs_task(task) and self._is_patch_fallback_candidate(exc):
                         fallback_attempted = True
                         fallback_reason = self._patch_failure_reason(exc)
-                        structured, structured_raw = self._structured_proposal(task, fallback_reason=fallback_reason)
+                        try:
+                            structured, structured_raw = self._structured_proposal(task, fallback_reason=fallback_reason)
+                        except OllamaSchemaValidationError as schema_exc:
+                            patch_artifacts.extend(self._persist_structured_schema_error(schema_exc, fallback_reason=fallback_reason))
+                            raise StructuredEditSchemaError(self._structured_schema_message(schema_exc.raw_response)) from schema_exc
                         patch_artifacts.extend(self._persist_structured_inputs(structured_raw, structured))
                         try:
                             diff_stats = self._validate_and_apply_structured(task, structured)
@@ -178,6 +192,25 @@ class ImplementationAgent:
                 status=ReportStatus.FAILED,
                 errors=errors,
                 failure_stage="structured_edit_apply",
+                failure_reason=exc.reason,
+                patch_artifacts=patch_artifacts,
+                retry_attempted=retry_attempted,
+                retry_succeeded=retry_succeeded,
+                no_changes_committed=not commit_created,
+                no_branch_pushed=not branch_pushed,
+                implementation_mode="structured_edit",
+                fallback_attempted=fallback_attempted,
+                fallback_succeeded=fallback_succeeded,
+                fallback_reason=fallback_reason,
+            )
+        except StructuredEditSchemaError as exc:
+            errors.append(str(exc))
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                errors=errors,
+                failure_stage="structured_edit_schema_validation",
                 failure_reason=exc.reason,
                 patch_artifacts=patch_artifacts,
                 retry_attempted=retry_attempted,
@@ -284,10 +317,27 @@ class ImplementationAgent:
             "repo_context": self.repo_context,
             "file_snippets": snippets,
             "fallback_reason": fallback_reason,
-            "rules": {
-                "output": "Return only one StructuredEditProposal JSON object.",
-                "format": "Do not return a unified diff. Do not use Markdown fences. Do not include explanations outside JSON.",
-                "scope": "Only edit files listed in task.affected_files.",
+                "rules": {
+                    "output": "Return only one StructuredEditProposal JSON object.",
+                    "format": "Do not return a unified diff. Do not use Markdown fences. Do not include explanations outside JSON.",
+                    "example": {
+                        "task_id": task.id,
+                        "summary": "Short description of the documentation change.",
+                        "edits": [
+                            {
+                                "path": "README.md",
+                                "operation": "replace_text",
+                                "old_text": "exact old text",
+                                "new_text": "replacement text",
+                            }
+                        ],
+                        "expected_tests": [],
+                        "risk_score": 1,
+                        "rollback": "Revert the documentation edit.",
+                        "metadata": {},
+                    },
+                    "field_names": "Use path and operation. Do not use file_path. Do not use tool.",
+                    "scope": "Only edit files listed in task.affected_files.",
                 "operations": {
                     "replace_text": "Use when replacing exactly one existing text block; old_text must match exactly once.",
                     "append_to_file": "Use only when appending to an existing file.",
@@ -462,6 +512,32 @@ class ImplementationAgent:
         )
         return [record.name]
 
+    def _persist_structured_schema_error(
+        self,
+        exc: OllamaSchemaValidationError,
+        *,
+        fallback_reason: str | None = None,
+    ) -> list[str]:
+        if self.artifacts is None:
+            return []
+        raw_record = self.artifacts.write_text("structured_edit_raw_response.json", exc.raw_response)
+        error_record = self.artifacts.write_json(
+            "structured_edit_schema_error",
+            {
+                "validation_error_summary": exc.validation_error,
+                "normalized_attempt": self._structured_normalized_attempt(exc.raw_response),
+                "original_response": exc.raw_response,
+                "expected_schema_hint": {
+                    "edit_path_field": "path",
+                    "edit_operation_field": "operation",
+                    "allowed_operations": ["replace_file", "append_to_file", "replace_text"],
+                    "do_not_use": ["file_path", "tool"],
+                },
+                "fallback_reason": fallback_reason,
+            },
+        )
+        return [raw_record.name, error_record.name]
+
     def _validate_and_apply(self, task: AgentTask, proposal: PatchProposal) -> Any:
         self._ensure_task_scope(task, proposal)
         return self.file_tool.apply_patch(proposal)
@@ -540,6 +616,60 @@ class ImplementationAgent:
         if "secret" in text:
             return "secret_detected"
         return "structured_edit_failed"
+
+    @staticmethod
+    def _structured_normalized_attempt(raw_response: str) -> object | None:
+        try:
+            payload = json.loads(raw_response)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return payload
+        normalized = dict(payload)
+        edits = normalized.get("edits")
+        if isinstance(edits, list):
+            normalized_edits = []
+            for edit in edits:
+                if not isinstance(edit, dict):
+                    normalized_edits.append(edit)
+                    continue
+                item = dict(edit)
+                if "path" not in item:
+                    for alias in ("file_path", "filepath", "filename", "file"):
+                        if alias in item:
+                            item["path"] = item[alias]
+                            break
+                if "operation" not in item:
+                    for alias in ("tool", "op", "action"):
+                        if alias in item:
+                            item["operation"] = item[alias]
+                            break
+                normalized_edits.append(item)
+            normalized["edits"] = normalized_edits
+        return normalized
+
+    @staticmethod
+    def _structured_schema_message(raw_response: str) -> str:
+        try:
+            payload = json.loads(raw_response)
+        except json.JSONDecodeError:
+            return "StructuredEditProposal schema validation failed: response was not valid JSON"
+        edits = payload.get("edits") if isinstance(payload, dict) else None
+        if isinstance(edits, list):
+            for index, edit in enumerate(edits):
+                if not isinstance(edit, dict):
+                    continue
+                used = []
+                if any(alias in edit for alias in ("file_path", "filepath", "filename", "file")) and "path" not in edit:
+                    used.append("file_path")
+                if any(alias in edit for alias in ("tool", "op", "action")) and "operation" not in edit:
+                    used.append("tool")
+                if used:
+                    return (
+                        "StructuredEditProposal schema validation failed: "
+                        f"edits[{index}] used {'/'.join(used)}; expected path/operation"
+                    )
+        return "StructuredEditProposal schema validation failed: expected path/operation in each edit"
 
     @staticmethod
     def _is_corrupt_patch(stderr: str) -> bool:
