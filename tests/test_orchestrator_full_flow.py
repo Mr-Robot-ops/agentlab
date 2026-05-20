@@ -4,7 +4,7 @@ from contextlib import nullcontext
 from pathlib import Path
 
 from agentlab.config import AppConfig
-from agentlab.models import AgentTask, GateDecision, ImplementationReport, ReportStatus, TaskPlan
+from agentlab.models import AgentTask, GateDecision, ImplementationReport, ReportStatus, RiskLevel, TaskPlan, TaskType
 from agentlab.orchestrator import Orchestrator
 
 
@@ -50,6 +50,32 @@ class DummyOrchestrator(Orchestrator):
         return None
 
 
+class AutoApproveOrchestrator(DummyOrchestrator):
+    def __init__(self, config: AppConfig) -> None:
+        super().__init__(config)
+        self.implemented_task: AgentTask | None = None
+
+    def plan(self) -> TaskPlan:
+        return TaskPlan(
+            tasks=[
+                AgentTask(
+                    id="docs-readme",
+                    title="Docs README",
+                    task_type=TaskType.DOCS,
+                    risk_level=RiskLevel.LOW,
+                    risk_score=1,
+                    affected_files=["README.md"],
+                    forbidden_actions=["Do not change source code."],
+                    approved=False,
+                )
+            ]
+        )
+
+    def run_task(self, task: AgentTask) -> ImplementationReport:
+        self.implemented_task = task
+        return ImplementationReport(task_id=task.id, branch="agent/docs-readme-run-1", status=ReportStatus.PASSED, pushed=True)
+
+
 def test_full_flow_skips_auto_merge_when_no_mr_exists() -> None:
     config = AppConfig(
         gitlab_url="https://gitlab.example.com",
@@ -72,3 +98,27 @@ def test_full_flow_skips_auto_merge_when_no_mr_exists() -> None:
     assert mr_finalization["status"] == "skipped"
     assert "mr_finalization_result" in orchestrator.artifacts.payloads
     assert "direct_main_push_result" in orchestrator.artifacts.payloads
+
+
+def test_full_flow_uses_auto_approved_task() -> None:
+    config = AppConfig(
+        gitlab_url="https://gitlab.example.com",
+        project_id=1,
+        target_repo_path=Path("."),
+        workspace_root=Path(".runs"),
+        push_agent_branches_enabled=False,
+        auto_approve={"enabled": True},
+    )
+    orchestrator = AutoApproveOrchestrator(config)
+
+    result = orchestrator.full_flow()
+
+    assert result["status"] == "passed"
+    assert orchestrator.implemented_task is not None
+    assert orchestrator.implemented_task.approved is True
+    assert orchestrator.implemented_task.metadata["auto_approval"]["approved_by_policy"] is True
+    assert "auto_approval_report" in orchestrator.artifacts.payloads
+    assert "approved_plan" in orchestrator.artifacts.payloads
+    report = orchestrator.artifacts.payloads["auto_approval_report"]
+    assert isinstance(report, dict)
+    assert report["selected_task_id"] == "docs-readme"

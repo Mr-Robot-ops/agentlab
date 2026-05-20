@@ -62,6 +62,7 @@ class Doctor:
             self._check_docker()
             self._check_repo_policy()
             self._check_dangerous_flags()
+            self._check_auto_approve()
         exit_code = self.exit_code()
         status = "failed" if exit_code == 2 else "warning" if exit_code == 1 else "passed"
         return {
@@ -319,6 +320,29 @@ class Doctor:
             )
         else:
             self._passed("dangerous_flags", "auto_merge, direct_main_push, and push_agent_branches are disabled")
+
+    def _check_auto_approve(self) -> None:
+        assert self.config is not None
+        policy = self.config.auto_approve
+        if not policy.enabled:
+            self._passed("auto_approve", "auto_approve is disabled")
+            return
+        if self.config.direct_main_push_enabled or self.config.auto_merge_enabled:
+            self._failed(
+                "auto_approve",
+                "auto_approve is enabled together with direct_main_push or auto_merge",
+                "Disable direct_main_push_enabled and auto_merge_enabled for autonomous MR-flow.",
+            )
+            return
+        broad = {"*", "**", "**/*"}
+        if any(pattern in broad for pattern in policy.allowed_paths):
+            self._warning(
+                "auto_approve",
+                "auto_approve is enabled with broad allowed_paths",
+                "Narrow auto_approve.allowed_paths to documentation or test paths.",
+            )
+            return
+        self._passed("auto_approve", "auto_approve is enabled with constrained paths")
 
     def _passed(self, name: str, message: str) -> None:
         self.checks.append(PreflightCheck(name=name, status="passed", message=message))

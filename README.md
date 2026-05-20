@@ -257,6 +257,39 @@ AgentLab ist kein Rewrite-Tool. Es arbeitet in kleinen, pruefbaren Schritten:
 - PushService ist der einzige Direct-Main-Push-Pfad und nutzt kein LLM.
 - Rollback/Recovery Agent erstellt Recovery-Hinweise nach fehlgeschlagenen Pipelines.
 
+### Auto-Approval fuer full-flow
+
+`full-flow` kann Planner-Aufgaben deterministisch freigeben, ohne dass das LLM selbst ueber Approval entscheidet.
+Der Planner schlaegt Aufgaben vor; `AutoApprovalPolicy` prueft Task-Typ, Risiko, betroffene Dateien, blockierte
+Pfade und Testanforderungen. Nur Aufgaben, die alle Regeln erfuellen, werden auf `approved: true` gesetzt.
+
+Beispiel:
+
+```yaml
+auto_approve:
+  enabled: true
+  max_risk_score: 3
+  allowed_task_types:
+    - docs
+    - tests
+  allowed_paths:
+    - README.md
+    - docs/**
+    - tests/**
+  blocked_paths:
+    - .gitlab-ci.yml
+    - deploy/**
+    - Dockerfile
+    - compose.yaml
+    - "**/.env"
+  max_changed_files: 5
+  require_tests_for_code: true
+```
+
+Auto-Approval ist standardmaessig deaktiviert. Wenn aktiviert, schreibt AgentLab `auto_approval_report.json` und
+`approved_plan.json`. Die Auswahl ist stabil: niedrigster `risk_score`, dann `low` vor `medium`, dann `docs` vor
+`tests`, dann Task-ID. `auto_approve` darf nicht mit Direct-Main-Push oder Auto-Merge kombiniert werden.
+
 Der Integrationsablauf:
 
 ```mermaid
@@ -289,6 +322,7 @@ Wichtige Run-Artefakte:
 - LLMs fuehren keine freie Shell aus.
 - Shell-Kommandos laufen durch `CommandPolicy`.
 - Keine Policy-Aenderung waehrend Agent-Runs.
+- Auto-Approval ist regelbasiert; das LLM darf Aufgaben vorschlagen, aber nicht selbst freigeben.
 - Kein Force Push.
 - Kein Auto-Merge oder Direct-Main-Push per Default.
 - Auto-Merge braucht Gate-Freigabe, MR-Readiness und eine direkt vor Merge erfolgreiche GitLab-Pipeline.

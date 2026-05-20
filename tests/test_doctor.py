@@ -196,3 +196,29 @@ def test_doctor_passes_when_git_author_identity_is_configured(tmp_path: Path) ->
 
     assert any(check["name"] == "git_credential_helper" and check["status"] == "passed" for check in report["checks"])
     assert any(check["name"] == "git_author_identity" and check["status"] == "passed" for check in report["checks"])
+
+
+def test_doctor_fails_when_auto_approve_combines_with_direct_main(tmp_path: Path) -> None:
+    config = write_config(tmp_path, direct_main_push_enabled=True)
+    with config.open("a", encoding="utf-8") as handle:
+        handle.write("auto_approve:\n  enabled: true\n")
+
+    report = Doctor(
+        config,
+        environ={
+            "GITLAB_TOKEN": "token",
+            "GIT_CONFIG_COUNT": "3",
+            "GIT_CONFIG_KEY_0": "credential.helper",
+            "GIT_CONFIG_VALUE_0": "helper",
+            "GIT_CONFIG_KEY_1": "user.name",
+            "GIT_CONFIG_VALUE_1": "AgentLab Bot",
+            "GIT_CONFIG_KEY_2": "user.email",
+            "GIT_CONFIG_VALUE_2": "agentlab-bot@example.local",
+        },
+        http_get=fake_http_get,
+        which=lambda name: "git",
+        run_command=fake_git_config_run({}),
+    ).run()
+
+    check = next(check for check in report["checks"] if check["name"] == "auto_approve")
+    assert check["status"] == "failed"

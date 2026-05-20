@@ -60,6 +60,39 @@ class OllamaConfig(BaseModel):
         return self.models.get(agent_name, self.models.get("default", "qwen3.6:35b"))
 
 
+class AutoApproveConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    max_risk_score: int = Field(default=3, ge=0)
+    allowed_task_types: list[str] = Field(default_factory=lambda: ["docs", "tests"])
+    allowed_paths: list[str] = Field(
+        default_factory=lambda: [
+            "README.md",
+            "docs/**",
+            "tests/**",
+            "rust-backend/tests/**",
+            "web/src/**/*.test.ts",
+        ]
+    )
+    blocked_paths: list[str] = Field(
+        default_factory=lambda: [
+            ".gitlab-ci.yml",
+            "deploy/**",
+            "Dockerfile",
+            "compose.yaml",
+            "**/.env",
+        ]
+    )
+    max_changed_files: int = Field(default=5, ge=1)
+    require_tests_for_code: bool = True
+
+    @field_validator("allowed_task_types", "allowed_paths", "blocked_paths")
+    @classmethod
+    def normalize_strings(cls, values: list[str]) -> list[str]:
+        return [value.strip() for value in values if value.strip()]
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
@@ -75,6 +108,7 @@ class AppConfig(BaseModel):
     reject_embedded_git_credentials: bool = True
     workspace_root: Path = Path("./runs")
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
+    auto_approve: AutoApproveConfig = Field(default_factory=AutoApproveConfig)
     allowed_commands: list[str] = Field(default_factory=list)
     forbidden_commands: list[str] = Field(default_factory=list)
     protected_paths: list[str] = Field(default_factory=list)
