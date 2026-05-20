@@ -184,7 +184,7 @@ class MRFinalizer:
     @staticmethod
     def _readiness_skip_reason(readiness: dict[str, object]) -> str | None:
         state = readiness.get("state")
-        if state and state != "opened":
+        if state != "opened":
             return f"MR state is not opened: {state}"
         if readiness.get("draft"):
             return "MR is draft"

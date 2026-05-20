@@ -1,6 +1,9 @@
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
+from agentlab.config import AppConfig
 from agentlab.models import AgentTask, GateDecision, PatchProposal, ReviewReport, TaskType, Verdict
 
 
@@ -42,3 +45,15 @@ def test_gate_decision_serializes_to_json_values() -> None:
     )
     assert decision.model_dump(mode="json")["verdict"] == "blocked"
     assert Verdict.APPROVED.value == "approved"
+
+
+def test_config_keeps_dangerous_defaults_disabled() -> None:
+    config = AppConfig(
+        gitlab_url="https://gitlab.example.com",
+        project_id=1,
+        target_repo_path=Path("."),
+    )
+
+    assert config.auto_merge_enabled is False
+    assert config.direct_main_push_enabled is False
+    assert config.push_agent_branches_enabled is False

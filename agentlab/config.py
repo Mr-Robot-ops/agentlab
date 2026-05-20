@@ -2,9 +2,43 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+
+def derive_project_path_from_repo_url(repo_url: str) -> str | None:
+    value = repo_url.strip()
+    if not value:
+        return None
+    if "://" not in value and ":" in value and "@" in value.split(":", 1)[0]:
+        path = value.split(":", 1)[1]
+    else:
+        parsed = urlparse(value)
+        path = parsed.path
+    path = unquote(path).strip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    return path or None
+
+
+def normalize_project_id(project_id: int | str) -> int | str:
+    if isinstance(project_id, int):
+        return project_id
+    value = unquote(str(project_id).strip()).strip("/")
+    if value.endswith(".git"):
+        value = value[:-4]
+    return int(value) if value.isdigit() else value
+
+
+def gitlab_project_api_id(project_id: int | str) -> int | str:
+    normalized = normalize_project_id(project_id)
+    if isinstance(normalized, int):
+        return normalized
+    from urllib.parse import quote
+
+    return quote(normalized, safe="")
 
 
 class OllamaConfig(BaseModel):
@@ -30,7 +64,7 @@ class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
     gitlab_url: str
-    project_id: int | str
+    project_id: int | str | None = None
     default_branch: str = "main"
     gitlab_token_env: str = "GITLAB_TOKEN"
     target_repo_path: Path
@@ -84,6 +118,24 @@ class AppConfig(BaseModel):
     docker_compose_enabled: bool = True
     command_timeout_seconds: int = Field(default=900, ge=1)
     audit_file: str = "audit.jsonl"
+
+    @model_validator(mode="before")
+    @classmethod
+    def derive_project_id_from_repo_url(cls, raw: Any) -> Any:
+        if isinstance(raw, dict) and not raw.get("project_id"):
+            repo_url = raw.get("target_repo_url")
+            if repo_url:
+                derived = derive_project_path_from_repo_url(str(repo_url))
+                if derived:
+                    raw = {**raw, "project_id": derived}
+        return raw
+
+    @model_validator(mode="after")
+    def validate_project_id_present(self) -> "AppConfig":
+        if self.project_id is None:
+            raise ValueError("project_id is required unless it can be derived from target_repo_url")
+        self.project_id = normalize_project_id(self.project_id)
+        return self
 
     @field_validator(
         "protected_paths",
