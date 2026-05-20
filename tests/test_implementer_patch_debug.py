@@ -308,6 +308,79 @@ def test_structured_replace_file_replaces_content(tmp_path: Path) -> None:
     assert stats.changed_files == ["README.md"]
 
 
+def test_structured_insert_before_inserts_before_unique_anchor(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path, content="# AgentLab\n\n## Quick Start\nRun it.\n")
+    proposal = StructuredEditProposal(
+        task_id="document-privileged-container-boundaries",
+        summary="insert",
+        edits=[FileEdit(path="README.md", operation="insert_before", anchor="## Quick Start", content="## Security\nSafe.\n\n")],
+        rollback="Remove inserted section.",
+    )
+
+    file_tool_for(repo).apply_structured_edits(proposal)
+
+    assert "## Security\nSafe.\n\n## Quick Start" in (repo / "README.md").read_text(encoding="utf-8")
+
+
+def test_structured_insert_after_inserts_after_unique_anchor(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path, content="# AgentLab\nOpen **http://localhost:8080** — default API key is `admin123`.\n")
+    anchor = "Open **http://localhost:8080** — default API key is `admin123`."
+    proposal = StructuredEditProposal(
+        task_id="document-privileged-container-boundaries",
+        summary="insert",
+        edits=[FileEdit(path="README.md", operation="insert_after", anchor=anchor, content="\n\n### Deployment Assumptions\nLocal only.\n")],
+        rollback="Remove inserted section.",
+    )
+
+    file_tool_for(repo).apply_structured_edits(proposal)
+
+    assert f"{anchor}\n\n### Deployment Assumptions" in (repo / "README.md").read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("operation", ["insert_before", "insert_after"])
+def test_structured_insert_fails_when_anchor_missing(tmp_path: Path, operation: str) -> None:
+    repo = init_repo(tmp_path, content="# AgentLab\n")
+    proposal = StructuredEditProposal(
+        task_id="document-privileged-container-boundaries",
+        summary="insert",
+        edits=[FileEdit(path="README.md", operation=operation, anchor="## Missing", content="Text\n")],
+        rollback="Remove inserted section.",
+    )
+
+    with pytest.raises(ToolError, match="anchor not found"):
+        file_tool_for(repo).apply_structured_edits(proposal)
+
+
+@pytest.mark.parametrize("operation", ["insert_before", "insert_after"])
+def test_structured_insert_fails_when_anchor_repeats(tmp_path: Path, operation: str) -> None:
+    repo = init_repo(tmp_path, content="## Repeat\nBody\n## Repeat\n")
+    proposal = StructuredEditProposal(
+        task_id="document-privileged-container-boundaries",
+        summary="insert",
+        edits=[FileEdit(path="README.md", operation=operation, anchor="## Repeat", content="Text\n")],
+        rollback="Remove inserted section.",
+    )
+
+    with pytest.raises(ToolError, match="multiple times"):
+        file_tool_for(repo).apply_structured_edits(proposal)
+
+
+def test_structured_insert_touching_protected_path_is_rejected(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    (repo / "docs").mkdir()
+    (repo / "docs" / "protected.md").write_text("## Anchor\n", encoding="utf-8")
+    cfg = config(repo).model_copy(update={"protected_paths": ["docs"]})
+    proposal = StructuredEditProposal(
+        task_id="document-privileged-container-boundaries",
+        summary="insert",
+        edits=[FileEdit(path="docs/protected.md", operation="insert_before", anchor="## Anchor", content="Text\n")],
+        rollback="Remove inserted section.",
+    )
+
+    with pytest.raises(ToolError, match="protected"):
+        FileTool(repo, cfg).apply_structured_edits(proposal)
+
+
 def test_structured_edit_rejects_symlink(tmp_path: Path) -> None:
     if os.name == "nt":
         pytest.skip("Windows symlink permissions vary by environment")
@@ -339,6 +412,19 @@ def test_docs_task_uses_structured_edit_instead_of_patch(tmp_path: Path) -> None
     assert "structured_edit_raw_response.json" in report.patch_artifacts
     assert "structured_edit_proposal.json" in report.patch_artifacts
     assert "structured_edit_apply_report.json" in report.patch_artifacts
+
+
+def test_docs_prompt_prefers_insert_operations(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    ollama = FakeOllama([structured_proposal()])
+
+    ImplementationAgent(config(repo), FakeGitTool(), FileTool(repo, config(repo)), ollama).implement(docs_task())
+
+    prompt = ollama.prompts[0]
+    assert "use insert_before or insert_after for new sections" in prompt
+    assert '"operation": "insert_before"' in prompt
+    assert '"operation": "insert_after"' in prompt
+    assert "old_text must be copied exactly from file_snippets" in prompt
 
 
 def test_structured_edit_accepts_file_path_tool_aliases_and_writes_normalized_artifact(tmp_path: Path) -> None:
@@ -406,6 +492,104 @@ def test_structured_edit_schema_error_writes_artifacts_and_does_not_commit_or_pu
     assert schema_error["normalized_attempt"]["edits"][0]["path"] == "README.md"
     assert schema_error["normalized_attempt"]["edits"][0]["operation"] == "replace_text"
     assert schema_error["expected_schema_hint"]["edit_path_field"] == "path"
+
+
+def test_structured_edit_error_artifact_includes_context_hashes_and_repr(tmp_path: Path) -> None:
+    repo = init_repo(
+        tmp_path,
+        content="# AgentLab\nOpen **http://localhost:8080** — default API key is `admin123`.\n## Quick Start\n",
+    )
+    store = ArtifactStore(tmp_path / "run", "run")
+    git = FakeGitTool()
+    literal_backslash = "Open **http://localhost:8080** \\u2014 default API key is `admin123`."
+    bad = StructuredEditProposal(
+        task_id="document-privileged-container-boundaries",
+        summary="bad",
+        edits=[FileEdit(path="README.md", operation="replace_text", old_text=literal_backslash, new_text="replacement")],
+        rollback="Revert README.md changes.",
+    )
+
+    report = ImplementationAgent(config(repo), git, FileTool(repo, config(repo)), FakeOllama([bad]), artifacts=store).implement(docs_task())
+
+    assert report.status == ReportStatus.FAILED
+    error = json.loads(read_artifact(store, "structured_edit_error.json"))
+    assert error["failing_edit_index"] == 0
+    assert error["path"] == "README.md"
+    assert error["operation"] == "replace_text"
+    assert error["old_text_excerpt"] == literal_backslash
+    assert "\\\\u2014" in error["old_text_repr_excerpt"]
+    assert error["old_text_sha256"]
+    assert error["file_sha256"]
+    assert error["target_file_exists"] is True
+    assert error["target_file_size"] > 0
+    assert error["candidate_contexts"]
+    assert "—" in error["candidate_contexts"][0]
+    assert error["no_changes_committed"] is True
+    assert error["no_branch_pushed"] is True
+
+
+def test_structured_repair_succeeds_after_anchor_correction(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path, content="# AgentLab\n\n## Quick Start\nRun it.\n")
+    store = ArtifactStore(tmp_path / "run", "run")
+    git = FakeGitTool()
+    bad = StructuredEditProposal(
+        task_id="document-privileged-container-boundaries",
+        summary="bad",
+        edits=[FileEdit(path="README.md", operation="insert_before", anchor="## Missing", content="## Security\nSafe.\n\n")],
+        rollback="Revert README.md changes.",
+    )
+    fixed = StructuredEditProposal(
+        task_id="document-privileged-container-boundaries",
+        summary="fixed",
+        edits=[FileEdit(path="README.md", operation="insert_before", anchor="## Quick Start", content="## Security\nSafe.\n\n")],
+        rollback="Revert README.md changes.",
+    )
+
+    ollama = FakeOllama([bad, fixed])
+    report = ImplementationAgent(config(repo), git, FileTool(repo, config(repo)), ollama, artifacts=store).implement(docs_task())
+
+    assert report.status == ReportStatus.PASSED
+    assert report.retry_attempted is True
+    assert report.retry_succeeded is True
+    assert git.committed is True
+    assert "structured_edit_repair_raw_response.json" in report.patch_artifacts
+    assert "structured_edit_repair_proposal.json" in report.patch_artifacts
+    assert "structured_edit_repair_apply_report.json" in report.patch_artifacts
+    repair_prompt = ollama.prompts[1]
+    assert "candidate_contexts" in repair_prompt
+    assert "only repair anchors or old_text" in repair_prompt
+    assert "## Security\nSafe.\n\n## Quick Start" in (repo / "README.md").read_text(encoding="utf-8")
+
+
+def test_structured_repair_failure_does_not_commit_or_push(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path, content="# AgentLab\n\n## Quick Start\nRun it.\n")
+    store = ArtifactStore(tmp_path / "run", "run")
+    git = FakeGitTool()
+    bad = StructuredEditProposal(
+        task_id="document-privileged-container-boundaries",
+        summary="bad",
+        edits=[FileEdit(path="README.md", operation="insert_before", anchor="## Missing", content="## Security\nSafe.\n\n")],
+        rollback="Revert README.md changes.",
+    )
+    still_bad = StructuredEditProposal(
+        task_id="document-privileged-container-boundaries",
+        summary="still bad",
+        edits=[FileEdit(path="README.md", operation="insert_after", anchor="## Still Missing", content="More\n")],
+        rollback="Revert README.md changes.",
+    )
+
+    report = ImplementationAgent(config(repo), git, FileTool(repo, config(repo)), FakeOllama([bad, still_bad]), artifacts=store).implement(docs_task())
+
+    assert report.status == ReportStatus.FAILED
+    assert report.retry_attempted is True
+    assert report.retry_succeeded is False
+    assert report.failure_stage == "structured_edit_apply"
+    assert report.failure_reason == "anchor_not_found"
+    assert git.committed is False
+    assert git.pushed is False
+    assert report.no_changes_committed is True
+    assert report.no_branch_pushed is True
+    assert "structured_edit_repair_error.json" in report.patch_artifacts
 
 
 def test_normalized_structured_edit_can_push_when_enabled(tmp_path: Path) -> None:

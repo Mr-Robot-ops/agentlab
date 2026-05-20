@@ -8,7 +8,7 @@ from agentlab.config import AppConfig
 from agentlab.models import AgentTask, DiffStats, ImplementationReport, PatchProposal, ReportStatus, StructuredEditProposal, TaskType
 from agentlab.policies.risk import assess_risk
 from agentlab.tools.common import ToolError
-from agentlab.tools.file_tool import FileTool, PatchApplyError, UnifiedDiffValidationError
+from agentlab.tools.file_tool import FileTool, PatchApplyError, StructuredEditError, UnifiedDiffValidationError
 from agentlab.tools.git_tool import GitTool
 from agentlab.tools.ollama_client import OllamaClient, OllamaSchemaValidationError
 
@@ -88,7 +88,20 @@ class ImplementationAgent:
                     diff_stats = self._validate_and_apply_structured(task, structured)
                 except Exception as structured_exc:
                     patch_artifacts.extend(self._persist_structured_error(structured_exc))
-                    raise StructuredEditApplyError(self._structured_failure_reason(structured_exc), str(structured_exc)) from structured_exc
+                    if self._is_structured_repair_candidate(structured_exc):
+                        retry_attempted = True
+                        try:
+                            repaired, repaired_raw = self._repair_structured_proposal(task, structured, structured_exc)
+                            patch_artifacts.extend(self._persist_structured_inputs(repaired_raw, repaired, repair=True))
+                            diff_stats = self._validate_and_apply_structured(task, repaired)
+                        except Exception as repair_exc:
+                            patch_artifacts.extend(self._persist_structured_error(repair_exc, repair=True))
+                            raise StructuredEditApplyError(self._structured_failure_reason(repair_exc), str(repair_exc)) from repair_exc
+                        patch_artifacts.extend(self._persist_structured_apply_report(repaired, diff_stats, repair=True))
+                        structured = repaired
+                        retry_succeeded = True
+                    else:
+                        raise StructuredEditApplyError(self._structured_failure_reason(structured_exc), str(structured_exc)) from structured_exc
                 patch_artifacts.extend(self._persist_structured_apply_report(structured, diff_stats))
                 summary = structured.summary
                 expected_tests = structured.expected_tests
@@ -342,6 +355,26 @@ class ImplementationAgent:
                     "replace_text": "Use when replacing exactly one existing text block; old_text must match exactly once.",
                     "append_to_file": "Use only when appending to an existing file.",
                     "replace_file": "Use only when full target file content is safer than a small replacement.",
+                    "insert_before": "Prefer this for adding a new Markdown section before an existing heading anchor.",
+                    "insert_after": "Prefer this for adding a new Markdown section after an existing exact anchor line.",
+                },
+                "docs_guidance": [
+                    "For Docs/Markdown tasks, use insert_before or insert_after for new sections.",
+                    "Use replace_text only for small exact text copied from file_snippets.",
+                    "Do not replace large multiline blocks when an insert is enough.",
+                    "old_text must be copied exactly from file_snippets.",
+                ],
+                "insert_before_example": {
+                    "path": "README.md",
+                    "operation": "insert_before",
+                    "anchor": "## Quick Start",
+                    "content": "## Security & Privileged Mode\n...\n\n",
+                },
+                "insert_after_example": {
+                    "path": "README.md",
+                    "operation": "insert_after",
+                    "anchor": "Open **http://localhost:8080** \u2014 default API key is `admin123`.",
+                    "content": "\n\n### Deployment Assumptions\n...",
                 },
                 "forbidden_actions": task.forbidden_actions,
             },
@@ -352,6 +385,34 @@ class ImplementationAgent:
         )
         if proposal.task_id != task.id:
             raise ToolError("StructuredEditProposal.task_id does not match task id")
+        return proposal, raw_response
+
+    def _repair_structured_proposal(
+        self,
+        task: AgentTask,
+        proposal: StructuredEditProposal,
+        exc: Exception,
+    ) -> tuple[StructuredEditProposal, str]:
+        payload = {
+            "task": task.model_dump(mode="json"),
+            "original_structured_edit_proposal": proposal.model_dump(mode="json"),
+            "structured_edit_error": self._structured_error_payload(exc),
+            "rules": {
+                "output": "Return only one StructuredEditProposal JSON object.",
+                "scope": "only repair anchors or old_text/new_text for the same affected files.",
+                "same_affected_files": task.affected_files,
+                "do_not_broaden_scope": True,
+                "prefer_insert_operations": "For new Markdown sections, prefer insert_before or insert_after over replacing large blocks.",
+                "no_markdown_fences": "Do not wrap JSON in Markdown fences.",
+                "no_explanations": "Do not include explanations outside JSON.",
+            },
+        }
+        proposal, raw_response = self._chat_structured_proposal(
+            system_prompt=load_prompt("implementer.md"),
+            user_prompt=json.dumps(payload, indent=2),
+        )
+        if proposal.task_id != task.id:
+            raise ToolError("Repaired StructuredEditProposal.task_id does not match task id")
         return proposal, raw_response
 
     def _repair_patch(
@@ -463,12 +524,14 @@ class ImplementationAgent:
             return self._persist_patch_apply_error(exc, prefix=prefix)
         return self._persist_patch_validation_error(exc, prefix=prefix)
 
-    def _persist_structured_inputs(self, raw_response: str, proposal: StructuredEditProposal) -> list[str]:
+    def _persist_structured_inputs(self, raw_response: str, proposal: StructuredEditProposal, *, repair: bool = False) -> list[str]:
         if self.artifacts is None:
             return []
+        raw_name = "structured_edit_repair_raw_response.json" if repair else "structured_edit_raw_response.json"
+        proposal_name = "structured_edit_repair_proposal" if repair else "structured_edit_proposal"
         records = [
-            self.artifacts.write_text("structured_edit_raw_response.json", raw_response),
-            self.artifacts.write_json("structured_edit_proposal", proposal),
+            self.artifacts.write_text(raw_name, raw_response),
+            self.artifacts.write_json(proposal_name, proposal),
         ]
         return [record.name for record in records]
 
@@ -480,11 +543,12 @@ class ImplementationAgent:
         fallback_reason: str | None = None,
         fallback_from: str | None = None,
         fallback_to: str | None = None,
+        repair: bool = False,
     ) -> list[str]:
         if self.artifacts is None:
             return []
         record = self.artifacts.write_json(
-            "structured_edit_apply_report",
+            "structured_edit_repair_apply_report" if repair else "structured_edit_apply_report",
             {
                 "status": "passed",
                 "summary": proposal.summary,
@@ -498,17 +562,27 @@ class ImplementationAgent:
         )
         return [record.name]
 
-    def _persist_structured_error(self, exc: Exception, *, fallback_reason: str | None = None) -> list[str]:
+    def _persist_structured_error(
+        self,
+        exc: Exception,
+        *,
+        fallback_reason: str | None = None,
+        repair: bool = False,
+    ) -> list[str]:
         if self.artifacts is None:
             return []
-        record = self.artifacts.write_json(
-            "structured_edit_error",
+        payload = self._structured_error_payload(exc)
+        payload.update(
             {
                 "status": "failed",
-                "error": str(exc),
-                "reason": self._structured_failure_reason(exc),
                 "fallback_reason": fallback_reason,
-            },
+                "no_changes_committed": True,
+                "no_branch_pushed": True,
+            }
+        )
+        record = self.artifacts.write_json(
+            "structured_edit_repair_error" if repair else "structured_edit_error",
+            payload,
         )
         return [record.name]
 
@@ -602,6 +676,8 @@ class ImplementationAgent:
 
     @staticmethod
     def _structured_failure_reason(exc: Exception) -> str:
+        if isinstance(exc, StructuredEditError):
+            return exc.reason
         text = str(exc).lower()
         if "outside task scope" in text:
             return "outside_task_scope"
@@ -616,6 +692,24 @@ class ImplementationAgent:
         if "secret" in text:
             return "secret_detected"
         return "structured_edit_failed"
+
+    @staticmethod
+    def _structured_error_payload(exc: Exception) -> dict[str, object]:
+        if isinstance(exc, StructuredEditError):
+            return exc.to_dict()
+        return {
+            "reason": ImplementationAgent._structured_failure_reason(exc),
+            "error": str(exc),
+        }
+
+    @staticmethod
+    def _is_structured_repair_candidate(exc: Exception) -> bool:
+        return ImplementationAgent._structured_failure_reason(exc) in {
+            "old_text_not_found",
+            "old_text_not_unique",
+            "anchor_not_found",
+            "anchor_not_unique",
+        }
 
     @staticmethod
     def _structured_normalized_attempt(raw_response: str) -> object | None:

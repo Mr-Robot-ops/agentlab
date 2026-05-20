@@ -128,10 +128,16 @@ def test_file_edit_rejects_conflicting_operation_aliases() -> None:
         ("append_file", "append_to_file"),
         ("write_file", "replace_file"),
         ("overwrite_file", "replace_file"),
+        ("insertBefore", "insert_before"),
+        ("before", "insert_before"),
+        ("insert_before_anchor", "insert_before"),
+        ("insertAfter", "insert_after"),
+        ("after", "insert_after"),
+        ("insert_after_anchor", "insert_after"),
     ],
 )
 def test_file_edit_normalizes_operation_aliases(raw: str, normalized: str) -> None:
-    payload = {"path": "README.md", "operation": raw, "content": "x", "old_text": "a", "new_text": "b"}
+    payload = {"path": "README.md", "operation": raw, "content": "x", "old_text": "a", "new_text": "b", "anchor": "## Heading"}
 
     assert FileEdit.model_validate(payload).operation == normalized
 
