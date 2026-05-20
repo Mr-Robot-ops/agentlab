@@ -43,7 +43,7 @@ class Doctor:
         gitlab_tool_factory: GitLabToolFactory | None = None,
     ) -> None:
         self.config_path = Path(config_path)
-        self.environ = environ or os.environ
+        self.environ = environ if environ is not None else os.environ
         self.http_get = http_get or httpx.get
         self.which = which or shutil.which
         self.run_command = run_command or run_subprocess
