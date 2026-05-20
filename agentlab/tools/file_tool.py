@@ -211,8 +211,8 @@ class FileTool:
         originals: dict[str, str] = {}
         paths: dict[str, Path] = {}
         for index, edit in enumerate(proposal.edits):
-            path = self._safe_path(edit.path)
             self._validate_paths([edit.path])
+            path = self._safe_path(edit.path)
             if edit.path not in working:
                 originals[edit.path] = path.read_text(encoding="utf-8") if path.exists() else ""
                 working[edit.path] = originals[edit.path]
@@ -354,6 +354,10 @@ class FileTool:
 
     def _validate_paths(self, paths: list[str]) -> None:
         for path in paths:
+            raw = self.repo_path / path
+            if raw.is_symlink():
+                raise ToolError(f"refusing to touch symlink: {path}")
+
             safe = self._safe_path(path)
             if safe.is_symlink():
                 raise ToolError(f"refusing to touch symlink: {path}")
