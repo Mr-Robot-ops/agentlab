@@ -72,8 +72,11 @@ class FakeGitTool:
     def __init__(self) -> None:
         self.committed = False
         self.pushed = False
+        self.created_branch: str | None = None
+        self.pushed_branch: str | None = None
 
     def create_branch(self, branch: str, base: str) -> CommandResult:
+        self.created_branch = branch
         return CommandResult(command=f"git checkout -B {branch} {base}", cwd=".", exit_code=0)
 
     def commit(self, message: str) -> str:
@@ -82,6 +85,7 @@ class FakeGitTool:
 
     def push(self, branch: str) -> CommandResult:
         self.pushed = True
+        self.pushed_branch = branch
         return CommandResult(command=f"git push origin {branch}", cwd=".", exit_code=0)
 
 
@@ -92,6 +96,28 @@ class MissingIdentityGitTool(FakeGitTool):
             "*** Please tell me who you are.\n\n"
             "fatal: unable to auto-detect email address"
         )
+
+
+class NonFastForwardGitTool(FakeGitTool):
+    def push(self, branch: str) -> CommandResult:
+        self.pushed = True
+        self.pushed_branch = branch
+        return CommandResult(
+            command=f"git push origin {branch}",
+            cwd=".",
+            exit_code=1,
+            stderr=(
+                "! [rejected] agent/document-privileged-container-boundaries -> "
+                "agent/document-privileged-container-boundaries (non-fast-forward)\n"
+            ),
+        )
+
+
+class GenericPushFailGitTool(FakeGitTool):
+    def push(self, branch: str) -> CommandResult:
+        self.pushed = True
+        self.pushed_branch = branch
+        return CommandResult(command=f"git push origin {branch}", cwd=".", exit_code=1, stderr="remote: unavailable\n")
 
 
 class FakeFileTool:
@@ -637,12 +663,21 @@ def test_normalized_structured_edit_can_push_when_enabled(tmp_path: Path) -> Non
         }
     )
 
-    report = ImplementationAgent(cfg, git, FileTool(repo, cfg), RawStructuredOllama(raw)).implement(docs_task())
+    report = ImplementationAgent(
+        cfg,
+        git,
+        FileTool(repo, cfg),
+        RawStructuredOllama(raw),
+        run_id="cb9b06c1ab70433ea9bfce1602691d3b",
+    ).implement(docs_task())
 
     assert report.status == ReportStatus.PASSED
     assert git.committed is True
     assert git.pushed is True
     assert report.pushed is True
+    assert report.branch == "agent/document-privileged-container-boundaries-cb9b06c1"
+    assert git.created_branch == report.branch
+    assert git.pushed_branch == report.branch
 
 
 def test_structured_edit_outside_affected_files_is_rejected_without_commit_or_push(tmp_path: Path) -> None:
@@ -675,6 +710,81 @@ def test_successful_structured_edit_pushes_only_when_enabled(tmp_path: Path) -> 
     assert git.committed is True
     assert git.pushed is True
     assert report.pushed is True
+
+
+def test_repeated_runs_use_distinct_agent_branches(tmp_path: Path) -> None:
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first_repo = init_repo(first_root)
+    second_repo = init_repo(second_root)
+    first_git = FakeGitTool()
+    second_git = FakeGitTool()
+
+    first = ImplementationAgent(
+        config(first_repo),
+        first_git,
+        FileTool(first_repo, config(first_repo)),
+        FakeOllama([structured_proposal()]),
+        run_id="aaaaaaaa11111111",
+    ).implement(docs_task())
+    second = ImplementationAgent(
+        config(second_repo),
+        second_git,
+        FileTool(second_repo, config(second_repo)),
+        FakeOllama([structured_proposal()]),
+        run_id="bbbbbbbb22222222",
+    ).implement(docs_task())
+
+    assert first.branch != second.branch
+    assert first.branch.endswith("-aaaaaaaa")
+    assert second.branch.endswith("-bbbbbbbb")
+
+
+def test_push_non_fast_forward_preserves_local_commit_sha(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    cfg = config(repo).model_copy(update={"push_agent_branches_enabled": True})
+    git = NonFastForwardGitTool()
+
+    report = ImplementationAgent(
+        cfg,
+        git,
+        FileTool(repo, cfg),
+        FakeOllama([structured_proposal()]),
+        run_id="cb9b06c1ab70433ea9bfce1602691d3b",
+    ).implement(docs_task())
+
+    assert report.status == ReportStatus.FAILED
+    assert report.branch == "agent/document-privileged-container-boundaries-cb9b06c1"
+    assert report.failure_stage == "git_push"
+    assert report.failure_reason == "non_fast_forward"
+    assert report.commit_sha == "abc123"
+    assert report.pushed is False
+    assert report.no_changes_committed is False
+    assert report.no_branch_pushed is True
+    assert "non-fast-forward" in report.errors[0]
+
+
+def test_generic_push_failure_is_classified(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    cfg = config(repo).model_copy(update={"push_agent_branches_enabled": True})
+    git = GenericPushFailGitTool()
+
+    report = ImplementationAgent(
+        cfg,
+        git,
+        FileTool(repo, cfg),
+        FakeOllama([structured_proposal()]),
+        run_id="cccccccc33333333",
+    ).implement(docs_task())
+
+    assert report.status == ReportStatus.FAILED
+    assert report.failure_stage == "git_push"
+    assert report.failure_reason == "push_failed"
+    assert report.commit_sha == "abc123"
+    assert report.no_changes_committed is False
+    assert report.no_branch_pushed is True
 
 
 def test_patch_proposal_remains_for_non_docs_tasks(tmp_path: Path) -> None:
