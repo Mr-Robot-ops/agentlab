@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -51,9 +52,12 @@ class SchedulerStateStore:
 class Scheduler:
     def __init__(self, config: AppConfig, *, run_id: str | None = None) -> None:
         self.config = config
-        self.orchestrator = Orchestrator(config, run_id=run_id)
+        self.run_id = run_id or uuid.uuid4().hex
+        self.run_dir = Path(config.workspace_root) / self.run_id
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self._orchestrator: Orchestrator | None = None
         self.state_store = SchedulerStateStore(config.workspace_root)
-        self.artifacts: ArtifactStore = self.orchestrator.artifacts
+        self.artifacts = ArtifactStore(self.run_dir, self.run_id)
 
     def watch(self) -> dict[str, Any]:
         if not self.config.schedule.enabled:
@@ -158,9 +162,16 @@ class Scheduler:
     def _gitlab(self) -> GitLabTool:
         return GitLabTool(self.config)
 
+    @property
+    def orchestrator(self) -> Orchestrator:
+        if self._orchestrator is None:
+            self._orchestrator = Orchestrator(self.config, run_id=self.run_id)
+            self.artifacts = self._orchestrator.artifacts
+        return self._orchestrator
+
     def _write_report(self, report: dict[str, Any]) -> dict[str, Any]:
         self.artifacts.write_json("scheduler_report", report)
-        return {"run_id": self.orchestrator.run_id, **report}
+        return {"run_id": self.run_id, **report}
 
     def _report(self, status: str, reason: str, **extra: Any) -> dict[str, Any]:
         return {
@@ -188,3 +199,34 @@ def _parse_time(value: Any) -> datetime | None:
 def _mr_created(result: dict[str, Any]) -> bool:
     mr = result.get("merge_request")
     return isinstance(mr, dict) and mr.get("status") == "created"
+
+
+def reset_scheduler_state(config: AppConfig) -> dict[str, Any]:
+    store = SchedulerStateStore(config.workspace_root)
+    existed = store.path.exists()
+    if existed:
+        store.path.unlink()
+    return {
+        "status": "passed",
+        "reason": "scheduler_state_removed",
+        "path": str(store.path),
+        "existed": existed,
+    }
+
+
+def scheduler_status(config: AppConfig) -> dict[str, Any]:
+    store = SchedulerStateStore(config.workspace_root)
+    state, warning = store.read()
+    return {
+        "status": "passed",
+        "reason": "scheduler_state_read",
+        "path": str(store.path),
+        "exists": store.path.exists(),
+        "state_warning": warning,
+        "last_default_branch_head": state.get("last_default_branch_head"),
+        "last_watch_run": state.get("last_watch_run"),
+        "last_plan_run": state.get("last_plan_run"),
+        "last_action_run": state.get("last_action_run"),
+        "open_agent_mrs": state.get("open_agent_mrs"),
+        "new_mrs_today": state.get("new_mrs_today"),
+    }

@@ -13,11 +13,13 @@ from agentlab.config import AppConfig, gitlab_project_api_id, load_config
 from agentlab.models import PreflightCheck
 from agentlab.policies.command_policy import CommandPolicy, CommandPolicyError
 from agentlab.tools.common import run_subprocess
+from agentlab.tools.gitlab_tool import GitLabTool
 
 
 HttpGet = Callable[..., Any]
 Which = Callable[[str], str | None]
 RunCommand = Callable[..., Any]
+GitLabToolFactory = Callable[[AppConfig], Any]
 
 
 TOKEN_FIX = """Fix Local/Docker:
@@ -38,12 +40,14 @@ class Doctor:
         http_get: HttpGet | None = None,
         which: Which | None = None,
         run_command: RunCommand | None = None,
+        gitlab_tool_factory: GitLabToolFactory | None = None,
     ) -> None:
         self.config_path = Path(config_path)
         self.environ = environ or os.environ
         self.http_get = http_get or httpx.get
         self.which = which or shutil.which
         self.run_command = run_command or run_subprocess
+        self.gitlab_tool_factory = gitlab_tool_factory or GitLabTool
         self.checks: list[PreflightCheck] = []
         self.config: AppConfig | None = None
 
@@ -222,8 +226,8 @@ class Doctor:
         elif status_code == 404:
             self._failed(
                 "gitlab_project",
-                "GitLab project was not found",
-                "Check project_id. It may be numeric, URL-encoded, or a normal group/project path.",
+                f"GitLab project was not found for configured project_id={self.config.project_id}",
+                'Check project_id and try the numeric GitLab project ID for scheduler reliability. Example: project_id: "5".',
             )
         else:
             self._failed("gitlab_project", f"GitLab API returned HTTP {status_code}", "Inspect GitLab availability and token scopes.")
@@ -351,25 +355,59 @@ class Doctor:
         if not schedule.enabled:
             self._passed("schedule", "schedule is disabled")
             return
+        if not _is_numeric_project_id(self.config.project_id):
+            self._warning(
+                "scheduler_project_id",
+                f"configured project_id is not numeric: {self.config.project_id}",
+                'Numeric GitLab project ID is recommended for Scheduler/GitLab API reliability. Example: project_id: "5".',
+            )
+        self._check_scheduler_gitlab_api(enabled=True)
+        failed = False
         if schedule.action.enabled and self.config.direct_main_push_enabled:
             self._failed("schedule", "scheduler action cannot run with direct_main_push_enabled", "Use MR-flow branch pushes for scheduler action.")
-            return
+            failed = True
         if schedule.action.enabled and self.config.auto_merge_enabled:
             self._failed("schedule", "scheduler action cannot run with auto_merge_enabled", "Keep scheduler-created MRs reviewable; disable auto_merge_enabled.")
-            return
+            failed = True
         if schedule.action.enabled and not self.config.auto_approve.enabled:
             self._failed("schedule", "scheduler action is enabled but auto_approve is disabled", "Enable auto_approve or disable schedule.action.")
-            return
+            failed = True
         if schedule.action.enabled and not self.config.push_agent_branches_enabled:
             self._failed("schedule", "scheduler action is enabled but push_agent_branches_enabled is false", "Use mr-flow mode for scheduler action.")
-            return
+            failed = True
         if schedule.action.enabled and schedule.limits.min_hours_between_action_runs < 2:
             self._warning("schedule", "scheduler action cooldown is below 2 hours", "Use a conservative action cooldown to avoid MR spam.")
+            return
+        if failed:
             return
         self._passed(
             "schedule",
             f"schedule enabled: watch={schedule.watch.cron}, plan={schedule.plan.cron}, action={schedule.action.cron}",
         )
+
+    def _check_scheduler_gitlab_api(self, *, enabled: bool) -> None:
+        assert self.config is not None
+        if not self.environ.get(self.config.gitlab_token_env):
+            self._skipped("scheduler_gitlab", "Scheduler GitLab API check skipped because token is missing")
+            return
+        try:
+            gitlab = self.gitlab_tool_factory(self.config)
+            head = gitlab.get_default_branch_head()
+            open_mrs = len(gitlab.list_open_agent_mrs())
+        except Exception as exc:
+            message = (
+                f"Scheduler GitLab API check failed for configured project_id={self.config.project_id}: {exc}"
+            )
+            remediation = (
+                'Use the same project identifier scheduler-watch uses. Numeric GitLab project ID is recommended; '
+                'example: project_id: "5". Check token scopes and project visibility.'
+            )
+            if enabled and (self.config.schedule.watch.enabled or self.config.schedule.action.enabled):
+                self._failed("scheduler_gitlab", message, remediation)
+            else:
+                self._warning("scheduler_gitlab", message, remediation)
+            return
+        self._passed("scheduler_gitlab", f"Scheduler GitLab API works: default_branch_head={head}, open_agent_mrs={open_mrs}")
 
     def _passed(self, name: str, message: str) -> None:
         self.checks.append(PreflightCheck(name=name, status="passed", message=message))
@@ -403,3 +441,9 @@ def format_doctor(report: dict[str, Any]) -> str:
 
 def report_json(report: dict[str, Any]) -> str:
     return json.dumps(report, indent=2, ensure_ascii=False, default=str)
+
+
+def _is_numeric_project_id(project_id: int | str | None) -> bool:
+    if isinstance(project_id, int):
+        return True
+    return str(project_id or "").isdigit()

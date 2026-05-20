@@ -35,6 +35,9 @@ JOB_COMMANDS = {
     "plan": ["plan", "--config", "/etc/agentlab/config.yaml"],
     "run-task": ["run-task", "--config", "/etc/agentlab/config.yaml", "--task", "/etc/agentlab/task.json"],
     "full-flow": ["full-flow", "--config", "/etc/agentlab/config.yaml"],
+    "scheduler-watch": ["scheduler-watch", "--config", "/etc/agentlab/config.yaml"],
+    "scheduler-plan": ["scheduler-plan", "--config", "/etc/agentlab/config.yaml"],
+    "scheduler-action": ["scheduler-action", "--config", "/etc/agentlab/config.yaml"],
 }
 
 
@@ -101,11 +104,15 @@ def generate_k8s(
         )
     if schedule_enabled:
         cron_commands = {
-            "watch": ["scheduler-watch", "--config", "/etc/agentlab/config.yaml"],
-            "plan": ["scheduler-plan", "--config", "/etc/agentlab/config.yaml"],
-            "action": ["scheduler-action", "--config", "/etc/agentlab/config.yaml"],
+            "scheduler-watch": ["scheduler-watch", "--config", "/etc/agentlab/config.yaml"],
+            "scheduler-plan": ["scheduler-plan", "--config", "/etc/agentlab/config.yaml"],
+            "scheduler-action": ["scheduler-action", "--config", "/etc/agentlab/config.yaml"],
         }
-        cron_schedules = {"watch": schedule_watch_cron, "plan": schedule_plan_cron, "action": schedule_action_cron}
+        cron_schedules = {
+            "scheduler-watch": schedule_watch_cron,
+            "scheduler-plan": schedule_plan_cron,
+            "scheduler-action": schedule_action_cron,
+        }
         for name, command in cron_commands.items():
             files[f"cronjob-{name}.yaml"] = render_cronjob(
                 namespace=namespace,
@@ -346,7 +353,7 @@ def render_cronjob(
     job = render_job(
         namespace=namespace,
         image=image,
-        job_name=f"scheduler-{job_name}",
+        job_name=job_name,
         command=command,
         git_author_name=git_author_name,
         git_author_email=git_author_email,
@@ -355,7 +362,7 @@ def render_cronjob(
     return f"""apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: agentlab-scheduler-{job_name}
+  name: agentlab-{job_name}
   namespace: {namespace}
   labels:
     app.kubernetes.io/name: agentlab
@@ -419,9 +426,13 @@ Useful follow-ups:
 kubectl apply -f deploy/kubernetes/generated/job-index.yaml
 kubectl apply -f deploy/kubernetes/generated/job-steward.yaml
 kubectl apply -f deploy/kubernetes/generated/job-plan.yaml
+kubectl apply -f deploy/kubernetes/generated/job-scheduler-watch.yaml
+kubectl apply -f deploy/kubernetes/generated/job-scheduler-plan.yaml
 ```
 
 For `job-run-task.yaml`, create a ConfigMap named `agentlab-task` with `task.json` first.
+Manual `job-scheduler-*.yaml` manifests are always generated for testing. `cronjob-scheduler-*.yaml`
+manifests are generated only when scheduling is enabled.
 """
 
 
