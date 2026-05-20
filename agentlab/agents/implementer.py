@@ -279,11 +279,18 @@ class ImplementationAgent:
             )
         except Exception as exc:
             errors.append(str(exc))
+            failure_stage = None
+            failure_reason = None
+            if self._is_git_author_identity_missing(exc):
+                failure_stage = "git_commit"
+                failure_reason = "git_author_identity_missing"
             return ImplementationReport(
                 task_id=task.id,
                 branch=branch,
                 status=ReportStatus.FAILED,
                 errors=errors,
+                failure_stage=failure_stage,
+                failure_reason=failure_reason,
                 patch_artifacts=patch_artifacts,
                 retry_attempted=retry_attempted,
                 retry_succeeded=retry_succeeded,
@@ -710,6 +717,15 @@ class ImplementationAgent:
             "anchor_not_found",
             "anchor_not_unique",
         }
+
+    @staticmethod
+    def _is_git_author_identity_missing(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return (
+            "author identity unknown" in text
+            or "please tell me who you are" in text
+            or "unable to auto-detect email address" in text
+        )
 
     @staticmethod
     def _structured_normalized_attempt(raw_response: str) -> object | None:
