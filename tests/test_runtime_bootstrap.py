@@ -56,6 +56,7 @@ def test_kubernetes_bootstrap_generates_expected_files_without_secrets(tmp_path)
     assert "/var/run/docker.sock" not in content
     assert "privileged: true" not in content
     assert "glpat-replace-me" in (out / "secret.example.yaml").read_text(encoding="utf-8")
+    assert not list(out.glob("cronjob-*.yaml"))
 
 
 def test_kubernetes_configmap_safe_defaults_and_connection_values(tmp_path):
@@ -220,6 +221,41 @@ def test_kubernetes_kustomization_references_base_resources(tmp_path):
 
     kustomization = yaml.safe_load((out / "kustomization.yaml").read_text(encoding="utf-8"))
     assert set(kustomization["resources"]) == {"namespace.yaml", "serviceaccount.yaml", "pvc.yaml", "configmap.yaml"}
+
+
+def test_kubernetes_bootstrap_generates_scheduler_cronjobs_when_enabled(tmp_path):
+    out = generate_k8s(
+        namespace="agentlab",
+        image="registry.local/agentlab:0.1.0",
+        gitlab_url="https://gitlab.local",
+        target_repo_url="https://gitlab.local/group/project.git",
+        ollama_url="http://ollama.local:11434",
+        output_dir=tmp_path,
+        schedule_enabled=True,
+        schedule_watch_cron="*/15 * * * *",
+        schedule_plan_cron="0 8 * * *",
+        schedule_action_cron="30 2 * * *",
+    )
+
+    for name, cron, command in (
+        ("watch", "*/15 * * * *", "scheduler-watch"),
+        ("plan", "0 8 * * *", "scheduler-plan"),
+        ("action", "30 2 * * *", "scheduler-action"),
+    ):
+        cronjob = yaml.safe_load((out / f"cronjob-{name}.yaml").read_text(encoding="utf-8"))
+        assert cronjob["kind"] == "CronJob"
+        assert cronjob["spec"]["schedule"] == cron
+        assert cronjob["spec"]["concurrencyPolicy"] == "Forbid"
+        assert cronjob["spec"]["successfulJobsHistoryLimit"] == 3
+        assert cronjob["spec"]["failedJobsHistoryLimit"] == 5
+        container = cronjob["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
+        assert container["args"][0] == command
+        volume_names = {volume["name"] for volume in cronjob["spec"]["jobTemplate"]["spec"]["template"]["spec"]["volumes"]}
+        assert {"config", "git-netrc", "runs"}.issubset(volume_names)
+
+    config = config_from_configmap(out)
+    assert config["schedule"]["enabled"] is True
+    assert config["schedule"]["watch"]["cron"] == "*/15 * * * *"
 
 
 def test_docker_bootstrap_generates_compose_config_and_readme(tmp_path):

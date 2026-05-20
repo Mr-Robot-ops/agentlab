@@ -223,6 +223,22 @@ class GitLabTool:
     def list_issues(self, *, state: str = "opened", per_page: int = 20) -> list[dict[str, Any]]:
         return [issue.asdict() for issue in self.project.issues.list(state=state, per_page=per_page)]
 
+    def get_default_branch_head(self) -> str | None:
+        branch = self.project.branches.get(self.config.default_branch)
+        commit = getattr(branch, "commit", None)
+        if isinstance(commit, dict):
+            return commit.get("id") or commit.get("sha")
+        return getattr(commit, "id", None) or getattr(commit, "sha", None)
+
+    def list_open_agent_mrs(self) -> list[MergeRequestInfo]:
+        mrs = self.project.mergerequests.list(state="opened", target_branch=self.config.default_branch, all=True)
+        result = []
+        for mr in mrs:
+            source_branch = getattr(mr, "source_branch", "")
+            if str(source_branch).startswith("agent/"):
+                result.append(self._mr_info(mr))
+        return result
+
     def _mr_info(self, mr: Any) -> MergeRequestInfo:
         labels = getattr(mr, "labels", []) or []
         return MergeRequestInfo(

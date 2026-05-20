@@ -41,10 +41,21 @@ class FakeMRManager:
     def get(self, mr_id: int) -> FakeMR:
         return self.mr
 
+    def list(self, **kwargs):
+        return [self.mr]
+
 
 class FakeProject:
     def __init__(self, mr: FakeMR) -> None:
         self.mergerequests = FakeMRManager(mr)
+
+
+class FakeBranchManager:
+    def get(self, branch: str):
+        class Branch:
+            commit = {"id": "abc123"}
+
+        return Branch()
 
 
 def tool_for(mr: FakeMR) -> GitLabTool:
@@ -99,3 +110,23 @@ def test_merge_mr_guarded_allows_can_be_merged_when_detailed_missing() -> None:
 
     assert mr.merged is True
     assert result.iid == 7
+
+
+def test_list_open_agent_mrs_filters_agent_source_branch() -> None:
+    mr = FakeMR()
+    tool = tool_for(mr)
+    tool.config = type("Config", (), {"default_branch": "main"})()
+
+    result = tool.list_open_agent_mrs()
+
+    assert len(result) == 1
+    assert result[0].source_branch == "agent/t1"
+
+
+def test_get_default_branch_head_reads_branch_commit() -> None:
+    mr = FakeMR()
+    tool = tool_for(mr)
+    tool.config = type("Config", (), {"default_branch": "main"})()
+    tool.project.branches = FakeBranchManager()
+
+    assert tool.get_default_branch_head() == "abc123"

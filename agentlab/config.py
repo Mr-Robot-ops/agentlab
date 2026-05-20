@@ -93,6 +93,40 @@ class AutoApproveConfig(BaseModel):
         return [value.strip() for value in values if value.strip()]
 
 
+class ScheduleEntryConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    cron: str
+
+
+class ScheduleLimitsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    max_open_agent_mrs: int = Field(default=2, ge=0)
+    max_new_mrs_per_day: int = Field(default=1, ge=0)
+    min_hours_between_action_runs: int = Field(default=8, ge=0)
+
+
+class ScheduleBehaviorConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    skip_if_open_agent_mr_exists: bool = True
+    skip_if_default_branch_unchanged_since_last_plan: bool = True
+
+
+class ScheduleConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    timezone: str = "Europe/Berlin"
+    watch: ScheduleEntryConfig = Field(default_factory=lambda: ScheduleEntryConfig(cron="*/30 * * * *"))
+    plan: ScheduleEntryConfig = Field(default_factory=lambda: ScheduleEntryConfig(cron="0 7,19 * * *"))
+    action: ScheduleEntryConfig = Field(default_factory=lambda: ScheduleEntryConfig(cron="30 2 * * *"))
+    limits: ScheduleLimitsConfig = Field(default_factory=ScheduleLimitsConfig)
+    behavior: ScheduleBehaviorConfig = Field(default_factory=ScheduleBehaviorConfig)
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
@@ -109,6 +143,7 @@ class AppConfig(BaseModel):
     workspace_root: Path = Path("./runs")
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
     auto_approve: AutoApproveConfig = Field(default_factory=AutoApproveConfig)
+    schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
     allowed_commands: list[str] = Field(default_factory=list)
     forbidden_commands: list[str] = Field(default_factory=list)
     protected_paths: list[str] = Field(default_factory=list)

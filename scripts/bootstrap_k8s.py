@@ -57,6 +57,10 @@ def generate_k8s(
     emit_komodo: bool = False,
     git_author_name: str = "AgentLab Bot",
     git_author_email: str = "agentlab-bot@example.local",
+    schedule_enabled: bool = False,
+    schedule_watch_cron: str = "*/30 * * * *",
+    schedule_plan_cron: str = "0 7,19 * * *",
+    schedule_action_cron: str = "30 2 * * *",
 ) -> Path:
     mode = validate_mode(mode, allow_dangerous_mode=allow_dangerous_mode)
     project_value = project_identifier(project=project, project_id=project_id, target_repo_url=target_repo_url)
@@ -71,6 +75,10 @@ def generate_k8s(
         workspace_root=workspace_root,
         mode=mode,
         runtime="kubernetes",
+        schedule_enabled=schedule_enabled,
+        schedule_watch_cron=schedule_watch_cron,
+        schedule_plan_cron=schedule_plan_cron,
+        schedule_action_cron=schedule_action_cron,
     )
 
     files = {
@@ -91,6 +99,23 @@ def generate_k8s(
             git_author_name=git_author_name,
             git_author_email=git_author_email,
         )
+    if schedule_enabled:
+        cron_commands = {
+            "watch": ["scheduler-watch", "--config", "/etc/agentlab/config.yaml"],
+            "plan": ["scheduler-plan", "--config", "/etc/agentlab/config.yaml"],
+            "action": ["scheduler-action", "--config", "/etc/agentlab/config.yaml"],
+        }
+        cron_schedules = {"watch": schedule_watch_cron, "plan": schedule_plan_cron, "action": schedule_action_cron}
+        for name, command in cron_commands.items():
+            files[f"cronjob-{name}.yaml"] = render_cronjob(
+                namespace=namespace,
+                image=image,
+                job_name=name,
+                command=command,
+                cron=cron_schedules[name],
+                git_author_name=git_author_name,
+                git_author_email=git_author_email,
+            )
     for name, content in files.items():
         write_file(out / name, content)
     if emit_komodo:
@@ -308,6 +333,47 @@ spec:
 """
 
 
+def render_cronjob(
+    *,
+    namespace: str,
+    image: str,
+    job_name: str,
+    command: list[str],
+    cron: str,
+    git_author_name: str = "AgentLab Bot",
+    git_author_email: str = "agentlab-bot@example.local",
+) -> str:
+    job = render_job(
+        namespace=namespace,
+        image=image,
+        job_name=f"scheduler-{job_name}",
+        command=command,
+        git_author_name=git_author_name,
+        git_author_email=git_author_email,
+    )
+    template = job.split("  template:\n", 1)[1]
+    return f"""apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: agentlab-scheduler-{job_name}
+  namespace: {namespace}
+  labels:
+    app.kubernetes.io/name: agentlab
+    app.kubernetes.io/component: scheduler
+spec:
+  schedule: {yaml_string(cron)}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  startingDeadlineSeconds: 1800
+  jobTemplate:
+    spec:
+      backoffLimit: 0
+      template:
+{indent(template, 8)}
+"""
+
+
 def render_readme(namespace: str) -> str:
     return f"""# Generated AgentLab Kubernetes Runtime
 
@@ -378,6 +444,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--emit-komodo", action="store_true")
     parser.add_argument("--git-author-name", default="AgentLab Bot")
     parser.add_argument("--git-author-email", default="agentlab-bot@example.local")
+    parser.add_argument("--schedule-enabled", action="store_true")
+    parser.add_argument("--schedule-watch-cron", default="*/30 * * * *")
+    parser.add_argument("--schedule-plan-cron", default="0 7,19 * * *")
+    parser.add_argument("--schedule-action-cron", default="30 2 * * *")
     return parser
 
 
@@ -403,6 +473,10 @@ def main(argv: list[str] | None = None) -> int:
             emit_komodo=args.emit_komodo,
             git_author_name=args.git_author_name,
             git_author_email=args.git_author_email,
+            schedule_enabled=args.schedule_enabled,
+            schedule_watch_cron=args.schedule_watch_cron,
+            schedule_plan_cron=args.schedule_plan_cron,
+            schedule_action_cron=args.schedule_action_cron,
         )
     except ValueError as exc:
         parser.error(str(exc))
