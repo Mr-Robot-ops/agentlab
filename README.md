@@ -290,6 +290,48 @@ Auto-Approval ist standardmaessig deaktiviert. Wenn aktiviert, schreibt AgentLab
 `approved_plan.json`. Die Auswahl ist stabil: niedrigster `risk_score`, dann `low` vor `medium`, dann `docs` vor
 `tests`, dann Task-ID. `auto_approve` darf nicht mit Direct-Main-Push oder Auto-Merge kombiniert werden.
 
+### Scheduler
+
+Der optionale Scheduler teilt autonome Arbeit in drei Stufen:
+
+- `scheduler-watch`: schneller Check von Default-Branch-Head und offenen `agent/*` MRs; keine LLM-Planung.
+- `scheduler-plan`: Repo-Index/Planung plus Auto-Approval; keine Branches, keine MRs.
+- `scheduler-action`: prueft Limits und startet hoechstens einen sicheren `full-flow`-Lauf.
+
+Empfohlener Start:
+
+```yaml
+schedule:
+  enabled: true
+  timezone: "Europe/Berlin"
+
+  watch:
+    enabled: true
+    cron: "*/30 * * * *"
+
+  plan:
+    enabled: true
+    cron: "0 7,19 * * *"
+
+  action:
+    enabled: true
+    cron: "30 2 * * *"
+
+  limits:
+    max_open_agent_mrs: 2
+    max_new_mrs_per_day: 1
+    min_hours_between_action_runs: 8
+
+  behavior:
+    skip_if_open_agent_mr_exists: true
+    skip_if_default_branch_unchanged_since_last_plan: true
+```
+
+State liegt unter `<workspace_root>/scheduler/state.json`; pro Lauf wird `scheduler_report.json` geschrieben.
+Skips wie `open_agent_mr_limit_reached`, `daily_mr_limit_reached`, `action_cooldown_active` oder
+`no_auto_approved_task` sind keine Fehler. Kubernetes-CronJobs werden nur erzeugt, wenn der Bootstrap mit
+`--schedule-enabled` ausgefuehrt wird. Scheduler-Action erzwingt nie Direct-Main-Push oder Auto-Merge.
+
 Der Integrationsablauf:
 
 ```mermaid

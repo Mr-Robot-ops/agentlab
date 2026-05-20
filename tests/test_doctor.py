@@ -222,3 +222,29 @@ def test_doctor_fails_when_auto_approve_combines_with_direct_main(tmp_path: Path
 
     check = next(check for check in report["checks"] if check["name"] == "auto_approve")
     assert check["status"] == "failed"
+
+
+def test_doctor_fails_when_scheduler_action_without_auto_approve(tmp_path: Path) -> None:
+    config = write_config(tmp_path, push_agent_branches_enabled=True)
+    with config.open("a", encoding="utf-8") as handle:
+        handle.write("schedule:\n  enabled: true\n")
+
+    report = Doctor(
+        config,
+        environ={
+            "GITLAB_TOKEN": "token",
+            "GIT_CONFIG_COUNT": "3",
+            "GIT_CONFIG_KEY_0": "credential.helper",
+            "GIT_CONFIG_VALUE_0": "helper",
+            "GIT_CONFIG_KEY_1": "user.name",
+            "GIT_CONFIG_VALUE_1": "AgentLab Bot",
+            "GIT_CONFIG_KEY_2": "user.email",
+            "GIT_CONFIG_VALUE_2": "agentlab-bot@example.local",
+        },
+        http_get=fake_http_get,
+        which=lambda name: "git",
+        run_command=fake_git_config_run({}),
+    ).run()
+
+    check = next(check for check in report["checks"] if check["name"] == "schedule")
+    assert check["status"] == "failed"
