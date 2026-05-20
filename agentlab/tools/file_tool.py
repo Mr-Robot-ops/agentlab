@@ -20,6 +20,41 @@ class PatchApplyError(ToolError):
         self.check = check
 
 
+class UnifiedDiffValidationError(ToolError):
+    def __init__(self, *, line_number: int, offending_line: str, reason: str = "missing_diff_prefix_in_hunk") -> None:
+        super().__init__(f"{reason} at line {line_number}: {offending_line!r}")
+        self.line_number = line_number
+        self.offending_line = offending_line
+        self.reason = reason
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "line_number": self.line_number,
+            "offending_line": self.offending_line,
+            "reason": self.reason,
+        }
+
+
+def validate_unified_diff_structure(patch: str) -> None:
+    in_hunk = False
+    for line_number, line in enumerate(patch.splitlines(), start=1):
+        if line.startswith("diff --git "):
+            in_hunk = False
+            continue
+        if line.startswith("--- ") or line.startswith("+++ "):
+            in_hunk = False
+            continue
+        if line.startswith("@@"):
+            in_hunk = True
+            continue
+        if not in_hunk:
+            continue
+        if not line or line in {"---", "+++"} or line.startswith("--- ") or line.startswith("+++ "):
+            raise UnifiedDiffValidationError(line_number=line_number, offending_line=line)
+        if line[0] not in {" ", "+", "-", "\\"}:
+            raise UnifiedDiffValidationError(line_number=line_number, offending_line=line)
+
+
 class FileTool:
     def __init__(self, repo_path: str | Path, config: AppConfig, *, dry_run: bool = False) -> None:
         self.repo_path = Path(repo_path).resolve()
@@ -79,6 +114,7 @@ class FileTool:
         return matches
 
     def validate_patch(self, proposal: PatchProposal) -> DiffStats:
+        validate_unified_diff_structure(proposal.patch)
         files = self._patch_files(proposal.patch)
         if proposal.affected_files:
             missing = set(files) - set(proposal.affected_files)

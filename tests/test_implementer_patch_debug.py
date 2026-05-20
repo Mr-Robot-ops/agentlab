@@ -18,7 +18,7 @@ from agentlab.models import (
     ReportStatus,
 )
 from agentlab.orchestrator import Orchestrator
-from agentlab.tools.file_tool import PatchApplyError
+from agentlab.tools.file_tool import PatchApplyError, UnifiedDiffValidationError, validate_unified_diff_structure
 
 
 PATCH = """diff --git a/README.md b/README.md
@@ -27,6 +27,35 @@ PATCH = """diff --git a/README.md b/README.md
 @@ -1 +1,2 @@
  # AgentLab
 +More docs
+"""
+
+INVALID_RULE_PATCH = """diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1,4 @@
+ # AgentLab
+---
++
++Next line
+"""
+
+INVALID_HEADING_PATCH = """diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1,3 @@
+ # AgentLab
+## Security & Deployment Assumptions
++Next line
+"""
+
+VALID_MARKDOWN_PATCH = """diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1,4 @@
+ # AgentLab
++---
++
++## Security & Deployment Assumptions
 """
 
 
@@ -70,6 +99,12 @@ class FakeFileTool:
         return DiffStats(changed_files=["README.md"], added_lines=1)
 
 
+class ValidatingFakeFileTool(FakeFileTool):
+    def validate_patch(self, proposal: PatchProposal) -> DiffStats:
+        validate_unified_diff_structure(proposal.patch)
+        return DiffStats(changed_files=["README.md"], added_lines=1)
+
+
 class FakeOllama:
     def __init__(self, proposals: list[PatchProposal]) -> None:
         self.proposals = proposals
@@ -105,10 +140,14 @@ def task() -> AgentTask:
 
 
 def proposal(summary: str = "docs") -> PatchProposal:
+    return proposal_with_patch(PATCH, summary=summary)
+
+
+def proposal_with_patch(patch: str, summary: str = "docs") -> PatchProposal:
     return PatchProposal(
         task_id="document-privileged-container-boundaries",
         summary=summary,
-        patch=PATCH,
+        patch=patch,
         affected_files=["README.md"],
         expected_tests=[],
         rollback="Revert README.md changes.",
@@ -117,6 +156,32 @@ def proposal(summary: str = "docs") -> PatchProposal:
 
 def read_artifact(store: ArtifactStore, name: str) -> str:
     return (store.artifacts_dir / name).read_text(encoding="utf-8")
+
+
+def test_unified_diff_validation_rejects_unprefixed_markdown_rule_in_hunk() -> None:
+    try:
+        validate_unified_diff_structure(INVALID_RULE_PATCH)
+    except UnifiedDiffValidationError as exc:
+        assert exc.reason == "missing_diff_prefix_in_hunk"
+        assert exc.offending_line == "---"
+        assert exc.line_number == 6
+    else:
+        raise AssertionError("expected UnifiedDiffValidationError")
+
+
+def test_unified_diff_validation_rejects_unprefixed_heading_in_hunk() -> None:
+    try:
+        validate_unified_diff_structure(INVALID_HEADING_PATCH)
+    except UnifiedDiffValidationError as exc:
+        assert exc.reason == "missing_diff_prefix_in_hunk"
+        assert exc.offending_line == "## Security & Deployment Assumptions"
+        assert exc.line_number == 6
+    else:
+        raise AssertionError("expected UnifiedDiffValidationError")
+
+
+def test_unified_diff_validation_accepts_prefixed_markdown_additions() -> None:
+    validate_unified_diff_structure(VALID_MARKDOWN_PATCH)
 
 
 def test_malformed_patch_writes_debug_artifacts_and_failed_report(tmp_path: Path) -> None:
@@ -147,6 +212,43 @@ def test_malformed_patch_writes_debug_artifacts_and_failed_report(tmp_path: Path
     assert read_artifact(store, "patch_excerpt.txt").splitlines() == PATCH.splitlines()[:80]
     command = json.loads(read_artifact(store, "patch_apply_command.json"))
     assert command["command"] == ["git", "apply", "--check", "--whitespace=nowarn", "-"]
+
+
+def test_validation_error_writes_artifact_and_repair_prompt_gets_line_context(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "run", "run")
+    git = FakeGitTool()
+    file_tool = ValidatingFakeFileTool()
+    ollama = FakeOllama([proposal_with_patch(INVALID_HEADING_PATCH), proposal_with_patch(INVALID_RULE_PATCH, "repair")])
+
+    report = ImplementationAgent(config(tmp_path), git, file_tool, ollama, artifacts=store).implement(task())
+
+    assert report.status == ReportStatus.FAILED
+    assert report.failure_stage == "patch_validation"
+    assert report.failure_reason == "missing_diff_prefix_in_hunk"
+    assert report.retry_attempted is True
+    assert report.retry_succeeded is False
+    assert report.no_changes_committed is True
+    assert report.no_branch_pushed is True
+    assert file_tool.apply_calls == 0
+    assert git.committed is False
+    assert git.pushed is False
+    assert "patch_validation_error.json" in report.patch_artifacts
+    assert "repair_patch_validation_error.json" in report.patch_artifacts
+    assert "line 6" in report.errors[0]
+    assert "## Security & Deployment Assumptions" in report.errors[0]
+    validation = json.loads(read_artifact(store, "patch_validation_error.json"))
+    assert validation == {
+        "line_number": 6,
+        "offending_line": "## Security & Deployment Assumptions",
+        "reason": "missing_diff_prefix_in_hunk",
+    }
+    repair_prompt = ollama.prompts[1]
+    assert '"line_number": 6' in repair_prompt
+    assert '"offending_line": "## Security & Deployment Assumptions"' in repair_prompt
+    assert "Every line inside a unified diff hunk must start with space, +, -, or backslash." in repair_prompt
+    assert "Markdown lines that should be added must start with +" in repair_prompt
+    assert "Do not wrap the diff in Markdown fences." in repair_prompt
+    assert "Do not include explanations outside JSON." in repair_prompt
 
 
 def test_corrupt_patch_repair_success_continues_to_commit(tmp_path: Path) -> None:

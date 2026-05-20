@@ -440,10 +440,12 @@ Wichtige Dateien:
 - `implementer_raw_response.json` oder `implementer_raw_response.txt`: rohe Modellantwort, redacted.
 - `patch_proposal.json`: geparstes PatchProposal, redacted.
 - `raw_patch.diff`: urspruenglicher Unified Diff, redacted.
+- `patch_validation_error.json`: strukturierter Fehler aus der Unified-Diff-Validierung vor `git apply`,
+  inklusive `line_number`, `offending_line` und `reason`.
 - `patch_apply_error.txt` und `patch_apply_stderr.txt`: Fehler aus `git apply` / `git apply --check`.
 - `patch_apply_command.json`: ausgefuehrtes Apply-Kommando ohne Patchinhalt.
 - `patch_excerpt.txt`: erste 80 Zeilen des Patches.
-- Bei Reparaturversuchen: entsprechende `repair_*` Artefakte.
+- Bei Reparaturversuchen: entsprechende `repair_*` Artefakte, z. B. `repair_patch_validation_error.json`.
 
 Zum Gegencheck, dass nichts committed oder gepusht wurde:
 
