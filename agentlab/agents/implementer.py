@@ -8,7 +8,7 @@ from agentlab.config import AppConfig
 from agentlab.models import AgentTask, ImplementationReport, PatchProposal, ReportStatus
 from agentlab.policies.risk import assess_risk
 from agentlab.tools.common import ToolError
-from agentlab.tools.file_tool import FileTool, PatchApplyError
+from agentlab.tools.file_tool import FileTool, PatchApplyError, UnifiedDiffValidationError
 from agentlab.tools.git_tool import GitTool
 from agentlab.tools.ollama_client import OllamaClient
 
@@ -45,6 +45,7 @@ class ImplementationAgent:
         retry_succeeded = False
         commit_created = False
         branch_pushed = False
+        first_patch_failure: PatchApplyError | UnifiedDiffValidationError | None = None
         if not task.approved:
             return ImplementationReport(
                 task_id=task.id,
@@ -62,22 +63,26 @@ class ImplementationAgent:
             proposal, raw_response = self._proposal(task)
             patch_artifacts.extend(self._persist_patch_inputs(raw_response, proposal))
             try:
-                self._ensure_task_scope(task, proposal)
-                diff_stats = self.file_tool.apply_patch(proposal)
-            except PatchApplyError as exc:
-                patch_artifacts.extend(self._persist_patch_apply_error(exc))
-                if not self._is_corrupt_patch(exc.stderr):
+                diff_stats = self._validate_and_apply(task, proposal)
+            except (PatchApplyError, UnifiedDiffValidationError) as exc:
+                first_patch_failure = exc
+                patch_artifacts.extend(self._persist_patch_failure(exc))
+                if isinstance(exc, PatchApplyError) and not self._is_corrupt_patch(exc.stderr):
                     raise
                 retry_attempted = True
-                repaired, repaired_raw = self._repair_patch(task, proposal.patch, exc.stderr)
+                repaired, repaired_raw = self._repair_patch(
+                    task,
+                    proposal.patch,
+                    exc.stderr if isinstance(exc, PatchApplyError) else "",
+                    validation_error=exc if isinstance(exc, UnifiedDiffValidationError) else None,
+                )
                 patch_artifacts.extend(self._persist_patch_inputs(repaired_raw, repaired, prefix="repair_"))
-                self._ensure_task_scope(task, repaired)
                 try:
-                    diff_stats = self.file_tool.apply_patch(repaired)
+                    diff_stats = self._validate_and_apply(task, repaired)
                     proposal = repaired
                     retry_succeeded = True
-                except PatchApplyError as retry_exc:
-                    patch_artifacts.extend(self._persist_patch_apply_error(retry_exc, prefix="repair_"))
+                except (PatchApplyError, UnifiedDiffValidationError) as retry_exc:
+                    patch_artifacts.extend(self._persist_patch_failure(retry_exc, prefix="repair_"))
                     raise retry_exc
             risk = assess_risk(task, diff_stats.changed_files, proposal.patch)
             if risk.blocked:
@@ -109,6 +114,8 @@ class ImplementationAgent:
                 no_branch_pushed=not branch_pushed,
             )
         except PatchApplyError as exc:
+            if first_patch_failure is not None and first_patch_failure is not exc:
+                errors.append(str(first_patch_failure))
             errors.append(str(exc))
             return ImplementationReport(
                 task_id=task.id,
@@ -117,6 +124,23 @@ class ImplementationAgent:
                 errors=errors,
                 failure_stage="patch_apply",
                 failure_reason="corrupt_patch" if self._is_corrupt_patch(exc.stderr) else "patch_apply_failed",
+                patch_artifacts=patch_artifacts,
+                retry_attempted=retry_attempted,
+                retry_succeeded=retry_succeeded,
+                no_changes_committed=not commit_created,
+                no_branch_pushed=not branch_pushed,
+            )
+        except UnifiedDiffValidationError as exc:
+            if first_patch_failure is not None and first_patch_failure is not exc:
+                errors.append(str(first_patch_failure))
+            errors.append(str(exc))
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                errors=errors,
+                failure_stage="patch_validation",
+                failure_reason=exc.reason,
                 patch_artifacts=patch_artifacts,
                 retry_attempted=retry_attempted,
                 retry_succeeded=retry_succeeded,
@@ -165,17 +189,30 @@ class ImplementationAgent:
             raise ToolError("PatchProposal.task_id does not match task id")
         return proposal, raw_response
 
-    def _repair_patch(self, task: AgentTask, original_patch: str, stderr: str) -> tuple[PatchProposal, str]:
+    def _repair_patch(
+        self,
+        task: AgentTask,
+        original_patch: str,
+        stderr: str,
+        *,
+        validation_error: UnifiedDiffValidationError | None = None,
+    ) -> tuple[PatchProposal, str]:
+        validation_payload = validation_error.to_dict() if validation_error is not None else None
         payload = {
             "task": task.model_dump(mode="json"),
             "original_patch": original_patch,
             "git_apply_stderr": stderr,
+            "patch_validation_error": validation_payload,
             "rules": {
                 "repair_only": "Repair only unified diff syntax/format so git apply can parse it.",
+                "hunk_prefix_rule": "Every line inside a unified diff hunk must start with space, +, -, or backslash.",
+                "markdown_lines": "Markdown lines that should be added must start with +, for example +--- or +## Heading.",
                 "scope": "Do not change task scope or intent.",
                 "allowed_files": task.affected_files,
                 "forbidden_actions": task.forbidden_actions,
-                "output": "Return one PatchProposal JSON object with the repaired patch.",
+                "output": "Return only one PatchProposal JSON object with the repaired patch.",
+                "no_markdown_fences": "Do not wrap the diff in Markdown fences.",
+                "no_explanations": "Do not include explanations outside JSON.",
             },
         }
         proposal, raw_response = self._chat_patch_proposal(
@@ -231,6 +268,21 @@ class ImplementationAgent:
             self.artifacts.write_text(f"{prefix}patch_excerpt.txt", "\n".join(exc.patch.splitlines()[:80])),
         ]
         return [record.name for record in records]
+
+    def _persist_patch_validation_error(self, exc: UnifiedDiffValidationError, *, prefix: str = "") -> list[str]:
+        if self.artifacts is None:
+            return []
+        record = self.artifacts.write_json(f"{prefix}patch_validation_error", exc.to_dict())
+        return [record.name]
+
+    def _persist_patch_failure(self, exc: PatchApplyError | UnifiedDiffValidationError, *, prefix: str = "") -> list[str]:
+        if isinstance(exc, PatchApplyError):
+            return self._persist_patch_apply_error(exc, prefix=prefix)
+        return self._persist_patch_validation_error(exc, prefix=prefix)
+
+    def _validate_and_apply(self, task: AgentTask, proposal: PatchProposal) -> Any:
+        self._ensure_task_scope(task, proposal)
+        return self.file_tool.apply_patch(proposal)
 
     def _ensure_task_scope(self, task: AgentTask, proposal: PatchProposal) -> None:
         if not task.affected_files:
