@@ -200,3 +200,100 @@ def test_finalizer_blocks_auto_merge_when_mr_state_is_unknown() -> None:
     assert result.auto_merge_attempted is False
     assert result.skipped_reason == "MR state is not opened: None"
     assert fake.merge_called is False
+
+
+def test_finalizer_comment_is_reviewer_readable_for_readme_only_blocked_gate() -> None:
+    fake = FakeGitLabTool()
+    gate = GateDecision(
+        allowed=False,
+        mode="merge_request",
+        verdict="blocked",
+        risk_score=10,
+        blockers=[
+            "auto merge is disabled",
+            "quality review is not approved",
+            "security/architecture review is not approved",
+        ],
+        policy_checks={
+            "mode_enabled": False,
+            "quality_review_approved": False,
+            "security_review_approved": False,
+            "functional_tests_passed": True,
+        },
+        check_statuses={"docs_check": "passed", "structure_evidence_check": "skipped"},
+    )
+    payload = inputs(gate)
+    payload["functional_tests"] = AgentTestReport(
+        status=ReportStatus.SKIPPED,
+        passed=True,
+        recommendation="README-only change: docs checks are authoritative.",
+    )
+    payload["quality_review"] = ReviewReport(
+        reviewer="quality",
+        verdict=Verdict.CHANGES_REQUESTED,
+        summary="needs attention",
+    )
+    payload["security_review"] = ReviewReport(
+        reviewer="security_architecture",
+        verdict=Verdict.CHANGES_REQUESTED,
+        summary="needs attention",
+    )
+    payload["diff_stats"] = DiffStats(changed_files=["README.md"], added_lines=2, deleted_lines=1)
+
+    MRFinalizer(config(auto_merge_enabled=True), fake).finalize(**payload)  # type: ignore[arg-type]
+
+    comment = fake.comments[-1][1]
+    assert "ReportStatus." not in comment
+    assert "Verdict." not in comment
+    assert "RiskLevel." not in comment
+    assert "### Summary" in comment
+    assert "- Result: blocked" in comment
+    assert "- Why: auto merge is disabled; quality review changes requested; security/architecture review changes requested" in comment
+    assert "- Risk: low (10)" in comment
+    assert "- Changed files: `README.md`" in comment
+    assert "- Docs check: passed" in comment
+    assert "- Structure evidence: skipped" in comment
+    assert "- Functional tests: skipped because README-only" in comment
+    assert "- Quality review: changes requested" in comment
+    assert "- Security/architecture review: changes requested" in comment
+    assert "- Pipeline: not checked" in comment
+    assert "Full policy details are available in `gate_decision.json`." in comment
+
+
+def test_finalizer_comment_omits_passing_policy_checks_and_shows_failed_checks() -> None:
+    fake = FakeGitLabTool()
+    gate = GateDecision(
+        allowed=False,
+        mode="merge_request",
+        verdict="blocked",
+        risk_score=10,
+        blockers=["failing policy check"],
+        policy_checks={
+            "passing_check": True,
+            "failing_check": False,
+        },
+    )
+
+    MRFinalizer(config(auto_merge_enabled=True), fake).finalize(**inputs(gate))  # type: ignore[arg-type]
+
+    comment = fake.comments[-1][1]
+    assert "`failing_check`" in comment
+    assert "passing_check" not in comment
+
+
+def test_finalizer_comment_mentions_when_no_policy_checks_failed() -> None:
+    fake = FakeGitLabTool()
+    gate = GateDecision(
+        allowed=True,
+        mode="merge_request",
+        verdict="allowed",
+        risk_score=10,
+        policy_checks={"mode_enabled": True, "functional_tests_passed": True},
+    )
+
+    MRFinalizer(config(auto_merge_enabled=False), fake).finalize(**inputs(gate))  # type: ignore[arg-type]
+
+    comment = fake.comments[-1][1]
+    assert "No failed policy checks. Full policy details are available in `gate_decision.json`." in comment
+    assert "mode_enabled" not in comment
+    assert "functional_tests_passed" not in comment
