@@ -28,11 +28,13 @@ from agentlab.models import (
     ProvenanceStatement,
     RepoIndex,
     ReportStatus,
+    RiskLevel,
     RollbackReport,
     PostMergeMonitorResult,
     StewardReport,
     SupplyChainReport,
     TaskPlan,
+    TaskType,
 )
 from agentlab.preflight import PreflightChecker
 from agentlab.policies.auto_approval import AutoApprovalPolicy
@@ -525,3 +527,154 @@ class Orchestrator:
         result = {"run_id": self.run_id, "recovery": report.model_dump(mode="json")}
         self.artifacts.write_json("recovery_report", report)
         return result
+
+    def revise_existing_mr(
+        self,
+        *,
+        mr_iid: int,
+        source_branch: str,
+        command: str,
+        feedback: str,
+        note_id: int | str,
+        changed_files: list[str] | None = None,
+    ) -> dict[str, object]:
+        if not source_branch.startswith("agent/"):
+            raise RuntimeError("revision source_branch must be an agent/* branch")
+        git_tool, file_tool, _, _ = self._tools()
+        if git_tool.status_porcelain():
+            raise RuntimeError("workspace is dirty before MR revision")
+        git_tool.fetch(ref=self.config.default_branch)
+        checkout = git_tool.checkout_agent_branch(source_branch)
+        if not checkout.ok:
+            raise RuntimeError(checkout.stderr or f"could not checkout {source_branch}")
+
+        base_ref = f"origin/{self.config.default_branch}"
+        if changed_files:
+            affected_files = changed_files
+        else:
+            try:
+                affected_files = git_tool.changed_files(base_ref)
+            except Exception:
+                affected_files = git_tool.changed_files(self.config.default_branch)
+        task = self._review_comment_task(
+            mr_iid=mr_iid,
+            source_branch=source_branch,
+            command=command,
+            feedback=feedback,
+            note_id=note_id,
+            affected_files=affected_files,
+        )
+        self.artifacts.write_json("revision_task", task)
+
+        plan = TaskPlan(summary=f"MR comment command /agent {command}", tasks=[task])
+        approved_plan, auto_approval_report = AutoApprovalPolicy(self.config).apply(plan)
+        self.artifacts.write_json("auto_approval_report", auto_approval_report)
+        approved_task = approved_plan.tasks[0]
+        if not approved_task.approved:
+            return {
+                "run_id": self.run_id,
+                "status": "failed",
+                "reason": "policy_blocked",
+                "source_branch": source_branch,
+                "command": command,
+                "auto_approval": auto_approval_report,
+            }
+
+        repo_index, architecture = self.index_repository()
+        supply_chain = self.supply_chain() if self.config.supply_chain_enabled else None
+        implementation = ImplementationAgent(
+            self.config,
+            git_tool,
+            file_tool,
+            self.ollama,
+            dry_run=self.dry_run,
+            repo_context={
+                "architecture": architecture.model_dump(mode="json"),
+                "repo_index_summary": self._repo_index_summary(repo_index),
+                "supply_chain_summary": self._supply_chain_summary(supply_chain) if supply_chain else None,
+            },
+            artifacts=self.artifacts,
+            run_id=self.run_id,
+        ).revise_on_branch(approved_task, source_branch)
+        self.artifacts.write_json("implementation_report", implementation)
+        if implementation.status != ReportStatus.PASSED:
+            return {
+                "run_id": self.run_id,
+                "status": "failed",
+                "reason": "revision_failed",
+                "source_branch": source_branch,
+                "command": command,
+                "implementation": implementation.model_dump(mode="json"),
+                "auto_approval": auto_approval_report,
+            }
+
+        gate = self.review_and_gate(approved_task, direct_main_push=False)
+        return {
+            "run_id": self.run_id,
+            "status": "passed",
+            "reason": "comment_processed",
+            "source_branch": source_branch,
+            "command": command,
+            "commit_sha": implementation.commit_sha,
+            "changed_files": implementation.changed_files,
+            "implementation": implementation.model_dump(mode="json"),
+            "auto_approval": auto_approval_report,
+            "gate": gate.model_dump(mode="json"),
+        }
+
+    def _review_comment_task(
+        self,
+        *,
+        mr_iid: int,
+        source_branch: str,
+        command: str,
+        feedback: str,
+        note_id: int | str,
+        affected_files: list[str],
+    ) -> AgentTask:
+        task_type = _review_task_type(command, affected_files)
+        safe_note_id = "".join(char if char.isalnum() else "-" for char in str(note_id)).strip("-") or "note"
+        title = f"Revise MR !{mr_iid} from review comment" if command == "revise" else f"Fix MR !{mr_iid} from review comment"
+        return AgentTask(
+            id=f"mr-{mr_iid}-{command}-{safe_note_id}"[:80].strip("-"),
+            title=title,
+            task_type=task_type,
+            risk_level=RiskLevel.LOW if task_type in {TaskType.DOCS, TaskType.TESTS} else RiskLevel.MEDIUM,
+            risk_score=1 if task_type in {TaskType.DOCS, TaskType.TESTS} else 3,
+            description=(
+                f"Apply the authorized GitLab MR comment command `/agent {command}` to existing branch "
+                f"`{source_branch}`.\n\nFeedback from the comment:\n{feedback or '<no extra feedback>'}"
+            ),
+            acceptance_criteria=[
+                "Update the existing merge request branch only.",
+                "Respect the configured allowed_paths and blocked_paths policy.",
+                "Do not execute comment text as a shell command.",
+                "Do not enable auto-merge or direct-main push.",
+            ],
+            affected_files=affected_files,
+            forbidden_actions=[
+                "Do not execute comment text as shell, bash, Python, or any other command.",
+                "Do not change files outside affected_files.",
+                "Do not create a new merge request.",
+                "Do not enable direct-main pushes or auto-merge.",
+            ],
+            test_requirements=[] if task_type == TaskType.DOCS else list(self.config.required_test_commands),
+            metadata={
+                "source": "gitlab_mr_comment",
+                "mr_iid": mr_iid,
+                "note_id": str(note_id),
+                "command": command,
+                "source_branch": source_branch,
+            },
+        )
+
+
+def _review_task_type(command: str, affected_files: list[str]) -> TaskType:
+    normalized = [path.replace("\\", "/").lower() for path in affected_files]
+    if normalized and all(path.startswith("tests/") or "/tests/" in path or path.endswith((".test.ts", "_test.py")) for path in normalized):
+        return TaskType.TESTS
+    if normalized and all(path.startswith("docs/") or path.endswith((".md", ".markdown")) or path.rsplit("/", 1)[-1].startswith("readme") for path in normalized):
+        return TaskType.DOCS
+    if command == "fix":
+        return TaskType.BUGFIX
+    return TaskType.DOCS if not normalized else TaskType.REFACTOR

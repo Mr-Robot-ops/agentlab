@@ -5,6 +5,7 @@ AgentLab scheduler support is split into three commands:
 - `scheduler-watch`: cheap GitLab API check for the default branch head and open `agent/*` merge requests.
 - `scheduler-plan`: repository indexing, planning, and deterministic AutoApprovalPolicy evaluation.
 - `scheduler-action`: one bounded implementation/MR attempt after scheduler limits pass.
+- `scheduler-review-comments`: polling loop for explicit commands in GitLab MR notes/discussions on agent-generated MRs.
 
 Scheduling is disabled by default. Start manually before enabling CronJobs.
 
@@ -86,9 +87,97 @@ schedule:
   action:
     enabled: false
     cron: "30 2 * * *"
+  review_comments:
+    enabled: false
+    cron: "*/10 * * * *"
+    max_comments_per_run: 1
+    cooldown_minutes: 10
+    allowed_commands:
+      - revise
+      - fix
+      - status
+      - explain
+      - stop
+      - resume
+    allowed_authors: []
+    require_author_role:
+      - owner
+      - maintainer
 ```
 
 Keep `schedule.action.enabled: false` until watch, plan, and AutoApproval reports look right.
+
+## MR Review Comment Commands
+
+`scheduler-review-comments` polls GitLab MR Notes and Discussions. It is intentionally not a webhook receiver: AgentLab does not expose a new HTTP service, ingress, or webhook signature endpoint for this loop.
+
+AgentLab only reacts when all MR filters match:
+
+- MR is open.
+- `source_branch` starts with `agent/`.
+- MR has label `agent/generated`.
+- `target_branch` equals `default_branch`.
+- MR belongs to the configured `project_id`.
+
+Supported commands:
+
+```text
+/agent revise
+/agent fix
+/agent status
+/agent explain
+/agent stop
+/agent resume
+
+@agentlab revise
+@agentlab fix
+@agentlab status
+@agentlab explain
+@agentlab stop
+@agentlab resume
+```
+
+`/agent revise` and `/agent fix` may update code or docs on the existing MR source branch, subject to AutoApproval, allowed paths, protected paths, risk checks, tests, and Gatekeeper. They do not create a new MR and they do not enable auto-merge or direct-main push.
+
+`/agent status`, `/agent explain`, `/agent stop`, and `/agent resume` are read-only with respect to repository files. `stop` writes only the scheduler state marker for that MR; future `revise` and `fix` commands are skipped until an authorized user posts `/agent resume`.
+
+Examples:
+
+```text
+/agent revise
+Bitte README-Struktur anhand der tatsaechlichen Dateien unter rust-backend/src/routes aktualisieren.
+```
+
+```text
+/agent fix
+Die Aenderung an web/package.json bitte zuruecknehmen. Der MR soll nur README.md aendern.
+```
+
+```text
+/agent status
+```
+
+```text
+/agent stop
+Ich uebernehme diesen MR manuell.
+```
+
+Rejected commands include `/agent run`, `/agent shell`, `/agent bash`, `/agent exec`, `/agent deploy`, `/agent merge`, `/agent approve`, `/agent auto-merge`, and `/agent push-main`. They are answered with a rejection comment and never executed.
+
+Authorization defaults to Owner/Maintainer roles. You can also configure a conservative explicit allowlist:
+
+```yaml
+schedule:
+  enabled: true
+  review_comments:
+    enabled: true
+    allowed_authors:
+      - alice
+      - bob
+    require_author_role: []
+```
+
+If role checks are unavailable and `allowed_authors` is empty, commands are blocked. Bot-authored comments are ignored to avoid loops. Processed notes are recorded in `<workspace_root>/scheduler/state.json` under `processed_review_comments`, so the same note is never patched or answered twice.
 
 ## Recommended Rollout
 
@@ -150,3 +239,8 @@ This means `rust-backend/Cargo.toml` was allowed by policy, but `rust-backend/sr
 - `default_branch_unchanged`: the plan was skipped because the default branch head matches the last plan. Use `scheduler-reset-state` or wait for a real repository change.
 - `selected_task_id: null`: inspect `auto_approval_report.json`.
 - `path_not_allowed`: compare `details.disallowed_paths` with `auto_approve.allowed_paths` and extend the narrowest safe pattern.
+- Review comment ignored: confirm the MR is open, targets the default branch, uses an `agent/*` source branch, and has the `agent/generated` label.
+- User not authorized: add the user to `schedule.review_comments.allowed_authors` or make sure GitLab role lookup works for Owner/Maintainer.
+- Policy blocks revision: inspect `review_comment_report.json`, `parsed_command.json`, `revision_task.json`, and `auto_approval_report.json`.
+- Comment already processed: the note ID is already in `processed_review_comments`; post a new comment for a new command.
+- MR stopped: post `/agent resume` as an authorized user before posting `/agent revise` or `/agent fix` again.
