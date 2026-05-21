@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-ALLOWED_REVIEW_COMMANDS = {"revise", "fix", "status", "explain", "stop", "resume"}
+ALLOWED_REVIEW_COMMANDS = {"revise", "fix", "propose", "dry-run", "status", "explain", "stop", "resume"}
 DENIED_REVIEW_COMMANDS = {
     "run",
     "shell",
@@ -19,6 +19,7 @@ DENIED_REVIEW_COMMANDS = {
 }
 
 COMMAND_RE = re.compile(r"^\s*(?P<prefix>/agent|@agentlab)\s+(?P<command>[a-z][a-z-]*)\b(?P<tail>.*)\Z", re.IGNORECASE | re.DOTALL)
+DRY_RUN_FLAG_RE = re.compile(r"(?:^|\s)--dry-run(?:\s|$)", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -28,6 +29,7 @@ class ParsedReviewCommand:
     feedback: str
     allowed: bool
     reason: str | None = None
+    propose_only: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -46,6 +48,10 @@ def parse_review_command(
     command = match.group("command").lower()
     tail = match.group("tail") or ""
     feedback = tail.strip()
+    propose_only = command in {"propose", "dry-run"}
+    if command in {"revise", "fix"} and DRY_RUN_FLAG_RE.search(feedback):
+        propose_only = True
+        feedback = DRY_RUN_FLAG_RE.sub(" ", feedback).strip()
 
     if command in DENIED_REVIEW_COMMANDS or command not in allowed_set:
         return ParsedReviewCommand(
@@ -54,6 +60,7 @@ def parse_review_command(
             feedback=feedback,
             allowed=False,
             reason="command_not_allowed",
+            propose_only=propose_only,
         )
 
     return ParsedReviewCommand(
@@ -61,6 +68,7 @@ def parse_review_command(
         command=command,
         feedback=feedback,
         allowed=True,
+        propose_only=propose_only,
     )
 
 

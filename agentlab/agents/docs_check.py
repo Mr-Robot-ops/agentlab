@@ -35,9 +35,16 @@ class FencedBlock:
 class DocsCheckAgent:
     name = "docs_check"
 
-    def __init__(self, file_tool: FileTool, artifacts: ArtifactStore | None = None) -> None:
+    def __init__(
+        self,
+        file_tool: FileTool,
+        artifacts: ArtifactStore | None = None,
+        *,
+        content_overrides: dict[str, str] | None = None,
+    ) -> None:
         self.file_tool = file_tool
         self.artifacts = artifacts
+        self.content_overrides = {path.replace("\\", "/"): content for path, content in (content_overrides or {}).items()}
 
     def run(self, changed_files: list[str]) -> DocsCheckReport:
         readme_paths = [path for path in _dedupe(changed_files) if is_readme_path(path)]
@@ -57,7 +64,9 @@ class DocsCheckAgent:
         structure_block_present = False
         for path in readme_paths:
             try:
-                content = self.file_tool.read_file(path)
+                content = self.content_overrides.get(path.replace("\\", "/"))
+                if content is None:
+                    content = self.file_tool.read_file(path)
             except Exception as exc:
                 findings.append(
                     _finding(

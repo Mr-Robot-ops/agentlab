@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 import hashlib
 import shutil
-from difflib import SequenceMatcher
+from difflib import SequenceMatcher, unified_diff
 from pathlib import Path, PurePosixPath
 
 from agentlab.config import AppConfig
@@ -205,7 +205,27 @@ class FileTool:
             raise PatchApplyError(command=apply_command, stderr=applied.stderr or "git apply failed", patch=proposal.patch, check=False)
         return stats
 
+    def preview_structured_edits(self, proposal: StructuredEditProposal) -> tuple[DiffStats, str, dict[str, str]]:
+        stats, planned = self._plan_structured_edits(proposal)
+        diff = self._structured_unified_diff(planned)
+        proposed_files = {path: new for path, (_, _, new) in planned.items() if path in stats.changed_files}
+        return stats, diff, proposed_files
+
     def apply_structured_edits(self, proposal: StructuredEditProposal) -> DiffStats:
+        stats, planned = self._plan_structured_edits(proposal)
+        if self.dry_run:
+            return stats
+
+        for path, _, new_content in planned.values():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(new_content, encoding="utf-8")
+
+        check = run_subprocess(["git", "diff", "--check"], cwd=self.repo_path, timeout_seconds=self.config.command_timeout_seconds)
+        if not check.ok:
+            raise ToolError(check.stderr or "git diff --check failed after structured edit")
+        return stats
+
+    def _plan_structured_edits(self, proposal: StructuredEditProposal) -> tuple[DiffStats, dict[str, tuple[Path, str, str]]]:
         planned: dict[str, tuple[Path, str, str]] = {}
         working: dict[str, str] = {}
         originals: dict[str, str] = {}
@@ -305,17 +325,32 @@ class FileTool:
             raise ToolError("refusing to apply structured edit that touches secrets")
         if stats.touched_protected_paths:
             raise ToolError("refusing to apply structured edit that touches protected paths")
-        if self.dry_run:
-            return stats
+        return stats, planned
 
-        for path, _, new_content in planned.values():
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(new_content, encoding="utf-8")
-
-        check = run_subprocess(["git", "diff", "--check"], cwd=self.repo_path, timeout_seconds=self.config.command_timeout_seconds)
-        if not check.ok:
-            raise ToolError(check.stderr or "git diff --check failed after structured edit")
-        return stats
+    @staticmethod
+    def _structured_unified_diff(planned: dict[str, tuple[Path, str, str]]) -> str:
+        chunks: list[str] = []
+        for relative_path, (_, old, new) in planned.items():
+            if old == new:
+                continue
+            chunks.append(f"diff --git a/{relative_path} b/{relative_path}\n")
+            old_lines = old.splitlines(keepends=True)
+            new_lines = new.splitlines(keepends=True)
+            chunks.extend(
+                unified_diff(
+                    old_lines,
+                    new_lines,
+                    fromfile=f"a/{relative_path}",
+                    tofile=f"b/{relative_path}",
+                    lineterm="",
+                )
+            )
+        if not chunks:
+            return ""
+        normalized: list[str] = []
+        for line in chunks:
+            normalized.append(line if line.endswith("\n") else f"{line}\n")
+        return "".join(normalized)
 
     def _structured_error(
         self,

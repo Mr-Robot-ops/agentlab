@@ -96,6 +96,8 @@ schedule:
     allowed_commands:
       - revise
       - fix
+      - propose
+      - dry-run
       - status
       - explain
       - stop
@@ -125,6 +127,9 @@ Supported commands:
 ```text
 /agent revise
 /agent fix
+/agent propose
+/agent dry-run
+/agent revise --dry-run
 /agent status
 /agent explain
 /agent stop
@@ -132,6 +137,8 @@ Supported commands:
 
 @agentlab revise
 @agentlab fix
+@agentlab propose
+@agentlab dry-run
 @agentlab status
 @agentlab explain
 @agentlab stop
@@ -139,6 +146,8 @@ Supported commands:
 ```
 
 `/agent revise` and `/agent fix` may update code or docs on the existing MR source branch, subject to AutoApproval, allowed paths, protected paths, risk checks, tests, and Gatekeeper. They do not create a new MR and they do not enable auto-merge or direct-main push.
+
+`/agent propose`, `/agent dry-run`, and `/agent revise --dry-run` generate a proposed revision only. They must report `Commit: none` and `Push: skipped`, write proposal artifacts such as `proposed.diff`, and must not present proposal validation as an applied MR gate.
 
 `/agent status`, `/agent explain`, `/agent stop`, and `/agent resume` are read-only with respect to repository files. `stop` writes only the scheduler state marker for that MR; future `revise` and `fix` commands are skipped until an authorized user posts `/agent resume`.
 

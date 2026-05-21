@@ -146,13 +146,14 @@ class ReviewScheduler(Scheduler):
         return self.fake_gitlab
 
 
-@pytest.mark.parametrize("command", ["revise", "fix", "status", "explain", "stop", "resume"])
+@pytest.mark.parametrize("command", ["revise", "fix", "propose", "dry-run", "status", "explain", "stop", "resume"])
 def test_parser_recognizes_agent_commands(command: str) -> None:
     parsed = parse_review_command(f"/agent {command}")
 
     assert parsed is not None
     assert parsed.command == command
     assert parsed.allowed is True
+    assert parsed.propose_only is (command in {"propose", "dry-run"})
 
 
 def test_parser_recognizes_alias_and_multiline_feedback() -> None:
@@ -160,6 +161,15 @@ def test_parser_recognizes_alias_and_multiline_feedback() -> None:
 
     assert parsed is not None
     assert parsed.command == "revise"
+    assert parsed.feedback == "Bitte README aktualisieren."
+
+
+def test_parser_recognizes_revise_dry_run_and_cleans_feedback() -> None:
+    parsed = parse_review_command("/agent revise --dry-run Bitte README aktualisieren.")
+
+    assert parsed is not None
+    assert parsed.command == "revise"
+    assert parsed.propose_only is True
     assert parsed.feedback == "Bitte README aktualisieren."
 
 
@@ -284,6 +294,75 @@ def test_revision_command_uses_existing_source_branch(tmp_path: Path) -> None:
     assert "AgentLab processed `/agent revise`" in gitlab.posted[0][1]
     parsed = json.loads((scheduler.artifacts.artifacts_dir / "parsed_command.json").read_text(encoding="utf-8"))
     assert parsed["command"] == "revise"
+    assert parsed["propose_only"] is False
+
+
+def test_propose_command_generates_proposal_response_and_consumes_cooldown(tmp_path: Path) -> None:
+    cfg = config(tmp_path, process_history=True)
+    result = {
+        "run_id": "run-1",
+        "status": "passed",
+        "reason": "proposal_generated",
+        "source_branch": "agent/docs",
+        "command": "propose",
+        "propose_only": True,
+        "commit_sha": None,
+        "changed_files": ["README.md"],
+        "auto_approval": {"approved_tasks": ["mr-15-propose-1"], "evaluated_tasks": [{"details": {"risk_score": 1}}]},
+        "proposal_validation": {"status": "passed", "blockers": []},
+        "proposal_artifacts": ["structured_proposal.json", "proposed.diff", "structured_proposal_report.json"],
+    }
+    orchestrator = FakeOrchestrator(cfg, result=result)
+    gitlab = FakeGitLab(notes=[note(1, "/agent propose\nBitte README nur vorschlagen.")])
+    scheduler = ReviewScheduler(cfg, gitlab=gitlab, orchestrator=orchestrator)
+
+    report = scheduler.review_comments()
+
+    assert report["status"] == "passed"
+    assert report["reason"] == "proposal_generated"
+    assert orchestrator.calls[0]["propose_only"] is True
+    assert orchestrator.calls[0]["feedback"] == "Bitte README nur vorschlagen."
+    response = gitlab.posted[0][1]
+    assert "AgentLab generated a proposed revision but did not push it." in response
+    assert "Commit: none" in response
+    assert "Push: skipped" in response
+    assert "Proposal validation:" in response
+    assert "Gate:" not in response
+    assert "- structured_proposal.json" in response
+    assert "- proposed.diff" in response
+    assert "- structured_proposal_report.json" in response
+    state, _ = scheduler.state_store.read()
+    assert "1:15:1" in state["processed_review_comments"]
+    assert "1:15" in state["review_comment_cooldowns"]
+
+
+def test_revise_dry_run_routes_to_propose_only_without_gate_claim(tmp_path: Path) -> None:
+    cfg = config(tmp_path, process_history=True)
+    result = {
+        "run_id": "run-1",
+        "status": "passed",
+        "reason": "proposal_generated",
+        "source_branch": "agent/docs",
+        "command": "revise",
+        "propose_only": True,
+        "changed_files": ["README.md"],
+        "auto_approval": {"approved_tasks": ["mr-15-revise-1"], "evaluated_tasks": [{"details": {"risk_score": 1}}]},
+        "proposal_validation": {"status": "failed", "blockers": ["docs check failed"]},
+        "proposal_artifacts": ["structured_proposal.json", "proposed.diff", "structured_proposal_report.json"],
+    }
+    orchestrator = FakeOrchestrator(cfg, result=result)
+    gitlab = FakeGitLab(notes=[note(1, "/agent revise --dry-run Bitte README pruefen.")])
+    scheduler = ReviewScheduler(cfg, gitlab=gitlab, orchestrator=orchestrator)
+
+    scheduler.review_comments()
+
+    assert orchestrator.calls[0]["propose_only"] is True
+    assert orchestrator.calls[0]["feedback"] == "Bitte README pruefen."
+    response = gitlab.posted[0][1]
+    assert "Proposal validation:" in response
+    assert "- failed" in response
+    assert "MR gate passed" not in response
+    assert "Gate:" not in response
 
 
 def test_empty_state_initializes_seen_notes_without_processing_history(tmp_path: Path) -> None:
