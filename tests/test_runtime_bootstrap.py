@@ -57,6 +57,7 @@ def test_kubernetes_bootstrap_generates_expected_files_without_secrets(tmp_path)
         "job-scheduler-watch.yaml",
         "job-scheduler-plan.yaml",
         "job-scheduler-action.yaml",
+        "job-scheduler-review-comments.yaml",
         "kustomization.yaml",
         "README.generated.md",
     }
@@ -283,6 +284,7 @@ def test_kubernetes_bootstrap_generates_manual_scheduler_jobs(tmp_path):
         ("scheduler-watch", "scheduler-watch"),
         ("scheduler-plan", "scheduler-plan"),
         ("scheduler-action", "scheduler-action"),
+        ("scheduler-review-comments", "scheduler-review-comments"),
     ):
         pod, container = pod_parts_from_job(out, f"job-{name}.yaml")
         assert container["args"] == [command, "--config", "/etc/agentlab/config.yaml"]
@@ -318,6 +320,31 @@ def test_scheduler_jobs_share_env_and_mounts_with_run_task(tmp_path):
         mount["name"] for mount in run_container["volumeMounts"] if mount["name"] != "task"
     }
     assert {volume["name"] for volume in watch_pod["volumes"]} >= {volume["name"] for volume in run_pod["volumes"] if volume["name"] != "task"}
+
+
+def test_kubernetes_bootstrap_generates_review_comment_cronjob_when_enabled(tmp_path):
+    out = generate_k8s(
+        namespace="agentlab",
+        image="registry.local/agentlab:0.1.0",
+        gitlab_url="https://gitlab.local",
+        target_repo_url="https://gitlab.local/group/project.git",
+        ollama_url="http://ollama.local:11434",
+        output_dir=tmp_path,
+        schedule_enabled=True,
+        schedule_review_comments_enabled=True,
+        schedule_review_comments_cron="*/7 * * * *",
+    )
+
+    cronjob = yaml.safe_load((out / "cronjob-scheduler-review-comments.yaml").read_text(encoding="utf-8"))
+    assert cronjob["kind"] == "CronJob"
+    assert cronjob["spec"]["schedule"] == "*/7 * * * *"
+    assert cronjob["spec"]["concurrencyPolicy"] == "Forbid"
+    container = cronjob["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
+    assert container["args"] == ["scheduler-review-comments", "--config", "/etc/agentlab/config.yaml"]
+
+    config = config_from_configmap(out)
+    assert config["schedule"]["review_comments"]["enabled"] is True
+    assert config["schedule"]["review_comments"]["cron"] == "*/7 * * * *"
 
 
 def test_docker_bootstrap_generates_compose_config_and_readme(tmp_path):

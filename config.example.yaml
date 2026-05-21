@@ -94,3 +94,32 @@ docker_compose_enabled: true
 require_two_reviewers: true
 require_two_testers: true
 command_timeout_seconds: 900
+
+schedule:
+  enabled: false
+  timezone: "Europe/Berlin"
+  watch:
+    enabled: true
+    cron: "*/30 * * * *"
+  plan:
+    enabled: true
+    cron: "0 7,19 * * *"
+  action:
+    enabled: true
+    cron: "30 2 * * *"
+  review_comments:
+    enabled: false
+    cron: "*/10 * * * *"
+    max_comments_per_run: 1
+    cooldown_minutes: 10
+    allowed_commands:
+      - revise
+      - fix
+      - status
+      - explain
+      - stop
+      - resume
+    allowed_authors: []
+    require_author_role:
+      - owner
+      - maintainer

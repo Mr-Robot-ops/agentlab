@@ -38,6 +38,7 @@ JOB_COMMANDS = {
     "scheduler-watch": ["scheduler-watch", "--config", "/etc/agentlab/config.yaml"],
     "scheduler-plan": ["scheduler-plan", "--config", "/etc/agentlab/config.yaml"],
     "scheduler-action": ["scheduler-action", "--config", "/etc/agentlab/config.yaml"],
+    "scheduler-review-comments": ["scheduler-review-comments", "--config", "/etc/agentlab/config.yaml"],
 }
 
 
@@ -64,6 +65,8 @@ def generate_k8s(
     schedule_watch_cron: str = "*/30 * * * *",
     schedule_plan_cron: str = "0 7,19 * * *",
     schedule_action_cron: str = "30 2 * * *",
+    schedule_review_comments_enabled: bool = False,
+    schedule_review_comments_cron: str = "*/10 * * * *",
 ) -> Path:
     mode = validate_mode(mode, allow_dangerous_mode=allow_dangerous_mode)
     project_value = project_identifier(project=project, project_id=project_id, target_repo_url=target_repo_url)
@@ -82,6 +85,8 @@ def generate_k8s(
         schedule_watch_cron=schedule_watch_cron,
         schedule_plan_cron=schedule_plan_cron,
         schedule_action_cron=schedule_action_cron,
+        schedule_review_comments_enabled=schedule_review_comments_enabled,
+        schedule_review_comments_cron=schedule_review_comments_cron,
     )
 
     files = {
@@ -113,6 +118,9 @@ def generate_k8s(
             "scheduler-plan": schedule_plan_cron,
             "scheduler-action": schedule_action_cron,
         }
+        if schedule_review_comments_enabled:
+            cron_commands["scheduler-review-comments"] = ["scheduler-review-comments", "--config", "/etc/agentlab/config.yaml"]
+            cron_schedules["scheduler-review-comments"] = schedule_review_comments_cron
         for name, command in cron_commands.items():
             files[f"cronjob-{name}.yaml"] = render_cronjob(
                 namespace=namespace,
@@ -428,6 +436,7 @@ kubectl apply -f deploy/kubernetes/generated/job-steward.yaml
 kubectl apply -f deploy/kubernetes/generated/job-plan.yaml
 kubectl apply -f deploy/kubernetes/generated/job-scheduler-watch.yaml
 kubectl apply -f deploy/kubernetes/generated/job-scheduler-plan.yaml
+kubectl apply -f deploy/kubernetes/generated/job-scheduler-review-comments.yaml
 ```
 
 For `job-run-task.yaml`, create a ConfigMap named `agentlab-task` with `task.json` first.
@@ -459,6 +468,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--schedule-watch-cron", default="*/30 * * * *")
     parser.add_argument("--schedule-plan-cron", default="0 7,19 * * *")
     parser.add_argument("--schedule-action-cron", default="30 2 * * *")
+    parser.add_argument("--schedule-review-comments-enabled", action="store_true")
+    parser.add_argument("--schedule-review-comments-cron", default="*/10 * * * *")
     return parser
 
 
@@ -488,6 +499,8 @@ def main(argv: list[str] | None = None) -> int:
             schedule_watch_cron=args.schedule_watch_cron,
             schedule_plan_cron=args.schedule_plan_cron,
             schedule_action_cron=args.schedule_action_cron,
+            schedule_review_comments_enabled=args.schedule_review_comments_enabled,
+            schedule_review_comments_cron=args.schedule_review_comments_cron,
         )
     except ValueError as exc:
         parser.error(str(exc))

@@ -104,6 +104,12 @@ def scheduler_action(config: Path = typer.Option(..., "--config", exists=True, r
     _json_echo(Scheduler(cfg).action())
 
 
+@app.command("scheduler-review-comments")
+def scheduler_review_comments(config: Path = typer.Option(..., "--config", exists=True, readable=True)) -> None:
+    cfg = load_config(config)
+    _json_echo(Scheduler(cfg).review_comments())
+
+
 @app.command("scheduler-reset-state")
 def scheduler_reset_state(config: Path = typer.Option(..., "--config", exists=True, readable=True)) -> None:
     cfg = load_config(config)

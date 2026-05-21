@@ -68,6 +68,7 @@ class Doctor:
             self._check_dangerous_flags()
             self._check_auto_approve()
             self._check_schedule()
+            self._check_review_comments()
         exit_code = self.exit_code()
         status = "failed" if exit_code == 2 else "warning" if exit_code == 1 else "passed"
         return {
@@ -383,6 +384,64 @@ class Doctor:
         self._passed(
             "schedule",
             f"schedule enabled: watch={schedule.watch.cron}, plan={schedule.plan.cron}, action={schedule.action.cron}",
+        )
+
+    def _check_review_comments(self) -> None:
+        assert self.config is not None
+        review = self.config.schedule.review_comments
+        if not review.enabled:
+            self._skipped("review_comments", "review comment scheduler is disabled")
+            return
+        if not self.config.schedule.enabled:
+            self._failed(
+                "review_comments",
+                "schedule.review_comments is enabled but schedule.enabled is false",
+                "Set schedule.enabled: true or disable schedule.review_comments.",
+            )
+            return
+        if not review.allowed_authors and not review.require_author_role:
+            self._failed(
+                "review_comments_auth",
+                "review comment commands have no safe authorization source",
+                "Set schedule.review_comments.allowed_authors or require_author_role.",
+            )
+            return
+        if not self.environ.get(self.config.gitlab_token_env):
+            self._skipped("review_comments_gitlab", "Review comment GitLab API check skipped because token is missing")
+            return
+        try:
+            gitlab = self.gitlab_tool_factory(self.config)
+            if not review.allowed_authors and not (
+                hasattr(gitlab, "author_is_allowed") or hasattr(gitlab, "get_project_member_role")
+            ):
+                self._failed(
+                    "review_comments_auth",
+                    "review comment commands require roles, but this GitLab adapter cannot verify author roles",
+                    "Set schedule.review_comments.allowed_authors to an explicit username allowlist.",
+                )
+                return
+            mrs = gitlab.list_open_agent_merge_requests()
+            if mrs:
+                first_mr = mrs[0]
+                if isinstance(first_mr, dict):
+                    raw_iid = first_mr.get("iid") or first_mr.get("mr_id")
+                else:
+                    raw_iid = getattr(first_mr, "iid", None) or getattr(first_mr, "mr_id", 0)
+                mr_iid = int(raw_iid)
+                gitlab.list_merge_request_notes(mr_iid)
+                gitlab.list_merge_request_discussions(mr_iid)
+            if not hasattr(gitlab, "post_merge_request_note"):
+                raise RuntimeError("post_merge_request_note is not available")
+        except Exception as exc:
+            self._failed(
+                "review_comments_gitlab",
+                f"Review comment GitLab API check failed: {exc}",
+                "Check api scope, project_id, and whether the token can read merge requests, notes, and discussions.",
+            )
+            return
+        self._passed(
+            "review_comments",
+            "review comment scheduler can read agent MRs and MR notes/discussions; note posting is not side-effect tested.",
         )
 
     def _check_scheduler_gitlab_api(self, *, enabled: bool) -> None:

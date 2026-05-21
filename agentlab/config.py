@@ -115,6 +115,30 @@ class ScheduleBehaviorConfig(BaseModel):
     skip_if_default_branch_unchanged_since_last_plan: bool = True
 
 
+class ScheduleReviewCommentsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    cron: str = "*/10 * * * *"
+    max_comments_per_run: int = Field(default=1, ge=1)
+    cooldown_minutes: int = Field(default=10, ge=0)
+    allowed_commands: list[str] = Field(
+        default_factory=lambda: ["revise", "fix", "status", "explain", "stop", "resume"]
+    )
+    allowed_authors: list[str] = Field(default_factory=list)
+    require_author_role: list[str] = Field(default_factory=lambda: ["owner", "maintainer"])
+
+    @field_validator("allowed_commands", "allowed_authors", "require_author_role")
+    @classmethod
+    def normalize_strings(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            stripped = value.strip().lower()
+            if stripped and stripped not in normalized:
+                normalized.append(stripped)
+        return normalized
+
+
 class ScheduleConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -125,6 +149,7 @@ class ScheduleConfig(BaseModel):
     action: ScheduleEntryConfig = Field(default_factory=lambda: ScheduleEntryConfig(cron="30 2 * * *"))
     limits: ScheduleLimitsConfig = Field(default_factory=ScheduleLimitsConfig)
     behavior: ScheduleBehaviorConfig = Field(default_factory=ScheduleBehaviorConfig)
+    review_comments: ScheduleReviewCommentsConfig = Field(default_factory=ScheduleReviewCommentsConfig)
 
     @model_validator(mode="before")
     @classmethod
@@ -135,6 +160,15 @@ class ScheduleConfig(BaseModel):
             "watch": {"enabled": True, "cron": "*/30 * * * *"},
             "plan": {"enabled": True, "cron": "0 7,19 * * *"},
             "action": {"enabled": True, "cron": "30 2 * * *"},
+            "review_comments": {
+                "enabled": False,
+                "cron": "*/10 * * * *",
+                "max_comments_per_run": 1,
+                "cooldown_minutes": 10,
+                "allowed_commands": ["revise", "fix", "status", "explain", "stop", "resume"],
+                "allowed_authors": [],
+                "require_author_role": ["owner", "maintainer"],
+            },
         }
         merged = dict(raw)
         for key, default in defaults.items():

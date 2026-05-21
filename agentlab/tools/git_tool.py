@@ -69,6 +69,22 @@ class GitTool:
             raise ToolError("unsafe git ref")
         return self._git(["checkout", ref])
 
+    def fetch(self, remote: str = "origin", ref: str | None = None) -> CommandResult:
+        if ref and (ref.startswith("-") or ".." in ref):
+            raise ToolError("unsafe git ref")
+        args = ["fetch", "--prune", remote]
+        if ref:
+            args.append(ref)
+        return self._git(args)
+
+    def checkout_agent_branch(self, branch: str, remote: str = "origin") -> CommandResult:
+        if not branch.startswith("agent/") or ".." in branch or branch.endswith(".lock") or branch.startswith("-"):
+            raise ToolError("agent branches must match agent/<task-id>")
+        fetched = self.fetch(remote, branch)
+        if not fetched.ok:
+            return fetched
+        return self._git(["checkout", "-B", branch, f"{remote}/{branch}"])
+
     def pull_ff_only(self, remote: str = "origin", branch: str | None = None) -> CommandResult:
         target = branch or self.default_branch
         if target.startswith("-"):
