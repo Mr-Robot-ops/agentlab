@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from enum import Enum
+
 from agentlab.config import AppConfig
 from agentlab.models import (
     AgentTask,
@@ -246,37 +248,191 @@ class MRFinalizer:
         supply_chain_status: str | None,
         direct_main_note: str | None,
     ) -> str:
-        blockers = "\n".join(f"- {blocker}" for blocker in gate.blockers) or "- None"
-        changed = "\n".join(f"- `{path}`" for path in diff_stats.changed_files) or "- None"
+        readme_only = MRFinalizer._readme_only(diff_stats.changed_files)
+        failed_policy_checks = [name for name, passed in sorted(gate.policy_checks.items()) if not passed]
+        blocker_items = MRFinalizer._blocker_lines(gate.blockers)
+        result = MRFinalizer._result_label(
+            gate=gate,
+            auto_merge_succeeded=auto_merge_succeeded,
+            skipped_reason=skipped_reason,
+        )
+        why = MRFinalizer._why_summary(gate.blockers, skipped_reason, auto_merge_succeeded)
+        checks = MRFinalizer._checks_lines(
+            functional_tests=functional_tests,
+            build_security=build_security,
+            quality_review=quality_review,
+            security_review=security_review,
+            gate=gate,
+            pipeline_status=pipeline_status,
+            readme_only=readme_only,
+            failed_policy_checks=failed_policy_checks,
+        )
+        audit_lines = MRFinalizer._audit_lines(
+            audit_id=audit_id,
+            direct_main_note=direct_main_note,
+            supply_chain_status=supply_chain_status,
+            skipped_reason=skipped_reason,
+            failed_policy_checks=failed_policy_checks,
+        )
         return (
             "## AgentLab Gate Report\n\n"
-            f"**Task:** `{task.id}` - {task.title}\n"
-            f"**Gate:** `{gate.verdict}`\n"
-            f"**Risk:** `{risk.score}` / `{risk.level}`\n\n"
+            "### Summary\n"
+            f"- Result: {result}\n"
+            f"- Why: {why}\n"
+            f"- Task: `{task.id}` - {task.title}\n"
+            f"- Risk: {MRFinalizer._label(risk.level)} ({risk.score})\n"
+            f"- Changed files: {MRFinalizer._inline_files(diff_stats.changed_files)}\n\n"
             "### Implementation\n"
             f"- Branch: `{implementation.branch}`\n"
             f"- Commit: `{implementation.commit_sha or '<none>'}`\n"
-            f"- Pushed: `{implementation.pushed}`\n\n"
-            "### Tests\n"
-            f"- Functional: `{functional_tests.status}`\n"
-            f"- Build/Security: `{build_security.status}`\n\n"
-            "### Reviews\n"
-            f"- Quality: `{quality_review.verdict}`\n"
-            f"- Security/Architecture: `{security_review.verdict}`\n\n"
-            "### Diff\n"
-            f"- Added lines: `{diff_stats.added_lines}`\n"
-            f"- Deleted lines: `{diff_stats.deleted_lines}`\n"
-            f"- Changed files:\n{changed}\n\n"
+            f"- Pushed: {MRFinalizer._yes_no(implementation.pushed)}\n"
+            f"- Merged: {MRFinalizer._yes_no(auto_merge_succeeded)}\n"
+            f"- Added/deleted lines: +{diff_stats.added_lines} / -{diff_stats.deleted_lines}\n\n"
+            "### Checks\n"
+            f"{checks}\n\n"
             "### Blockers\n"
-            f"{blockers}\n\n"
-            "### Integration\n"
-            f"- Pipeline: `{pipeline_status or 'not checked'}`\n"
-            f"- Auto-merge attempted: `{auto_merge_attempted}`\n"
-            f"- Auto-merge succeeded: `{auto_merge_succeeded}`\n"
-            f"- Auto-merge skipped reason: `{skipped_reason or '<none>'}`\n"
-            f"- Direct-main: `{direct_main_note or 'not applicable for MR finalization'}`\n"
-            f"- Supply-chain: `{supply_chain_status or 'not provided'}`\n"
-            f"- Audit/Run ID: `{audit_id or '<unknown>'}`\n\n"
-            "### Policy Checks\n"
-            + "\n".join(f"- `{name}`: `{passed}`" for name, passed in sorted(gate.policy_checks.items()))
+            f"{blocker_items}\n\n"
+            "### Audit\n"
+            f"{audit_lines}"
         )
+
+    @staticmethod
+    def _label(value: object) -> str:
+        if isinstance(value, Enum):
+            value = value.value
+        text = str(value).strip() if value is not None else "unknown"
+        return text.replace("_", " ").lower()
+
+    @staticmethod
+    def _yes_no(value: bool) -> str:
+        return "yes" if value else "no"
+
+    @staticmethod
+    def _inline_files(paths: list[str]) -> str:
+        if not paths:
+            return "none"
+        return ", ".join(f"`{path}`" for path in paths)
+
+    @staticmethod
+    def _readme_only(paths: list[str]) -> bool:
+        if not paths:
+            return False
+        for path in paths:
+            name = path.replace("\\", "/").rsplit("/", 1)[-1].lower()
+            if name != "readme" and not name.startswith("readme."):
+                return False
+        return True
+
+    @staticmethod
+    def _result_label(
+        *,
+        gate: GateDecision,
+        auto_merge_succeeded: bool,
+        skipped_reason: str | None,
+    ) -> str:
+        if auto_merge_succeeded:
+            return "merged"
+        if not gate.allowed:
+            return "blocked"
+        if skipped_reason:
+            return "not merged"
+        return MRFinalizer._label(gate.verdict)
+
+    @staticmethod
+    def _why_summary(blockers: list[str], skipped_reason: str | None, auto_merge_succeeded: bool) -> str:
+        if auto_merge_succeeded:
+            return "merged successfully"
+        reasons = [MRFinalizer._human_reason(blocker) for blocker in blockers]
+        if skipped_reason and skipped_reason != "gate is blocked":
+            reasons.append(MRFinalizer._human_reason(skipped_reason))
+        unique_reasons: list[str] = []
+        for reason in reasons:
+            if reason and reason not in unique_reasons:
+                unique_reasons.append(reason)
+        return "; ".join(unique_reasons) if unique_reasons else "no blockers"
+
+    @staticmethod
+    def _human_reason(reason: str) -> str:
+        normalized = reason.strip()
+        replacements = {
+            "auto_merge_enabled is false": "auto merge is disabled",
+            "quality review is not approved": "quality review changes requested",
+            "security/architecture review is not approved": "security/architecture review changes requested",
+        }
+        return replacements.get(normalized, normalized.replace("_", " "))
+
+    @staticmethod
+    def _blocker_lines(blockers: list[str]) -> str:
+        if not blockers:
+            return "- None"
+        return "\n".join(f"- {MRFinalizer._sentence(MRFinalizer._human_reason(blocker))}" for blocker in blockers)
+
+    @staticmethod
+    def _sentence(text: str) -> str:
+        if not text:
+            return text
+        return text[0].upper() + text[1:]
+
+    @staticmethod
+    def _checks_lines(
+        *,
+        functional_tests: TestReport,
+        build_security: BuildSecurityReport,
+        quality_review: ReviewReport,
+        security_review: ReviewReport,
+        gate: GateDecision,
+        pipeline_status: str | None,
+        readme_only: bool,
+        failed_policy_checks: list[str],
+    ) -> str:
+        lines = [
+            f"- Functional tests: {MRFinalizer._functional_tests_label(functional_tests, readme_only)}",
+            f"- Build/security: {MRFinalizer._label(build_security.status)}",
+            f"- Quality review: {MRFinalizer._label(quality_review.verdict)}",
+            f"- Security/architecture review: {MRFinalizer._label(security_review.verdict)}",
+            f"- Pipeline: {MRFinalizer._pipeline_label(pipeline_status)}",
+        ]
+        docs_status = gate.check_statuses.get("docs_check")
+        structure_status = gate.check_statuses.get("structure_evidence_check")
+        if readme_only or docs_status is not None:
+            lines.insert(0, f"- Docs check: {MRFinalizer._label(docs_status or 'skipped')}")
+        if readme_only or structure_status is not None:
+            insert_at = 1 if readme_only or docs_status is not None else 0
+            lines.insert(insert_at, f"- Structure evidence: {MRFinalizer._label(structure_status or 'skipped')}")
+        if failed_policy_checks:
+            checks = ", ".join(f"`{name}`" for name in failed_policy_checks)
+            lines.append(f"- Failed policy checks: {checks}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _functional_tests_label(functional_tests: TestReport, readme_only: bool) -> str:
+        status = MRFinalizer._label(functional_tests.status)
+        if readme_only and status == "skipped":
+            return "skipped because README-only"
+        return status
+
+    @staticmethod
+    def _pipeline_label(pipeline_status: str | None) -> str:
+        return MRFinalizer._label(pipeline_status or "not checked")
+
+    @staticmethod
+    def _audit_lines(
+        *,
+        audit_id: str | None,
+        direct_main_note: str | None,
+        supply_chain_status: str | None,
+        skipped_reason: str | None,
+        failed_policy_checks: list[str],
+    ) -> str:
+        lines = [
+            f"- Run ID: `{audit_id or '<unknown>'}`",
+            f"- Direct-main: {direct_main_note or 'not applicable for MR finalization'}",
+            f"- Supply-chain: {supply_chain_status or 'not provided'}",
+        ]
+        if skipped_reason:
+            lines.append(f"- Merge skipped reason: {MRFinalizer._human_reason(skipped_reason)}")
+        if failed_policy_checks:
+            lines.append("Full policy details are available in `gate_decision.json`.")
+        else:
+            lines.append("No failed policy checks. Full policy details are available in `gate_decision.json`.")
+        return "\n".join(lines)
