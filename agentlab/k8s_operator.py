@@ -188,6 +188,43 @@ class ArtifactResult:
     content: str
 
 
+@dataclass
+class FailedResources:
+    jobs: list[str] = field(default_factory=list)
+    pods: list[str] = field(default_factory=list)
+    skipped_resources: list[str] = field(default_factory=list)
+
+    @property
+    def found(self) -> bool:
+        return bool(self.jobs or self.pods)
+
+
+@dataclass
+class CleanupReport:
+    namespace: str
+    deleted_jobs: list[str] = field(default_factory=list)
+    deleted_pods: list[str] = field(default_factory=list)
+    skipped_resources: list[str] = field(default_factory=list)
+    dry_run: bool = False
+
+
+@dataclass
+class UpgradeReport:
+    namespace: str
+    manifest_dir: str
+    image: str
+    updated_manifests: list[str] = field(default_factory=list)
+    preserved_sections: list[str] = field(default_factory=list)
+    apply: bool = False
+    applied: bool = False
+    run_doctor: bool = False
+    doctor_status: str = "not requested"
+    cleanup_failed: bool = False
+    cleanup_report: CleanupReport | None = None
+    status_checked: bool = False
+    image_drift: list[str] = field(default_factory=list)
+
+
 class K8sOperator:
     def __init__(
         self,
@@ -326,6 +363,140 @@ class K8sOperator:
         item = self._run_json(["get", "cronjob", cronjob, "-o", "json"])
         return _cronjob_status(item, None)
 
+    def failed_resources(self) -> FailedResources:
+        jobs: list[str] = []
+        pods: list[str] = []
+        skipped: list[str] = []
+        for item in self._items("jobs"):
+            name = _resource_name(item)
+            if not name:
+                continue
+            if not name.startswith("agentlab-"):
+                if _job_failed(item):
+                    skipped.append(f"job/{name}: not an AgentLab resource")
+                continue
+            if _job_active(item):
+                skipped.append(f"job/{name}: still active")
+                continue
+            if _job_failed(item):
+                jobs.append(name)
+
+        for item in self._items("pods"):
+            name = _resource_name(item)
+            if not name:
+                continue
+            if not name.startswith("agentlab-"):
+                if _pod_failed(item):
+                    skipped.append(f"pod/{name}: not an AgentLab resource")
+                continue
+            if _pod_running(item):
+                skipped.append(f"pod/{name}: still running")
+                continue
+            if _pod_failed(item):
+                pods.append(name)
+        return FailedResources(jobs=sorted(jobs), pods=sorted(pods), skipped_resources=skipped)
+
+    def cleanup_failed(self, *, dry_run: bool = False) -> CleanupReport:
+        resources = self.failed_resources()
+        deleted_jobs: list[str] = []
+        deleted_pods: list[str] = []
+        if not dry_run:
+            for job in resources.jobs:
+                self._run(["delete", "job", job])
+                deleted_jobs.append(job)
+            for pod in resources.pods:
+                self._run(["delete", "pod", pod])
+                deleted_pods.append(pod)
+        return CleanupReport(
+            namespace=self.namespace,
+            deleted_jobs=resources.jobs if dry_run else deleted_jobs,
+            deleted_pods=resources.pods if dry_run else deleted_pods,
+            skipped_resources=resources.skipped_resources,
+            dry_run=dry_run,
+        )
+
+    def upgrade(
+        self,
+        *,
+        image: str,
+        apply: bool = False,
+        preserve_cluster_config: bool = False,
+        preserve_local_config: bool = False,
+        run_doctor: bool = False,
+        show_status: bool = False,
+        cleanup_failed: bool = False,
+    ) -> UpgradeReport:
+        if preserve_cluster_config and preserve_local_config:
+            raise K8sOperatorError("Choose either --preserve-cluster-config or --preserve-local-config, not both.")
+        if not self.manifest_dir.exists():
+            raise K8sOperatorError(f"manifest dir is missing: {self.manifest_dir}")
+        if not self.manifest_dir.is_dir():
+            raise K8sOperatorError(f"manifest dir is not a directory: {self.manifest_dir}")
+
+        preserved_config: dict[str, Any] | None = None
+        if preserve_cluster_config:
+            preserved_config = self._cluster_config()
+        elif preserve_local_config:
+            preserved_config = _config_from_configmap_manifest(self.manifest_dir / "configmap.yaml")
+
+        updated = update_generated_manifests(
+            manifest_dir=self.manifest_dir,
+            image=image,
+            preserved_config=preserved_config,
+        )
+        expected_image, drifts = detect_manifest_image_drift(self.manifest_dir)
+        drift_messages = [
+            f"{drift.path}: {drift.image} != {drift.expected_image}"
+            for drift in drifts
+        ]
+        if expected_image != image:
+            drift_messages.append(f"configmap.yaml annotation: {expected_image or 'missing'} != {image}")
+
+        report = UpgradeReport(
+            namespace=self.namespace,
+            manifest_dir=str(self.manifest_dir),
+            image=image,
+            updated_manifests=updated["updated_manifests"],
+            preserved_sections=updated["preserved_sections"],
+            apply=apply,
+            run_doctor=run_doctor,
+            cleanup_failed=cleanup_failed,
+            image_drift=drift_messages,
+        )
+        if report.image_drift:
+            return report
+
+        if apply:
+            self._run(["apply", "-k", str(self.manifest_dir)])
+            report.applied = True
+            if show_status or apply:
+                report.status_checked = True
+                cluster_status = self.status(manifest_dir=self.manifest_dir)
+                cluster_drifts = [
+                    f"CronJob {item.name}: {item.image} != {cluster_status.configmap_image}"
+                    for item in cluster_status.cronjobs
+                    if item.image_drift
+                ]
+                if cluster_drifts:
+                    report.image_drift.extend(cluster_drifts)
+                    raise K8sOperatorError("image drift remains after apply: " + "; ".join(cluster_drifts))
+            if run_doctor:
+                self.run_component("doctor", follow=True)
+                report.doctor_status = "completed"
+            if cleanup_failed:
+                report.cleanup_report = self.cleanup_failed(dry_run=False)
+        return report
+
+    def _cluster_config(self) -> dict[str, Any]:
+        configmap = self._run_json(["get", "configmap", "agentlab-config", "-o", "json"])
+        config_text = ((configmap.get("data") or {}).get("config.yaml") or "")
+        if not config_text:
+            return {}
+        loaded = yaml.safe_load(config_text) or {}
+        if not isinstance(loaded, dict):
+            return {}
+        return loaded
+
     def _run_artifact_status(self, run_id: str, *, shell_pod: str) -> tuple[str, str]:
         for artifact in (
             "scheduler_report.json",
@@ -432,6 +603,43 @@ spec:
 """
 
 
+def update_generated_manifests(
+    *,
+    manifest_dir: Path,
+    image: str,
+    preserved_config: dict[str, Any] | None = None,
+) -> dict[str, list[str]]:
+    configmap_path = manifest_dir / "configmap.yaml"
+    if not configmap_path.exists():
+        raise K8sOperatorError(f"missing manifest: {configmap_path}")
+
+    updated_manifests: list[str] = []
+    preserved_sections: list[str] = []
+    configmap = _load_yaml_file(configmap_path)
+    metadata = configmap.setdefault("metadata", {})
+    annotations = metadata.setdefault("annotations", {})
+    annotations["agentlab.io/image"] = image
+    config = _config_from_configmap_document(configmap)
+    if preserved_config:
+        preserved_sections = _merge_preserved_config_sections(config, preserved_config)
+    config["auto_merge_enabled"] = False
+    config["direct_main_push_enabled"] = False
+    data = configmap.setdefault("data", {})
+    data["config.yaml"] = yaml.safe_dump(config, sort_keys=False)
+    _write_yaml_file(configmap_path, configmap)
+    updated_manifests.append(configmap_path.name)
+
+    for path in sorted([*manifest_dir.glob("job-*.yaml"), *manifest_dir.glob("cronjob-*.yaml")]):
+        document = _load_yaml_file(path)
+        if _set_manifest_image(document, image):
+            _write_yaml_file(path, document)
+            updated_manifests.append(path.name)
+
+    if _ensure_kustomization_includes_cronjobs(manifest_dir):
+        updated_manifests.append("kustomization.yaml")
+    return {"updated_manifests": updated_manifests, "preserved_sections": preserved_sections}
+
+
 def detect_manifest_image_drift(manifest_dir: Path) -> tuple[str | None, list[ManifestImageDrift]]:
     configmap_path = manifest_dir / "configmap.yaml"
     expected_image: str | None = None
@@ -503,11 +711,178 @@ def format_runs(runs: list[RunSummary]) -> str:
     return "\n".join(f"- {run.run_id}: {run.mtime} | {run.status} | {run.reason}".rstrip() for run in runs)
 
 
+def format_failed_resources(resources: FailedResources, *, namespace: str) -> str:
+    if not resources.found:
+        return "No failed AgentLab resources found."
+    lines = [
+        f"Found failed AgentLab resources in namespace {namespace}:",
+        "",
+        "Jobs:",
+    ]
+    lines.extend(f"- {name}" for name in resources.jobs)
+    if not resources.jobs:
+        lines.append("- none")
+    lines.extend(["", "Pods:"])
+    lines.extend(f"- {name}" for name in resources.pods)
+    if not resources.pods:
+        lines.append("- none")
+    if resources.skipped_resources:
+        lines.extend(["", "Skipped resources:"])
+        lines.extend(f"- {item}" for item in resources.skipped_resources)
+    return "\n".join(lines)
+
+
+def format_cleanup_report(report: CleanupReport) -> str:
+    if report.dry_run:
+        header = f"Dry run: no resources deleted in namespace {report.namespace}."
+    else:
+        header = f"Cleanup summary for namespace {report.namespace}:"
+    lines = [header, "", "Deleted jobs:"]
+    lines.extend(f"- job/{name}" for name in report.deleted_jobs)
+    if not report.deleted_jobs:
+        lines.append("- none")
+    lines.extend(["", "Deleted pods:"])
+    lines.extend(f"- pod/{name}" for name in report.deleted_pods)
+    if not report.deleted_pods:
+        lines.append("- none")
+    lines.extend(["", "Skipped resources:"])
+    lines.extend(f"- {item}" for item in report.skipped_resources)
+    if not report.skipped_resources:
+        lines.append("- none")
+    return "\n".join(lines)
+
+
+def format_upgrade_report(report: UpgradeReport) -> str:
+    lines = [
+        "AgentLab Kubernetes upgrade plan",
+        "",
+        f"Namespace: {report.namespace}",
+        f"Manifest dir: {report.manifest_dir}",
+        f"New image: {report.image}",
+        "",
+        "Updated manifests:",
+    ]
+    lines.extend(f"- {name}" for name in report.updated_manifests)
+    if not report.updated_manifests:
+        lines.append("- none")
+    lines.extend(["", "Preserved config sections:"])
+    lines.extend(f"- {section}" for section in report.preserved_sections)
+    if not report.preserved_sections:
+        lines.append("- none")
+    lines.extend(
+        [
+            "",
+            f"Apply: {'yes' if report.apply else 'no'}",
+            f"Doctor: {'yes' if report.run_doctor else 'no'}",
+            f"Cleanup failed: {'yes' if report.cleanup_failed else 'no'}",
+            "",
+            "Result:",
+            f"- {'applied' if report.applied else 'generated only'}",
+            f"- image drift: {'none' if not report.image_drift else '; '.join(report.image_drift)}",
+            f"- doctor: {report.doctor_status}",
+        ]
+    )
+    if report.cleanup_report is not None:
+        lines.append(f"- cleanup deleted jobs: {len(report.cleanup_report.deleted_jobs)}")
+        lines.append(f"- cleanup deleted pods: {len(report.cleanup_report.deleted_pods)}")
+    return "\n".join(lines)
+
+
 def _configmap_image(configmap: dict[str, Any]) -> str | None:
     metadata = configmap.get("metadata") or {}
     annotations = metadata.get("annotations") or {}
     image = annotations.get("agentlab.io/image")
     return str(image) if image else None
+
+
+def _load_yaml_file(path: Path) -> dict[str, Any]:
+    data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    if not isinstance(data, dict):
+        raise K8sOperatorError(f"manifest is not a YAML object: {path}")
+    return data
+
+
+def _write_yaml_file(path: Path, data: dict[str, Any]) -> None:
+    path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+
+
+def _config_from_configmap_manifest(path: Path) -> dict[str, Any]:
+    return _config_from_configmap_document(_load_yaml_file(path))
+
+
+def _config_from_configmap_document(configmap: dict[str, Any]) -> dict[str, Any]:
+    config_text = ((configmap.get("data") or {}).get("config.yaml") or "")
+    if not config_text:
+        return {}
+    config = yaml.safe_load(config_text) or {}
+    if not isinstance(config, dict):
+        return {}
+    return config
+
+
+def _merge_preserved_config_sections(target: dict[str, Any], source: dict[str, Any]) -> list[str]:
+    preserved: list[str] = []
+    for key in ("auto_approve", "required_test_commands"):
+        if key in source:
+            target[key] = source[key]
+            preserved.append(key)
+    if "schedule" in source:
+        target["schedule"] = source["schedule"]
+        preserved.append("schedule")
+        schedule = source.get("schedule") or {}
+        if isinstance(schedule, dict):
+            for key in ("review_comments", "limits", "behavior"):
+                if key in schedule:
+                    preserved.append(f"schedule.{key}")
+    return preserved
+
+
+def _set_manifest_image(document: dict[str, Any], image: str) -> bool:
+    containers = _manifest_containers(document)
+    if not containers:
+        return False
+    changed = False
+    for container in containers:
+        if isinstance(container, dict) and container.get("image") != image:
+            container["image"] = image
+            changed = True
+    return changed
+
+
+def _manifest_containers(document: dict[str, Any]) -> list[dict[str, Any]]:
+    kind = document.get("kind")
+    spec = document.get("spec") or {}
+    if kind == "CronJob" or "jobTemplate" in spec:
+        template = (((spec.get("jobTemplate") or {}).get("spec") or {}).get("template") or {}).get("spec") or {}
+    elif kind == "Job" or "template" in spec:
+        template = ((spec.get("template") or {}).get("spec") or {})
+    else:
+        template = spec
+    containers = template.get("containers") or []
+    return [container for container in containers if isinstance(container, dict)]
+
+
+def _ensure_kustomization_includes_cronjobs(manifest_dir: Path) -> bool:
+    path = manifest_dir / "kustomization.yaml"
+    if not path.exists():
+        return False
+    document = _load_yaml_file(path)
+    resources = document.setdefault("resources", [])
+    if not isinstance(resources, list):
+        raise K8sOperatorError(f"kustomization resources must be a list: {path}")
+    changed = False
+    for cronjob in sorted(manifest_dir.glob("cronjob-*.yaml")):
+        if cronjob.name not in resources:
+            resources.append(cronjob.name)
+            changed = True
+    if changed:
+        _write_yaml_file(path, document)
+    return changed
+
+
+def _resource_name(item: dict[str, Any]) -> str:
+    metadata = item.get("metadata") or {}
+    return str(metadata.get("name") or "")
 
 
 def _cronjob_status(item: dict[str, Any], expected_image: str | None) -> CronJobStatus:
@@ -545,6 +920,21 @@ def _job_status(item: dict[str, Any]) -> JobStatus:
     )
 
 
+def _job_failed(item: dict[str, Any]) -> bool:
+    status = item.get("status") or {}
+    if int(status.get("failed") or 0) > 0:
+        return True
+    for condition in status.get("conditions") or []:
+        if condition.get("type") == "Failed" and condition.get("status") == "True":
+            return True
+    return False
+
+
+def _job_active(item: dict[str, Any]) -> bool:
+    status = item.get("status") or {}
+    return int(status.get("active") or 0) > 0
+
+
 def _pod_status(item: dict[str, Any]) -> PodStatus:
     metadata = item.get("metadata") or {}
     status = item.get("status") or {}
@@ -558,20 +948,32 @@ def _pod_status(item: dict[str, Any]) -> PodStatus:
     return PodStatus(name=str(metadata.get("name") or ""), phase=str(status.get("phase") or "Unknown"), reason=reason)
 
 
+def _pod_failed(item: dict[str, Any]) -> bool:
+    status = item.get("status") or {}
+    if status.get("phase") == "Failed":
+        return True
+    if status.get("phase") in {"Running", "Succeeded"}:
+        return False
+    for container in status.get("containerStatuses") or []:
+        state = container.get("state") or {}
+        terminated = state.get("terminated") or {}
+        waiting = state.get("waiting") or {}
+        if terminated.get("reason") == "Error" or waiting.get("reason") == "Error":
+            return True
+    return False
+
+
+def _pod_running(item: dict[str, Any]) -> bool:
+    status = item.get("status") or {}
+    return status.get("phase") == "Running"
+
+
 def _is_agentlab_job(name: str) -> bool:
     return name.startswith("agentlab-scheduler-") or name.startswith("agentlab-doctor")
 
 
 def _manifest_image(document: dict[str, Any]) -> str | None:
-    kind = document.get("kind")
-    spec = document.get("spec") or {}
-    if kind == "CronJob" or "jobTemplate" in spec:
-        template = (((spec.get("jobTemplate") or {}).get("spec") or {}).get("template") or {}).get("spec") or {}
-    elif kind == "Job" or "template" in spec:
-        template = ((spec.get("template") or {}).get("spec") or {})
-    else:
-        template = spec
-    containers = template.get("containers") or []
+    containers = _manifest_containers(document)
     if not containers:
         return None
     image = containers[0].get("image")
@@ -668,6 +1070,26 @@ class K8sTUI:
             if self._confirm("Create artifact-shell pod if missing and open shell?"):
                 self.operator.shell()
         elif choice == "10":
+            image = self.input("Image: ").strip()
+            preserve_source = self._select("Preserve config", ["none", "local generated config", "cluster config"])
+            apply = self._confirm("Apply generated manifests to the cluster?")
+            run_doctor = self._confirm("Run doctor after apply?")
+            cleanup_failed = self._confirm("Cleanup failed resources after apply?")
+            report = self.operator.upgrade(
+                image=image,
+                apply=apply,
+                preserve_local_config=preserve_source == "local generated config",
+                preserve_cluster_config=preserve_source == "cluster config",
+                run_doctor=run_doctor,
+                cleanup_failed=cleanup_failed,
+            )
+            self.output(format_upgrade_report(report))
+        elif choice == "11":
+            resources = self.operator.failed_resources()
+            self.output(format_failed_resources(resources, namespace=self.operator.namespace))
+            if resources.found and self._confirm("Delete failed AgentLab resources?"):
+                self.output(format_cleanup_report(self.operator.cleanup_failed()))
+        elif choice == "12":
             return False
         else:
             self.output("Unknown selection.")
@@ -688,7 +1110,9 @@ class K8sTUI:
                         "7. CronJob pausieren",
                         "8. CronJob fortsetzen",
                         "9. Artifact shell öffnen",
-                        "10. Beenden",
+                        "10. Upgrade / reconcile deployment",
+                        "11. Cleanup failed resources",
+                        "12. Beenden",
                     ]
                 )
             )

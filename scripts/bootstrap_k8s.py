@@ -96,7 +96,6 @@ def generate_k8s(
         "pvc.yaml": render_pvc(namespace, storage_size),
         "configmap.yaml": render_configmap(namespace, image, config_yaml),
         "secret.example.yaml": render_secret_example(namespace, gitlab_url),
-        "kustomization.yaml": render_kustomization(namespace),
         "README.generated.md": render_readme(namespace),
     }
     for job_name, command in JOB_COMMANDS.items():
@@ -138,6 +137,10 @@ def generate_k8s(
             git_author_name=git_author_name,
             git_author_email=git_author_email,
         )
+    files["kustomization.yaml"] = render_kustomization(
+        namespace,
+        extra_resources=[f"cronjob-{name}.yaml" for name in sorted(cron_commands)],
+    )
     for name, content in files.items():
         write_file(out / name, content)
     if emit_komodo:
@@ -214,15 +217,14 @@ stringData:
 """
 
 
-def render_kustomization(namespace: str) -> str:
+def render_kustomization(namespace: str, *, extra_resources: list[str] | None = None) -> str:
+    resources = ["namespace.yaml", "serviceaccount.yaml", "pvc.yaml", "configmap.yaml", *(extra_resources or [])]
+    resource_lines = "\n".join(f"  - {resource}" for resource in resources)
     return f"""apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: {namespace}
 resources:
-  - namespace.yaml
-  - serviceaccount.yaml
-  - pvc.yaml
-  - configmap.yaml
+{resource_lines}
 """
 
 
