@@ -8,6 +8,7 @@ import typer
 
 from agentlab.config import load_config
 from agentlab.doctor import format_doctor, report_json, run_doctor
+from agentlab.k8s_cli import k8s_app
 from agentlab.models import AgentTask
 from agentlab.orchestrator import Orchestrator
 from agentlab.preflight import PreflightChecker
@@ -15,6 +16,7 @@ from agentlab.scheduler import Scheduler, reset_scheduler_state, scheduler_statu
 from agentlab.status import TERMINAL_STATES, format_status, list_run_statuses, read_run_status
 
 app = typer.Typer(help="AgentLab GitLab agent orchestration CLI.")
+app.add_typer(k8s_app, name="k8s")
 
 
 def _json_echo(value: object) -> None:

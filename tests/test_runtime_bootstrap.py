@@ -65,6 +65,7 @@ def test_kubernetes_bootstrap_generates_expected_files_without_secrets(tmp_path)
         "job-scheduler-plan.yaml",
         "job-scheduler-action.yaml",
         "job-scheduler-review-comments.yaml",
+        "job-scheduler-reset-state.yaml",
         "kustomization.yaml",
         "README.generated.md",
     }

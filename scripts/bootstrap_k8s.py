@@ -39,6 +39,7 @@ JOB_COMMANDS = {
     "scheduler-plan": ["scheduler-plan", "--config", "/etc/agentlab/config.yaml"],
     "scheduler-action": ["scheduler-action", "--config", "/etc/agentlab/config.yaml"],
     "scheduler-review-comments": ["scheduler-review-comments", "--config", "/etc/agentlab/config.yaml"],
+    "scheduler-reset-state": ["scheduler-reset-state", "--config", "/etc/agentlab/config.yaml"],
 }
 
 
