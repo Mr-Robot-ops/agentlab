@@ -38,6 +38,7 @@ STATE_DEFAULTS: dict[str, Any] = {
     "last_selected_task_id": None,
     "last_review_comment_run": None,
     "processed_review_comments": {},
+    "review_comments_seen": {},
     "stopped_mrs": {},
     "review_comment_cooldowns": {},
 }
@@ -191,11 +192,14 @@ class Scheduler:
             return self._write_review_report(self._report("failed", "gitlab_unavailable", error=str(exc), state_warning=warning))
 
         processed_or_seen_processed = False
+        initialized_seen = False
+        state_changed = False
         for mr in mrs:
             if not is_agent_generated_mr(mr, default_branch=self.config.default_branch):
                 continue
             mr_info = normalize_mr(mr)
             mr_iid = int(mr_info["iid"])
+            stopped_key = mr_key(self.config.project_id or "", mr_iid)
             try:
                 comments = flatten_merge_request_comments(
                     gitlab.list_merge_request_notes(mr_iid),
@@ -206,10 +210,26 @@ class Scheduler:
                     self._report("failed", "gitlab_unavailable", error=f"could not read MR comments: {exc}", mr_iid=mr_iid, state_warning=warning)
                 )
 
+            if self._should_initialize_review_comment_seen(state, stopped_key):
+                self._initialize_review_comment_seen(state, stopped_key, comments)
+                initialized_seen = True
+                state_changed = True
+                continue
+
+            last_seen_note_id = self._last_seen_note_id(state, stopped_key)
             for comment in comments:
                 if comment.get("system"):
                     continue
                 note_id = comment["id"]
+                note_id_value = _note_id_value(note_id)
+                if not review_config.process_history:
+                    if note_id_value is not None and note_id_value <= last_seen_note_id:
+                        processed_or_seen_processed = True
+                        continue
+                    if note_id_value is not None:
+                        self._mark_review_comment_seen(state, stopped_key, note_id_value)
+                        last_seen_note_id = max(last_seen_note_id, note_id_value)
+                        state_changed = True
                 key = review_comment_key(self.config.project_id or "", mr_iid, note_id)
                 parsed = parse_review_command(comment.get("body", ""), allowed_commands=review_config.allowed_commands)
                 if parsed is None:
@@ -256,7 +276,6 @@ class Scheduler:
                         state_warning=warning,
                     )
 
-                stopped_key = mr_key(self.config.project_id or "", mr_iid)
                 if parsed.command in {"revise", "fix"} and stopped_key in state.get("stopped_mrs", {}):
                     response = "AgentLab ignored this revision command because this MR is stopped. Use `/agent resume` first."
                     return self._post_and_finish(
@@ -392,7 +411,12 @@ class Scheduler:
                     state_warning=warning,
                 )
 
-        reason = "already_processed" if processed_or_seen_processed else "no_agent_comment"
+        if state_changed:
+            self.state_store.write(state)
+        if initialized_seen:
+            reason = "review_comments_initialized"
+        else:
+            reason = "already_processed" if processed_or_seen_processed else "no_agent_comment"
         return self._write_review_report(self._report("skipped", reason, state_warning=warning))
 
     def _gitlab(self) -> GitLabTool:
@@ -525,6 +549,42 @@ class Scheduler:
         cooldowns[key] = (datetime.now(UTC) + timedelta(minutes=minutes)).isoformat()
         state["review_comment_cooldowns"] = cooldowns
 
+    def _should_initialize_review_comment_seen(self, state: dict[str, Any], key: str) -> bool:
+        if self.config.schedule.review_comments.process_history:
+            return False
+        if state.get("processed_review_comments"):
+            return False
+        seen = state.get("review_comments_seen")
+        return not isinstance(seen, dict) or key not in seen
+
+    def _initialize_review_comment_seen(self, state: dict[str, Any], key: str, comments: list[dict[str, Any]]) -> None:
+        last_seen = max((_note_id_value(comment.get("id")) or 0 for comment in comments), default=0)
+        self._mark_review_comment_seen(state, key, last_seen, initialized=True)
+
+    def _last_seen_note_id(self, state: dict[str, Any], key: str) -> int:
+        seen = state.get("review_comments_seen")
+        if not isinstance(seen, dict):
+            return 0
+        item = seen.get(key)
+        if not isinstance(item, dict):
+            return 0
+        try:
+            return int(item.get("last_seen_note_id") or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _mark_review_comment_seen(self, state: dict[str, Any], key: str, note_id: int, *, initialized: bool = False) -> None:
+        seen = dict(state.get("review_comments_seen") or {})
+        previous = seen.get(key) if isinstance(seen.get(key), dict) else {}
+        previous_last = _note_id_value(previous.get("last_seen_note_id")) if isinstance(previous, dict) else None
+        seen[key] = {
+            "initialized_at": previous.get("initialized_at") if isinstance(previous, dict) and previous.get("initialized_at") else _now(),
+            "last_seen_note_id": max(previous_last or 0, note_id),
+        }
+        if initialized:
+            seen[key]["initialized_at"] = _now()
+        state["review_comments_seen"] = seen
+
     def _run_revision(
         self,
         gitlab: Any,
@@ -614,17 +674,7 @@ class Scheduler:
     def _revision_response(self, command: str, revision: dict[str, Any]) -> str:
         if revision.get("reason") == "policy_blocked":
             auto = revision.get("auto_approval") if isinstance(revision.get("auto_approval"), dict) else {}
-            details = _first_auto_approval_details(auto)
-            disallowed = details.get("disallowed_paths") or []
-            allowed = details.get("allowed_paths") or self.config.auto_approve.allowed_paths
-            return (
-                "AgentLab could not apply this request.\n\n"
-                "Reason: policy_blocked\n"
-                "Disallowed paths:\n"
-                f"{_bullet_list(disallowed)}\n\n"
-                "Allowed paths:\n"
-                f"{_bullet_list(allowed)}"
-            )
+            return _policy_blocked_response(auto, revision, self.config)
         if revision.get("status") != "passed":
             return (
                 "AgentLab could not apply this request.\n\n"
@@ -667,6 +717,13 @@ def _parse_time(value: Any) -> datetime | None:
     try:
         return datetime.fromisoformat(str(value))
     except ValueError:
+        return None
+
+
+def _note_id_value(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
         return None
 
 
@@ -714,15 +771,89 @@ def _policy_risk_score(policy: Any) -> Any:
     return "unknown"
 
 
-def _first_auto_approval_details(policy: dict[str, Any]) -> dict[str, Any]:
+def _policy_blocked_response(policy: dict[str, Any], revision: dict[str, Any], config: AppConfig) -> str:
+    item = _first_auto_approval_item(policy)
+    details = item.get("details") if isinstance(item.get("details"), dict) else {}
+    task = revision.get("task") if isinstance(revision.get("task"), dict) else {}
+    policy_config = policy.get("policy_config") if isinstance(policy.get("policy_config"), dict) else {}
+    reasons = _auto_approval_reasons(policy)
+    affected_files = _value_or_default(details.get("affected_files"), task.get("affected_files"), revision.get("changed_files"), [])
+    disallowed_paths = details.get("disallowed_paths") if isinstance(details.get("disallowed_paths"), list) else []
+    blocked_matches = details.get("blocked_paths_matched") if isinstance(details.get("blocked_paths_matched"), list) else []
+
+    sections = [
+        "AgentLab could not apply this request.",
+        "",
+        "Reason: policy_blocked",
+        "Policy reasons:",
+        _bullet_list(reasons),
+        "",
+        "Task:",
+        f"- task_type: {_value_or_default(details.get('task_type'), task.get('task_type'), 'unknown')}",
+        f"- risk_score: {_value_or_default(details.get('risk_score'), task.get('risk_score'), 'unknown')}",
+        "- affected_files:",
+        _indented_bullet_list(affected_files),
+        "",
+        "AutoApproval:",
+        f"- enabled: {str(_value_or_default(policy.get('enabled'), policy_config.get('enabled'), config.auto_approve.enabled)).lower()}",
+        "- allowed_task_types:",
+        _indented_bullet_list(_value_or_default(details.get("allowed_task_types"), policy_config.get("allowed_task_types"), config.auto_approve.allowed_task_types)),
+        "- allowed_paths:",
+        _indented_bullet_list(_value_or_default(details.get("allowed_paths"), policy_config.get("allowed_paths"), config.auto_approve.allowed_paths)),
+        "- blocked_paths:",
+        _indented_bullet_list(_value_or_default(policy_config.get("blocked_paths"), config.auto_approve.blocked_paths)),
+    ]
+    if disallowed_paths:
+        sections.extend(["", "Path details:", "- disallowed_paths:", _indented_bullet_list(disallowed_paths)])
+    if blocked_matches:
+        sections.extend(["- blocked_paths_matched:", _indented_bullet_list(_format_blocked_matches(blocked_matches))])
+    return "\n".join(sections)
+
+
+def _first_auto_approval_item(policy: dict[str, Any]) -> dict[str, Any]:
     for key in ("rejected_tasks", "evaluated_tasks"):
         items = policy.get(key)
         if not isinstance(items, list):
             continue
         for item in items:
-            if isinstance(item, dict) and isinstance(item.get("details"), dict):
-                return item["details"]
+            if isinstance(item, dict):
+                if key == "rejected_tasks" or item.get("approved") is False:
+                    return item
     return {}
+
+
+def _first_auto_approval_details(policy: dict[str, Any]) -> dict[str, Any]:
+    item = _first_auto_approval_item(policy)
+    return item["details"] if isinstance(item.get("details"), dict) else {}
+
+
+def _auto_approval_reasons(policy: dict[str, Any]) -> list[str]:
+    item = _first_auto_approval_item(policy)
+    reasons = item.get("reasons")
+    if isinstance(reasons, list):
+        return [str(reason) for reason in reasons if str(reason)]
+    if policy.get("enabled") is False:
+        return ["auto_approve_disabled"]
+    return ["unknown_policy_rejection"]
+
+
+def _value_or_default(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _format_blocked_matches(values: list[Any]) -> list[str]:
+    formatted: list[str] = []
+    for value in values:
+        if isinstance(value, dict):
+            path = value.get("path")
+            pattern = value.get("pattern")
+            formatted.append(f"{path} (matched {pattern})" if pattern else str(path))
+        else:
+            formatted.append(str(value))
+    return formatted
 
 
 def _bullet_list(values: Any) -> str:
@@ -731,6 +862,14 @@ def _bullet_list(values: Any) -> str:
     if not isinstance(values, list):
         values = [values]
     return "\n".join(f"- {value}" for value in values)
+
+
+def _indented_bullet_list(values: Any) -> str:
+    if not values:
+        return "  - <none>"
+    if not isinstance(values, list):
+        values = [values]
+    return "\n".join(f"  - {value}" for value in values)
 
 
 def reset_scheduler_state(config: AppConfig) -> dict[str, Any]:

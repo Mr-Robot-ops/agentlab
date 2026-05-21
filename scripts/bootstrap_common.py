@@ -134,6 +134,7 @@ def render_agentlab_config(
         "  review_comments:",
         f"    enabled: {yaml_bool(schedule_review_comments_enabled)}",
         f"    cron: {yaml_string(schedule_review_comments_cron)}",
+        "    process_history: false",
         "    max_comments_per_run: 1",
         "    cooldown_minutes: 10",
         "    allowed_commands:",

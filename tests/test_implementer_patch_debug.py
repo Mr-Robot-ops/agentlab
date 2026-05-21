@@ -433,6 +433,197 @@ def test_structured_edit_rejects_symlink(tmp_path: Path) -> None:
         file_tool_for(repo).apply_structured_edits(proposal)
 
 
+README_STRUCTURE = """# Demo
+
+## Project Structure
+
+```text
+.
++-- rust-backend/
+|   +-- src/
+|       +-- routes/
+|           +-- health.rs
+|           +-- users.rs
++-- web/
+    +-- src/
+        +-- App.tsx
+```
+
+## Usage
+Run it.
+"""
+
+
+def write_project_structure_files(repo: Path, *, include_dist: bool = False) -> None:
+    for path in [
+        "rust-backend/src/routes/health.rs",
+        "rust-backend/src/routes/users.rs",
+        "web/src/App.tsx",
+        ".github/workflows/ci.yml",
+    ]:
+        target = repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("content\n", encoding="utf-8")
+    if include_dist:
+        target = repo / "web/dist/bundle.js"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("built\n", encoding="utf-8")
+
+
+def structure_task(description: str = "Update the README Project Structure to match actual files.") -> AgentTask:
+    return docs_task().model_copy(update={"description": description})
+
+
+def structure_replace_proposal(old_text: str, new_text: str) -> StructuredEditProposal:
+    return structured_proposal(old_text=old_text, new_text=new_text)
+
+
+def test_readme_project_structure_update_keeps_existing_files_and_writes_evidence(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path, README_STRUCTURE)
+    write_project_structure_files(repo)
+    store = ArtifactStore(tmp_path / "run", "run")
+    proposed = README_STRUCTURE.replace(
+        ".\n+-- rust-backend/",
+        ".\n+-- .github/\n|   +-- workflows/\n|       +-- ci.yml\n+-- rust-backend/",
+    )
+
+    report = ImplementationAgent(
+        config(repo),
+        FakeGitTool(),
+        FileTool(repo, config(repo)),
+        FakeOllama([structure_replace_proposal(README_STRUCTURE, proposed)]),
+        artifacts=store,
+        run_id="run",
+    ).implement(structure_task())
+
+    assert report.status == ReportStatus.PASSED
+    assert "project_structure_evidence.json" in report.patch_artifacts
+    evidence = json.loads(read_artifact(store, "project_structure_evidence.json"))
+    assert evidence["validation_status"] == "passed"
+    assert evidence["removed_existing_entries"] == []
+    assert evidence["added_entries"] == [".github/workflows/ci.yml"]
+    assert "rust-backend/src/routes/users.rs" in evidence["collected_files"]
+
+
+def test_readme_project_structure_prompt_includes_real_file_evidence(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path, README_STRUCTURE)
+    write_project_structure_files(repo)
+    proposed = README_STRUCTURE.replace("Run it.", "Run it locally.")
+    ollama = FakeOllama([structure_replace_proposal(README_STRUCTURE, proposed)])
+
+    report = ImplementationAgent(
+        config(repo),
+        FakeGitTool(),
+        FileTool(repo, config(repo)),
+        ollama,
+    ).implement(structure_task())
+
+    assert report.status == ReportStatus.PASSED
+    assert "project_structure_evidence" in ollama.prompts[0]
+    assert "find .github rust-backend web -maxdepth 4 -type f | sort" in ollama.prompts[0]
+    assert "rust-backend/src/routes/users.rs" in ollama.prompts[0]
+
+
+def test_readme_project_structure_removing_existing_route_file_is_blocked(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path, README_STRUCTURE)
+    write_project_structure_files(repo)
+    store = ArtifactStore(tmp_path / "run", "run")
+    proposed = README_STRUCTURE.replace("|           +-- users.rs\n", "")
+    git = FakeGitTool()
+
+    report = ImplementationAgent(
+        config(repo),
+        git,
+        FileTool(repo, config(repo)),
+        FakeOllama([structure_replace_proposal(README_STRUCTURE, proposed)]),
+        artifacts=store,
+        run_id="run",
+    ).implement(structure_task())
+
+    assert report.status == ReportStatus.FAILED
+    assert report.failure_reason == "project_structure_validation_failed"
+    assert git.committed is False
+    assert (repo / "README.md").read_text(encoding="utf-8") == README_STRUCTURE
+    evidence = json.loads(read_artifact(store, "project_structure_evidence.json"))
+    assert evidence["validation_status"] == "blocked"
+    assert evidence["removed_existing_entries"] == ["rust-backend/src/routes/users.rs"]
+    error = json.loads(read_artifact(store, "structured_edit_error.json"))
+    assert error["removed_existing_entries"] == ["rust-backend/src/routes/users.rs"]
+
+
+def test_readme_project_structure_ignores_web_dist_files_by_default(tmp_path: Path) -> None:
+    readme = README_STRUCTURE.replace(
+        "+-- web/\n    +-- src/",
+        "+-- web/\n    +-- dist/\n    |   +-- bundle.js\n    +-- src/",
+    )
+    repo = init_repo(tmp_path, readme)
+    write_project_structure_files(repo, include_dist=True)
+    store = ArtifactStore(tmp_path / "run", "run")
+    proposed = readme.replace("    +-- dist/\n    |   +-- bundle.js\n", "")
+
+    report = ImplementationAgent(
+        config(repo),
+        FakeGitTool(),
+        FileTool(repo, config(repo)),
+        FakeOllama([structure_replace_proposal(readme, proposed)]),
+        artifacts=store,
+        run_id="run",
+    ).implement(structure_task())
+
+    assert report.status == ReportStatus.PASSED
+    evidence = json.loads(read_artifact(store, "project_structure_evidence.json"))
+    assert evidence["removed_existing_entries"] == []
+    assert "web/dist/bundle.js" in evidence["ignored_files"]
+
+
+def test_readme_project_structure_compact_summary_requires_explicit_request(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path, README_STRUCTURE)
+    write_project_structure_files(repo)
+    compact = """# Demo
+
+## Project Structure
+
+This is a compact summary, not a complete file tree.
+
+```text
+.
++-- rust-backend/
++-- web/
+```
+
+## Usage
+Run it.
+"""
+
+    blocked_store = ArtifactStore(tmp_path / "blocked-run", "blocked")
+    blocked = ImplementationAgent(
+        config(repo),
+        FakeGitTool(),
+        FileTool(repo, config(repo)),
+        FakeOllama([structure_replace_proposal(README_STRUCTURE, compact)]),
+        artifacts=blocked_store,
+        run_id="blocked",
+    ).implement(structure_task("Update the README Project Structure to match actual files."))
+
+    assert blocked.status == ReportStatus.FAILED
+    assert blocked.failure_reason == "project_structure_validation_failed"
+
+    allowed_store = ArtifactStore(tmp_path / "allowed-run", "allowed")
+    allowed = ImplementationAgent(
+        config(repo),
+        FakeGitTool(),
+        FileTool(repo, config(repo)),
+        FakeOllama([structure_replace_proposal(README_STRUCTURE, compact)]),
+        artifacts=allowed_store,
+        run_id="allowed",
+    ).implement(structure_task("Create a compact summary of the README Project Structure."))
+
+    assert allowed.status == ReportStatus.PASSED
+    evidence = json.loads(read_artifact(allowed_store, "project_structure_evidence.json"))
+    assert evidence["validation_status"] == "passed"
+    assert "rust-backend/src/routes/users.rs" in evidence["removed_existing_entries"]
+
+
 def test_docs_task_uses_structured_edit_instead_of_patch(tmp_path: Path) -> None:
     repo = init_repo(tmp_path)
     store = ArtifactStore(tmp_path / "run", "run")

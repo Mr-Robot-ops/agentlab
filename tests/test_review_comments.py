@@ -7,11 +7,13 @@ import pytest
 
 from agentlab.artifacts import ArtifactStore
 from agentlab.config import AppConfig
+from agentlab.models import AgentTask, RiskLevel, TaskPlan, TaskType
+from agentlab.policies.auto_approval import AutoApprovalPolicy
 from agentlab.review_comments import parse_review_command
-from agentlab.scheduler import Scheduler, SchedulerStateStore
+from agentlab.scheduler import Scheduler, SchedulerStateStore, reset_scheduler_state
 
 
-def config(tmp_path: Path, **overrides: object) -> AppConfig:
+def config(tmp_path: Path, *, process_history: bool = False, **overrides: object) -> AppConfig:
     values = {
         "gitlab_url": "https://gitlab.example.com",
         "project_id": 1,
@@ -23,6 +25,7 @@ def config(tmp_path: Path, **overrides: object) -> AppConfig:
             "enabled": True,
             "review_comments": {
                 "enabled": True,
+                "process_history": process_history,
                 "allowed_authors": ["alice"],
                 "require_author_role": [],
             },
@@ -174,7 +177,7 @@ def test_parser_ignores_or_rejects_unsafe_comments(body: str) -> None:
 
 def test_allowed_author_can_run_status_and_posts_response(tmp_path: Path) -> None:
     gitlab = FakeGitLab(notes=[note(1, "/agent status")])
-    scheduler = ReviewScheduler(config(tmp_path), gitlab=gitlab)
+    scheduler = ReviewScheduler(config(tmp_path, process_history=True), gitlab=gitlab)
 
     report = scheduler.review_comments()
 
@@ -186,7 +189,7 @@ def test_allowed_author_can_run_status_and_posts_response(tmp_path: Path) -> Non
 
 def test_unknown_author_is_rejected_and_deduped(tmp_path: Path) -> None:
     gitlab = FakeGitLab(notes=[note(1, "/agent status", username="mallory")], allowed=False)
-    scheduler = ReviewScheduler(config(tmp_path), gitlab=gitlab)
+    scheduler = ReviewScheduler(config(tmp_path, process_history=True), gitlab=gitlab)
 
     report = scheduler.review_comments()
 
@@ -198,7 +201,7 @@ def test_unknown_author_is_rejected_and_deduped(tmp_path: Path) -> None:
 
 def test_bot_author_is_ignored_without_response(tmp_path: Path) -> None:
     gitlab = FakeGitLab(notes=[note(1, "/agent status", username="agentlab-bot", user_id=99)])
-    scheduler = ReviewScheduler(config(tmp_path), gitlab=gitlab)
+    scheduler = ReviewScheduler(config(tmp_path, process_history=True), gitlab=gitlab)
 
     report = scheduler.review_comments()
 
@@ -230,7 +233,7 @@ def test_processed_note_is_not_processed_again(tmp_path: Path) -> None:
 
 
 def test_stop_blocks_revision_until_resume(tmp_path: Path) -> None:
-    cfg = config(tmp_path)
+    cfg = config(tmp_path, process_history=True)
     gitlab = FakeGitLab(notes=[note(1, "/agent stop\nIch uebernehme manuell.")])
     scheduler = ReviewScheduler(cfg, gitlab=gitlab)
 
@@ -255,9 +258,9 @@ def test_stop_blocks_revision_until_resume(tmp_path: Path) -> None:
 
 
 def test_read_only_explain_does_not_call_revision(tmp_path: Path) -> None:
-    orchestrator = FakeOrchestrator(config(tmp_path))
+    orchestrator = FakeOrchestrator(config(tmp_path, process_history=True))
     gitlab = FakeGitLab(notes=[note(1, "/agent explain")])
-    scheduler = ReviewScheduler(config(tmp_path), gitlab=gitlab, orchestrator=orchestrator)
+    scheduler = ReviewScheduler(config(tmp_path, process_history=True), gitlab=gitlab, orchestrator=orchestrator)
 
     report = scheduler.review_comments()
 
@@ -267,7 +270,7 @@ def test_read_only_explain_does_not_call_revision(tmp_path: Path) -> None:
 
 
 def test_revision_command_uses_existing_source_branch(tmp_path: Path) -> None:
-    cfg = config(tmp_path)
+    cfg = config(tmp_path, process_history=True)
     orchestrator = FakeOrchestrator(cfg)
     gitlab = FakeGitLab(notes=[note(1, "/agent revise\nBitte README aktualisieren.")])
     scheduler = ReviewScheduler(cfg, gitlab=gitlab, orchestrator=orchestrator)
@@ -281,3 +284,147 @@ def test_revision_command_uses_existing_source_branch(tmp_path: Path) -> None:
     assert "AgentLab processed `/agent revise`" in gitlab.posted[0][1]
     parsed = json.loads((scheduler.artifacts.artifacts_dir / "parsed_command.json").read_text(encoding="utf-8"))
     assert parsed["command"] == "revise"
+
+
+def test_empty_state_initializes_seen_notes_without_processing_history(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    orchestrator = FakeOrchestrator(cfg)
+    gitlab = FakeGitLab(notes=[note(41, "/agent status"), note(43, "/agent revise\nBitte neu pruefen.")])
+    scheduler = ReviewScheduler(cfg, gitlab=gitlab, orchestrator=orchestrator)
+
+    report = scheduler.review_comments()
+
+    assert report["status"] == "skipped"
+    assert report["reason"] == "review_comments_initialized"
+    assert gitlab.posted == []
+    assert orchestrator.calls == []
+    state, _ = scheduler.state_store.read()
+    assert state["processed_review_comments"] == {}
+    assert state["review_comments_seen"]["1:15"]["last_seen_note_id"] == 43
+
+
+def test_new_comment_after_initialization_is_processed(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    orchestrator = FakeOrchestrator(cfg)
+    old_status = note(41, "/agent status")
+    gitlab = FakeGitLab(notes=[old_status])
+    scheduler = ReviewScheduler(cfg, gitlab=gitlab, orchestrator=orchestrator)
+
+    first = scheduler.review_comments()
+    gitlab.notes = [old_status, note(44, "/agent revise\nBitte README aktualisieren.")]
+    second = scheduler.review_comments()
+
+    assert first["reason"] == "review_comments_initialized"
+    assert second["status"] == "passed"
+    assert orchestrator.calls[0]["note_id"] == 44
+    assert orchestrator.calls[0]["feedback"] == "Bitte README aktualisieren."
+    assert "AgentLab processed `/agent revise`" in gitlab.posted[0][1]
+    state, _ = scheduler.state_store.read()
+    assert state["review_comments_seen"]["1:15"]["last_seen_note_id"] == 44
+
+
+def test_process_history_true_processes_historical_commands(tmp_path: Path) -> None:
+    gitlab = FakeGitLab(notes=[note(41, "/agent status")])
+    scheduler = ReviewScheduler(config(tmp_path, process_history=True), gitlab=gitlab)
+
+    report = scheduler.review_comments()
+
+    assert report["status"] == "passed"
+    assert report["reason"] == "comment_processed"
+    assert "Run:" in gitlab.posted[0][1]
+
+
+def test_state_reset_does_not_replay_old_status_before_new_revise(tmp_path: Path) -> None:
+    cfg = config(tmp_path)
+    state_store = SchedulerStateStore(cfg.workspace_root)
+    state, _ = state_store.read()
+    state["processed_review_comments"] = {"1:15:41": {"status": "passed"}}
+    state_store.write(state)
+    reset_scheduler_state(cfg)
+
+    orchestrator = FakeOrchestrator(cfg)
+    old_status = note(41, "/agent status")
+    gitlab = FakeGitLab(notes=[old_status])
+    scheduler = ReviewScheduler(cfg, gitlab=gitlab, orchestrator=orchestrator)
+
+    first = scheduler.review_comments()
+    gitlab.notes = [old_status, note(44, "/agent revise\nBitte reparieren.")]
+    second = scheduler.review_comments()
+
+    assert first["reason"] == "review_comments_initialized"
+    assert second["status"] == "passed"
+    assert orchestrator.calls[0]["command"] == "revise"
+    assert orchestrator.calls[0]["note_id"] == 44
+    assert len(gitlab.posted) == 1
+    assert "AgentLab processed `/agent revise`" in gitlab.posted[0][1]
+    assert "AgentLab status for this MR" not in gitlab.posted[0][1]
+
+
+def policy_task(**overrides: object) -> AgentTask:
+    values: dict[str, object] = {
+        "id": "mr-15-revise-1",
+        "title": "Revise MR !15 from review comment",
+        "task_type": TaskType.DOCS,
+        "risk_level": RiskLevel.LOW,
+        "risk_score": 1,
+        "affected_files": ["README.md"],
+        "approved": False,
+    }
+    values.update(overrides)
+    return AgentTask.model_validate(values)
+
+
+def policy_blocked_revision(cfg: AppConfig, task: AgentTask) -> dict[str, object]:
+    _, report = AutoApprovalPolicy(cfg).apply(TaskPlan(tasks=[task]))
+    return {
+        "status": "failed",
+        "reason": "policy_blocked",
+        "command": "revise",
+        "source_branch": "agent/docs",
+        "changed_files": task.affected_files,
+        "task": task.model_dump(mode="json"),
+        "auto_approval": report,
+    }
+
+
+def revision_response(tmp_path: Path, task: AgentTask, **config_overrides: object) -> str:
+    cfg = config(tmp_path, **config_overrides)
+    scheduler = ReviewScheduler(cfg, gitlab=FakeGitLab())
+    return scheduler._revision_response("revise", policy_blocked_revision(cfg, task))
+
+
+def test_policy_blocked_response_names_auto_approve_disabled(tmp_path: Path) -> None:
+    response = revision_response(tmp_path, policy_task(), auto_approve={"enabled": False})
+
+    assert "Reason: policy_blocked" in response
+    assert "- auto_approve_disabled" in response
+    assert "- enabled: false" in response
+    assert "- task_type: docs" in response
+    assert "Disallowed paths:" not in response
+    assert "disallowed_paths:\n  - <none>" not in response
+
+
+def test_policy_blocked_response_names_path_not_allowed_with_paths(tmp_path: Path) -> None:
+    response = revision_response(tmp_path, policy_task(affected_files=["src/app.py"]))
+
+    assert "- path_not_allowed" in response
+    assert "- disallowed_paths:" in response
+    assert "  - src/app.py" in response
+    assert "Disallowed paths:\n- None" not in response
+
+
+def test_policy_blocked_response_names_task_type_not_allowed(tmp_path: Path) -> None:
+    response = revision_response(tmp_path, policy_task(task_type=TaskType.CI))
+
+    assert "- task_type_not_allowed" in response
+    assert "- task_type: ci" in response
+    assert "- allowed_task_types:" in response
+    assert "  - docs" in response
+    assert "  - tests" in response
+
+
+def test_policy_blocked_response_names_risk_score_too_high(tmp_path: Path) -> None:
+    response = revision_response(tmp_path, policy_task(risk_score=99))
+
+    assert "- risk_score_too_high" in response
+    assert "- risk_score: 99" in response
