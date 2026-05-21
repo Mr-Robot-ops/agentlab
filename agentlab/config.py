@@ -120,6 +120,7 @@ class ScheduleReviewCommentsConfig(BaseModel):
 
     enabled: bool = False
     cron: str = "*/10 * * * *"
+    process_history: bool = False
     max_comments_per_run: int = Field(default=1, ge=1)
     cooldown_minutes: int = Field(default=10, ge=0)
     allowed_commands: list[str] = Field(
@@ -163,6 +164,7 @@ class ScheduleConfig(BaseModel):
             "review_comments": {
                 "enabled": False,
                 "cron": "*/10 * * * *",
+                "process_history": False,
                 "max_comments_per_run": 1,
                 "cooldown_minutes": 10,
                 "allowed_commands": ["revise", "fix", "status", "explain", "stop", "resume"],

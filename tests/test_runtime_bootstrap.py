@@ -31,6 +31,13 @@ def pod_parts_from_job(output_dir, job_name):
     return pod, container
 
 
+def pod_parts_from_cronjob(output_dir, cronjob_name):
+    cronjob = yaml.safe_load((output_dir / cronjob_name).read_text(encoding="utf-8"))
+    pod = cronjob["spec"]["jobTemplate"]["spec"]["template"]["spec"]
+    container = pod["containers"][0]
+    return pod, container
+
+
 def test_kubernetes_bootstrap_generates_expected_files_without_secrets(tmp_path):
     out = generate_k8s(
         namespace="agentlab",
@@ -330,21 +337,47 @@ def test_kubernetes_bootstrap_generates_review_comment_cronjob_when_enabled(tmp_
         target_repo_url="https://gitlab.local/group/project.git",
         ollama_url="http://ollama.local:11434",
         output_dir=tmp_path,
-        schedule_enabled=True,
         schedule_review_comments_enabled=True,
-        schedule_review_comments_cron="*/7 * * * *",
+        schedule_review_comments_cron="*/1 * * * *",
     )
 
     cronjob = yaml.safe_load((out / "cronjob-scheduler-review-comments.yaml").read_text(encoding="utf-8"))
+    pod, container = pod_parts_from_cronjob(out, "cronjob-scheduler-review-comments.yaml")
     assert cronjob["kind"] == "CronJob"
-    assert cronjob["spec"]["schedule"] == "*/7 * * * *"
+    assert cronjob["spec"]["schedule"] == "*/1 * * * *"
     assert cronjob["spec"]["concurrencyPolicy"] == "Forbid"
-    container = cronjob["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
+    assert cronjob["spec"]["successfulJobsHistoryLimit"] == 3
+    assert cronjob["spec"]["failedJobsHistoryLimit"] == 5
+    assert pod["restartPolicy"] == "Never"
     assert container["args"] == ["scheduler-review-comments", "--config", "/etc/agentlab/config.yaml"]
 
     config = config_from_configmap(out)
     assert config["schedule"]["review_comments"]["enabled"] is True
-    assert config["schedule"]["review_comments"]["cron"] == "*/7 * * * *"
+    assert config["schedule"]["review_comments"]["cron"] == "*/1 * * * *"
+    assert config["schedule"]["review_comments"]["process_history"] is False
+
+
+def test_review_comment_cronjob_matches_other_scheduler_cronjob_pod_settings(tmp_path):
+    out = generate_k8s(
+        namespace="agentlab",
+        image="registry.local/agentlab:0.1.0",
+        gitlab_url="https://gitlab.local",
+        target_repo_url="https://gitlab.local/group/project.git",
+        ollama_url="http://ollama.local:11434",
+        output_dir=tmp_path,
+        schedule_enabled=True,
+        schedule_review_comments_enabled=True,
+    )
+
+    review_pod, review_container = pod_parts_from_cronjob(out, "cronjob-scheduler-review-comments.yaml")
+    for name in ("scheduler-watch", "scheduler-plan", "scheduler-action"):
+        pod, container = pod_parts_from_cronjob(out, f"cronjob-{name}.yaml")
+        assert container["image"] == review_container["image"]
+        assert container["env"] == review_container["env"]
+        assert container["volumeMounts"] == review_container["volumeMounts"]
+        assert container["securityContext"] == review_container["securityContext"]
+        assert pod["securityContext"] == review_pod["securityContext"]
+        assert pod["volumes"] == review_pod["volumes"]
 
 
 def test_docker_bootstrap_generates_compose_config_and_readme(tmp_path):

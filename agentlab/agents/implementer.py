@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from typing import Any
 
@@ -15,6 +16,19 @@ from agentlab.tools.git_tool import GitTool
 from agentlab.tools.ollama_client import OllamaClient, OllamaSchemaValidationError
 
 from .base import compact_text, load_prompt
+
+
+PROJECT_STRUCTURE_HEADING_RE = re.compile(
+    r"^(#{1,6})\s*((?:project|repository|file|directory)\s+structure)\s*:?\s*$",
+    re.IGNORECASE,
+)
+COMPACT_SUMMARY_RE = re.compile(r"\b(compact|concise|summary|summar(?:y|ize|ise|ized|ised)|high-level|abridged)\b", re.IGNORECASE)
+ACTUAL_STRUCTURE_RE = re.compile(
+    r"\b(match actual files|actual files|real structure|real repository|complete file tree|vollstaendige|vollständige|tatsaechlich|tatsächlich)\b",
+    re.IGNORECASE,
+)
+PROJECT_STRUCTURE_ROOTS = (".github", "rust-backend", "web")
+PROJECT_STRUCTURE_MAX_DEPTH = 4
 
 
 class StructuredEditApplyError(ToolError):
@@ -33,6 +47,19 @@ class GitPushError(ToolError):
     def __init__(self, reason: str, message: str) -> None:
         super().__init__(message)
         self.reason = reason
+
+
+class ProjectStructureValidationError(ToolError):
+    def __init__(self, evidence: dict[str, object], artifact_names: list[str]) -> None:
+        removed = evidence.get("removed_existing_entries") or []
+        if removed:
+            message = "README project structure edit removes existing files: " + ", ".join(str(item) for item in removed)
+        else:
+            message = "README project structure edit failed evidence validation"
+        super().__init__(message)
+        self.reason = "project_structure_validation_failed"
+        self.evidence = evidence
+        self.artifact_names = artifact_names
 
 
 class ImplementationAgent:
@@ -97,16 +124,28 @@ class ImplementationAgent:
                     raise StructuredEditSchemaError(self._structured_schema_message(exc.raw_response)) from exc
                 patch_artifacts.extend(self._persist_structured_inputs(raw_response, structured))
                 try:
-                    diff_stats = self._validate_and_apply_structured(task, structured)
+                    diff_stats, evidence_artifacts = self._validate_and_apply_structured_with_evidence(
+                        task,
+                        structured,
+                        source_branch=branch,
+                    )
+                    patch_artifacts.extend(evidence_artifacts)
                 except Exception as structured_exc:
+                    patch_artifacts.extend(self._project_structure_artifacts_from_error(structured_exc))
                     patch_artifacts.extend(self._persist_structured_error(structured_exc))
                     if self._is_structured_repair_candidate(structured_exc):
                         retry_attempted = True
                         try:
                             repaired, repaired_raw = self._repair_structured_proposal(task, structured, structured_exc)
                             patch_artifacts.extend(self._persist_structured_inputs(repaired_raw, repaired, repair=True))
-                            diff_stats = self._validate_and_apply_structured(task, repaired)
+                            diff_stats, evidence_artifacts = self._validate_and_apply_structured_with_evidence(
+                                task,
+                                repaired,
+                                source_branch=branch,
+                            )
+                            patch_artifacts.extend(evidence_artifacts)
                         except Exception as repair_exc:
+                            patch_artifacts.extend(self._project_structure_artifacts_from_error(repair_exc))
                             patch_artifacts.extend(self._persist_structured_error(repair_exc, repair=True))
                             raise StructuredEditApplyError(self._structured_failure_reason(repair_exc), str(repair_exc)) from repair_exc
                         patch_artifacts.extend(self._persist_structured_apply_report(repaired, diff_stats, repair=True))
@@ -136,8 +175,14 @@ class ImplementationAgent:
                             raise StructuredEditSchemaError(self._structured_schema_message(schema_exc.raw_response)) from schema_exc
                         patch_artifacts.extend(self._persist_structured_inputs(structured_raw, structured))
                         try:
-                            diff_stats = self._validate_and_apply_structured(task, structured)
+                            diff_stats, evidence_artifacts = self._validate_and_apply_structured_with_evidence(
+                                task,
+                                structured,
+                                source_branch=branch,
+                            )
+                            patch_artifacts.extend(evidence_artifacts)
                         except Exception as structured_exc:
+                            patch_artifacts.extend(self._project_structure_artifacts_from_error(structured_exc))
                             patch_artifacts.extend(self._persist_structured_error(structured_exc, fallback_reason=fallback_reason))
                             raise StructuredEditApplyError(self._structured_failure_reason(structured_exc), str(structured_exc)) from structured_exc
                         patch_artifacts.extend(
@@ -379,8 +424,14 @@ class ImplementationAgent:
                     raise StructuredEditSchemaError(self._structured_schema_message(exc.raw_response)) from exc
                 patch_artifacts.extend(self._persist_structured_inputs(raw_response, structured))
                 try:
-                    diff_stats = self._validate_and_apply_structured(task, structured)
+                    diff_stats, evidence_artifacts = self._validate_and_apply_structured_with_evidence(
+                        task,
+                        structured,
+                        source_branch=branch,
+                    )
+                    patch_artifacts.extend(evidence_artifacts)
                 except Exception as exc:
+                    patch_artifacts.extend(self._project_structure_artifacts_from_error(exc))
                     patch_artifacts.extend(self._persist_structured_error(exc))
                     raise StructuredEditApplyError(self._structured_failure_reason(exc), str(exc)) from exc
                 patch_artifacts.extend(self._persist_structured_apply_report(structured, diff_stats))
@@ -552,6 +603,7 @@ class ImplementationAgent:
 
     def _structured_proposal(self, task: AgentTask, *, fallback_reason: str | None = None) -> tuple[StructuredEditProposal, str]:
         snippets = self._file_snippets(task)
+        project_structure_context = self._project_structure_prompt_context(task)
         payload = {
             "task": task.model_dump(mode="json"),
             "repo_context": self.repo_context,
@@ -606,6 +658,13 @@ class ImplementationAgent:
                 "forbidden_actions": task.forbidden_actions,
             },
         }
+        if project_structure_context is not None:
+            payload["project_structure_evidence"] = project_structure_context
+            payload["rules"]["project_structure"] = [
+                "When editing a Project Structure, Repository Structure, File Structure, or Directory Structure README section, use collected_files as the source of truth.",
+                "Do not remove files present in collected_files unless the task explicitly asks for a compact summary.",
+                "If the task explicitly asks for a compact summary, clearly state in the README block that it is a summary and not a complete file tree.",
+            ]
         proposal, raw_response = self._chat_structured_proposal(
             system_prompt=load_prompt("implementer.md"),
             user_prompt=json.dumps(payload, indent=2),
@@ -843,9 +902,269 @@ class ImplementationAgent:
         self._ensure_task_scope(task, proposal)
         return self.file_tool.apply_patch(proposal)
 
+    def _validate_and_apply_structured_with_evidence(
+        self,
+        task: AgentTask,
+        proposal: StructuredEditProposal,
+        *,
+        source_branch: str,
+    ) -> tuple[DiffStats, list[str]]:
+        self._ensure_structured_task_scope(task, proposal)
+        evidence_artifacts = self._validate_readme_project_structure_edit(
+            task,
+            proposal,
+            source_branch=source_branch,
+            base_ref=self.config.default_branch,
+        )
+        return self.file_tool.apply_structured_edits(proposal), evidence_artifacts
+
     def _validate_and_apply_structured(self, task: AgentTask, proposal: StructuredEditProposal) -> DiffStats:
         self._ensure_structured_task_scope(task, proposal)
         return self.file_tool.apply_structured_edits(proposal)
+
+    def _validate_readme_project_structure_edit(
+        self,
+        task: AgentTask,
+        proposal: StructuredEditProposal,
+        *,
+        source_branch: str,
+        base_ref: str,
+    ) -> list[str]:
+        for path, old_content, proposed_content in self._preview_readme_updates(proposal):
+            old_block, proposed_block = self._changed_project_structure_block(old_content, proposed_content)
+            if old_block is None and proposed_block is None:
+                continue
+
+            evidence = self._project_structure_evidence(
+                task,
+                source_branch=source_branch,
+                base_ref=base_ref,
+                old_readme_block=old_block or "",
+                proposed_readme_block=proposed_block or "",
+            )
+            artifact_names = self._persist_project_structure_evidence(evidence)
+            if evidence["validation_status"] == "blocked":
+                raise ProjectStructureValidationError(evidence, artifact_names)
+            return artifact_names
+        return []
+
+    def _project_structure_prompt_context(self, task: AgentTask) -> dict[str, object] | None:
+        readme_paths = [path for path in task.affected_files if self._is_readme_path(path)]
+        if not readme_paths:
+            return None
+
+        readme_blocks: dict[str, str] = {}
+        for path in readme_paths[:3]:
+            try:
+                blocks = self._readme_project_structure_blocks(self.file_tool.read_file(path))
+            except Exception:
+                blocks = []
+            if blocks:
+                readme_blocks[path] = blocks[0]["text"]
+
+        if not readme_blocks and not self._task_mentions_project_structure(task):
+            return None
+
+        collected_files, ignored_files = self._collect_project_structure_files()
+        return {
+            "collection_command_equivalent": "find .github rust-backend web -maxdepth 4 -type f | sort",
+            "collected_files": collected_files,
+            "ignored_files": ignored_files,
+            "old_readme_blocks": readme_blocks,
+            "explicit_compact_summary_requested": self._task_allows_compact_structure_summary(task),
+            "match_actual_files_requested": bool(ACTUAL_STRUCTURE_RE.search(self._task_text(task))),
+        }
+
+    def _project_structure_evidence(
+        self,
+        task: AgentTask,
+        *,
+        source_branch: str,
+        base_ref: str,
+        old_readme_block: str,
+        proposed_readme_block: str,
+    ) -> dict[str, object]:
+        collected_files, ignored_files = self._collect_project_structure_files()
+        old_entries = self._readme_tree_file_entries(old_readme_block)
+        proposed_entries = self._readme_tree_file_entries(proposed_readme_block)
+        collected = set(collected_files)
+        removed_existing_entries = sorted(entry for entry in old_entries - proposed_entries if entry in collected)
+        added_entries = sorted(proposed_entries - old_entries)
+        compact_requested = self._task_allows_compact_structure_summary(task)
+        validation_status = "passed"
+        if removed_existing_entries and not compact_requested:
+            validation_status = "blocked"
+        elif removed_existing_entries and not self._block_declares_compact_summary(proposed_readme_block):
+            validation_status = "blocked"
+
+        return {
+            "run_id": self.run_id,
+            "source_branch": source_branch,
+            "base_ref": base_ref,
+            "target_repo_path": str(self.file_tool.repo_path),
+            "collected_files": collected_files,
+            "ignored_files": ignored_files,
+            "old_readme_block": old_readme_block,
+            "proposed_readme_block": proposed_readme_block,
+            "removed_existing_entries": removed_existing_entries,
+            "added_entries": added_entries,
+            "validation_status": validation_status,
+        }
+
+    def _collect_project_structure_files(self) -> tuple[list[str], list[str]]:
+        collected: list[str] = []
+        ignored: list[str] = []
+        for root in PROJECT_STRUCTURE_ROOTS:
+            root_path = self.file_tool.repo_path / root
+            if not root_path.exists():
+                continue
+            for path in root_path.rglob("*"):
+                if not path.is_file():
+                    continue
+                relative = path.relative_to(self.file_tool.repo_path).as_posix()
+                if len(relative.split("/")) - 1 > PROJECT_STRUCTURE_MAX_DEPTH:
+                    continue
+                if self._is_ignored_project_structure_file(relative):
+                    ignored.append(relative)
+                else:
+                    collected.append(relative)
+        return sorted(set(collected)), sorted(set(ignored))
+
+    @staticmethod
+    def _is_ignored_project_structure_file(path: str) -> bool:
+        normalized = path.replace("\\", "/")
+        parts = normalized.split("/")
+        return (
+            normalized.startswith("web/dist/")
+            or ".git" in parts
+            or "node_modules" in parts
+            or "target" in parts
+        )
+
+    def _persist_project_structure_evidence(self, evidence: dict[str, object]) -> list[str]:
+        if self.artifacts is None:
+            return []
+        return [self.artifacts.write_json("project_structure_evidence", evidence).name]
+
+    @staticmethod
+    def _project_structure_artifacts_from_error(exc: Exception) -> list[str]:
+        if isinstance(exc, ProjectStructureValidationError):
+            return exc.artifact_names
+        return []
+
+    def _preview_readme_updates(self, proposal: StructuredEditProposal) -> list[tuple[str, str, str]]:
+        working: dict[str, str] = {}
+        original: dict[str, str] = {}
+        for edit in proposal.edits:
+            if not self._is_readme_path(edit.path):
+                continue
+            if edit.path not in working:
+                try:
+                    original[edit.path] = self.file_tool.read_file(edit.path)
+                except Exception:
+                    original[edit.path] = ""
+                working[edit.path] = original[edit.path]
+            old_content = working[edit.path]
+            try:
+                if edit.operation == "replace_file":
+                    new_content = edit.content or ""
+                elif edit.operation == "append_to_file":
+                    new_content = old_content + (edit.content or "")
+                elif edit.operation == "replace_text":
+                    old_text = edit.old_text or ""
+                    if old_content.count(old_text) != 1:
+                        return []
+                    new_content = old_content.replace(old_text, edit.new_text or "", 1)
+                elif edit.operation in {"insert_before", "insert_after"}:
+                    anchor = edit.anchor or ""
+                    if old_content.count(anchor) != 1:
+                        return []
+                    insert_at = old_content.index(anchor)
+                    if edit.operation == "insert_after":
+                        insert_at += len(anchor)
+                    new_content = old_content[:insert_at] + (edit.content or "") + old_content[insert_at:]
+                else:  # pragma: no cover - pydantic validates operation
+                    return []
+            except Exception:
+                return []
+            working[edit.path] = new_content
+        return [(path, original[path], proposed) for path, proposed in working.items() if original[path] != proposed]
+
+    @staticmethod
+    def _changed_project_structure_block(old_content: str, proposed_content: str) -> tuple[str | None, str | None]:
+        old_blocks = ImplementationAgent._readme_project_structure_blocks(old_content)
+        proposed_blocks = ImplementationAgent._readme_project_structure_blocks(proposed_content)
+        keys = list(dict.fromkeys([block["key"] for block in old_blocks] + [block["key"] for block in proposed_blocks]))
+        for key in keys:
+            old_block = next((block["text"] for block in old_blocks if block["key"] == key), None)
+            proposed_block = next((block["text"] for block in proposed_blocks if block["key"] == key), None)
+            if old_block != proposed_block:
+                return old_block, proposed_block
+        return None, None
+
+    @staticmethod
+    def _readme_project_structure_blocks(text: str) -> list[dict[str, str]]:
+        lines = text.splitlines(keepends=True)
+        blocks: list[dict[str, str]] = []
+        for index, line in enumerate(lines):
+            match = PROJECT_STRUCTURE_HEADING_RE.match(line.strip())
+            if not match:
+                continue
+            level = len(match.group(1))
+            end = len(lines)
+            for candidate in range(index + 1, len(lines)):
+                heading = re.match(r"^(#{1,6})\s+", lines[candidate].strip())
+                if heading and len(heading.group(1)) <= level:
+                    end = candidate
+                    break
+            blocks.append({"key": match.group(2).lower(), "text": "".join(lines[index:end])})
+        return blocks
+
+    @staticmethod
+    def _readme_tree_file_entries(block: str) -> set[str]:
+        entries: set[str] = set()
+        stack: list[str] = []
+        for raw_line in block.splitlines():
+            line = raw_line.rstrip()
+            connector = re.search(r"(├──|└──|\|--|`--|\+--|\\--)\s*", line)
+            if connector:
+                prefix = line[: connector.start()]
+                depth = len(prefix.replace("│", " ").replace("|", " ")) // 4
+                name = line[connector.end() :].strip().strip("`")
+                name = name.split("  #", 1)[0].strip()
+                if not name or name in {".", "./"}:
+                    continue
+                is_dir = name.endswith("/")
+                name = name.rstrip("/")
+                stack = stack[:depth]
+                parts = [part for part in stack if part] + [name]
+                if is_dir:
+                    stack = parts
+                else:
+                    entries.add("/".join(parts))
+                continue
+
+            for match in re.finditer(r"(?<![\w.-])(\.?[\w.-]+(?:/[\w.-]+)+\.[A-Za-z0-9][\w.-]*)", line):
+                entry = match.group(1)
+                entries.add(entry[2:] if entry.startswith("./") else entry)
+        return entries
+
+    @staticmethod
+    def _block_declares_compact_summary(block: str) -> bool:
+        text = block.lower()
+        has_summary_marker = any(marker in text for marker in ("summary", "compact", "overview", "concise"))
+        has_incomplete_marker = any(
+            marker in text
+            for marker in (
+                "not a complete",
+                "not complete",
+                "not the complete",
+                "not exhaustive",
+                "not a full",
+                "not full",
+            )
+        )
+        return has_summary_marker and has_incomplete_marker
 
     def _ensure_task_scope(self, task: AgentTask, proposal: PatchProposal) -> None:
         if not task.affected_files:
@@ -874,6 +1193,24 @@ class ImplementationAgent:
         return snippets
 
     @staticmethod
+    def _task_text(task: AgentTask) -> str:
+        return json.dumps(task.model_dump(mode="json"), ensure_ascii=False)
+
+    @classmethod
+    def _task_mentions_project_structure(cls, task: AgentTask) -> bool:
+        text = cls._task_text(task)
+        return bool(
+            PROJECT_STRUCTURE_HEADING_RE.search(text)
+            or re.search(r"\b(project|repository|file|directory)\s+structure\b", text, re.IGNORECASE)
+            or re.search(r"\b(file tree|directory tree|repo tree|repository tree)\b", text, re.IGNORECASE)
+            or ACTUAL_STRUCTURE_RE.search(text)
+        )
+
+    @classmethod
+    def _task_allows_compact_structure_summary(cls, task: AgentTask) -> bool:
+        return bool(COMPACT_SUMMARY_RE.search(cls._task_text(task)))
+
+    @staticmethod
     def _is_docs_task(task: AgentTask) -> bool:
         if task.task_type == TaskType.DOCS:
             return True
@@ -890,6 +1227,11 @@ class ImplementationAgent:
         return normalized.startswith("docs/") or name.startswith("readme") or normalized.endswith((".md", ".markdown"))
 
     @staticmethod
+    def _is_readme_path(path: str) -> bool:
+        normalized = path.replace("\\", "/").lower()
+        return normalized.rsplit("/", 1)[-1].startswith("readme")
+
+    @staticmethod
     def _is_patch_fallback_candidate(exc: PatchApplyError | UnifiedDiffValidationError) -> bool:
         if isinstance(exc, UnifiedDiffValidationError):
             return True
@@ -903,6 +1245,8 @@ class ImplementationAgent:
 
     @staticmethod
     def _structured_failure_reason(exc: Exception) -> str:
+        if isinstance(exc, ProjectStructureValidationError):
+            return exc.reason
         if isinstance(exc, StructuredEditError):
             return exc.reason
         text = str(exc).lower()
@@ -922,6 +1266,13 @@ class ImplementationAgent:
 
     @staticmethod
     def _structured_error_payload(exc: Exception) -> dict[str, object]:
+        if isinstance(exc, ProjectStructureValidationError):
+            return {
+                "reason": exc.reason,
+                "error": str(exc),
+                "removed_existing_entries": exc.evidence.get("removed_existing_entries", []),
+                "project_structure_evidence": exc.evidence,
+            }
         if isinstance(exc, StructuredEditError):
             return exc.to_dict()
         return {

@@ -253,6 +253,17 @@ class Finding(StrictModel):
     blocked: bool = False
 
 
+class DocsCheckReport(StrictModel):
+    status: ReportStatus
+    passed: bool
+    checks: dict[str, str] = Field(default_factory=dict)
+    findings: list[Finding] = Field(default_factory=list)
+    recommendation: str = ""
+    check_statuses: dict[str, str] = Field(default_factory=dict)
+    docs_check: str = "skipped"
+    structure_evidence_check: str = "skipped"
+
+
 class BuildSecurityReport(StrictModel):
     status: ReportStatus
     passed: bool
@@ -373,6 +384,7 @@ class GateContext(StrictModel):
     security_review: ReviewReport
     rollback_plan: str
     supply_chain: SupplyChainReport | None = None
+    docs_check: DocsCheckReport | None = None
 
 
 class PostMergeMonitorResult(StrictModel):
@@ -404,6 +416,7 @@ class GateDecision(StrictModel):
     reasons: list[str] = Field(default_factory=list)
     blockers: list[str] = Field(default_factory=list)
     policy_checks: dict[str, bool] = Field(default_factory=dict)
+    check_statuses: dict[str, str] = Field(default_factory=dict)
 
 
 class RollbackReport(StrictModel):

@@ -5,6 +5,7 @@ from agentlab.models import (
     AgentTask,
     BuildSecurityReport,
     DiffStats,
+    DocsCheckReport,
     FindingSeverity,
     GateDecision,
     ReportStatus,
@@ -14,6 +15,7 @@ from agentlab.models import (
     TestReport,
     Verdict,
 )
+from agentlab.agents.docs_check import is_readme_only
 
 
 class PolicyEngine:
@@ -32,12 +34,15 @@ class PolicyEngine:
         security_review: ReviewReport,
         rollback_plan: str | None,
         supply_chain: SupplyChainReport | None = None,
+        docs_check: DocsCheckReport | None = None,
         direct_main_push: bool = False,
     ) -> GateDecision:
         mode = "direct_main_push" if direct_main_push else "merge_request"
         checks: dict[str, bool] = {}
+        check_statuses: dict[str, str] = {}
         blockers: list[str] = []
         reasons: list[str] = []
+        readme_only = is_readme_only(diff_stats.changed_files)
 
         self._check(
             checks,
@@ -121,25 +126,51 @@ class PolicyEngine:
                 "dependency lockfiles missing: " + ", ".join(supply_chain.missing_lockfiles),
             )
 
+        if readme_only:
+            docs_status = _docs_status(docs_check)
+            structure_status = _structure_evidence_status(docs_check)
+            check_statuses["docs_check"] = docs_status
+            check_statuses["structure_evidence_check"] = structure_status
+            self._check_status(
+                checks,
+                blockers,
+                "docs_check",
+                docs_status,
+                "docs check failed",
+            )
+            self._check_status(
+                checks,
+                blockers,
+                "structure_evidence_check",
+                structure_status,
+                "project structure evidence failed",
+            )
+            blockers.extend(_docs_check_blockers(docs_check))
+
         if self.config.require_two_testers:
-            executed_commands = {result.command for result in functional_tests.commands}
-            missing_required_tests = [
-                command for command in self.config.required_test_commands if command not in executed_commands
-            ]
-            self._check(
-                checks,
-                blockers,
-                "required_tests_executed",
-                not missing_required_tests,
-                "required test commands were not executed: " + ", ".join(missing_required_tests),
-            )
-            self._check(
-                checks,
-                blockers,
-                "functional_tests_passed",
-                functional_tests.status == ReportStatus.PASSED and functional_tests.passed,
-                "functional tests did not pass",
-            )
+            skip_functional_tests = readme_only and not self.config.required_test_commands
+            if skip_functional_tests:
+                checks["required_tests_executed"] = True
+                checks["functional_tests_passed"] = True
+            else:
+                executed_commands = {result.command for result in functional_tests.commands}
+                missing_required_tests = [
+                    command for command in self.config.required_test_commands if command not in executed_commands
+                ]
+                self._check(
+                    checks,
+                    blockers,
+                    "required_tests_executed",
+                    not missing_required_tests,
+                    "required test commands were not executed: " + ", ".join(missing_required_tests),
+                )
+                self._check(
+                    checks,
+                    blockers,
+                    "functional_tests_passed",
+                    functional_tests.status == ReportStatus.PASSED and functional_tests.passed,
+                    "functional tests did not pass",
+                )
             self._check(
                 checks,
                 blockers,
@@ -197,6 +228,7 @@ class PolicyEngine:
             reasons=reasons,
             blockers=blockers,
             policy_checks=checks,
+            check_statuses=check_statuses,
         )
 
     @staticmethod
@@ -210,3 +242,44 @@ class PolicyEngine:
         checks[name] = passed
         if not passed:
             blockers.append(blocker)
+
+    @staticmethod
+    def _check_status(
+        checks: dict[str, bool],
+        blockers: list[str],
+        name: str,
+        status: str,
+        blocker: str,
+    ) -> None:
+        passed = status != "failed"
+        checks[name] = passed
+        if not passed:
+            blockers.append(blocker)
+
+
+def _docs_status(report: DocsCheckReport | None) -> str:
+    if report is None:
+        return "skipped"
+    status = report.checks.get("docs_check") or report.docs_check
+    if status:
+        return status
+    return "passed" if report.passed else "failed"
+
+
+def _structure_evidence_status(report: DocsCheckReport | None) -> str:
+    if report is None:
+        return "skipped"
+    return report.checks.get("structure_evidence_check") or report.structure_evidence_check or "skipped"
+
+
+def _docs_check_blockers(report: DocsCheckReport | None) -> list[str]:
+    if report is None:
+        return []
+    blockers: list[str] = []
+    for finding in report.findings:
+        if not finding.blocked:
+            continue
+        title = finding.title.strip()
+        if title and title not in blockers:
+            blockers.append(title)
+    return blockers

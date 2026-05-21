@@ -105,8 +105,15 @@ def scheduler_action(config: Path = typer.Option(..., "--config", exists=True, r
 
 
 @app.command("scheduler-review-comments")
-def scheduler_review_comments(config: Path = typer.Option(..., "--config", exists=True, readable=True)) -> None:
+def scheduler_review_comments(
+    config: Path = typer.Option(..., "--config", exists=True, readable=True),
+    process_history: bool = typer.Option(False, "--process-history", help="Process historical /agent comments instead of initializing high-water marks."),
+) -> None:
     cfg = load_config(config)
+    if process_history:
+        review_comments = cfg.schedule.review_comments.model_copy(update={"process_history": True})
+        schedule = cfg.schedule.model_copy(update={"review_comments": review_comments})
+        cfg = cfg.model_copy(update={"schedule": schedule})
     _json_echo(Scheduler(cfg).review_comments())
 
 

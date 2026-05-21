@@ -4,6 +4,7 @@ from agentlab.models import (
     AgentTask,
     BuildSecurityReport,
     DiffStats,
+    DocsCheckReport,
     GateDecision,
     ReviewReport,
     RiskAssessment,
@@ -31,6 +32,7 @@ class Gatekeeper:
         security_review: ReviewReport,
         rollback_plan: str | None,
         supply_chain: SupplyChainReport | None = None,
+        docs_check: DocsCheckReport | None = None,
         direct_main_push: bool = False,
     ) -> GateDecision:
         return self.policy_engine.evaluate(
@@ -42,6 +44,7 @@ class Gatekeeper:
             quality_review=quality_review,
             security_review=security_review,
             supply_chain=supply_chain,
+            docs_check=docs_check,
             rollback_plan=rollback_plan,
             direct_main_push=direct_main_push,
         )

@@ -4,7 +4,19 @@ from contextlib import nullcontext
 from pathlib import Path
 
 from agentlab.config import AppConfig
-from agentlab.models import AgentTask, GateDecision, ImplementationReport, ReportStatus, RiskLevel, TaskPlan, TaskType
+from agentlab.models import (
+    AgentTask,
+    BuildSecurityReport,
+    DiffStats,
+    GateDecision,
+    ImplementationReport,
+    ReportStatus,
+    ReviewReport,
+    RiskLevel,
+    TaskPlan,
+    TaskType,
+    Verdict,
+)
 from agentlab.orchestrator import Orchestrator
 
 
@@ -122,3 +134,86 @@ def test_full_flow_uses_auto_approved_task() -> None:
     report = orchestrator.artifacts.payloads["auto_approval_report"]
     assert isinstance(report, dict)
     assert report["selected_task_id"] == "docs-readme"
+
+
+class FakeReadmeGit:
+    def diff(self, base: str = "main") -> str:
+        return "diff --git a/README.md b/README.md\n"
+
+    def diff_stats(self, base: str = "main", protected_paths: list[str] | None = None) -> DiffStats:
+        return DiffStats(changed_files=["README.md"], added_lines=1)
+
+
+class FakeReadmeFileTool:
+    def read_file(self, path: str) -> str:
+        return "# Demo\n\nREADME update.\n"
+
+
+class ReadmeOnlyGateOrchestrator(Orchestrator):
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self.dry_run = False
+        self.run_id = "run-1"
+        self.audit = FakeAudit()
+        self.artifacts = FakeArtifacts()
+        self.ollama = object()
+
+    def _tools(self):  # type: ignore[override]
+        return FakeReadmeGit(), FakeReadmeFileTool(), object(), object()
+
+
+def test_review_and_gate_skips_functional_tests_for_readme_only_without_required_commands(monkeypatch) -> None:
+    class FailingFunctionalTestAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def run(self):
+            raise AssertionError("functional tests should be skipped for README-only changes")
+
+    class PassingBuildSecurityAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def run(self) -> BuildSecurityReport:
+            return BuildSecurityReport(status=ReportStatus.PASSED, passed=True)
+
+    class ApprovedQualityAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def review(self, diff_text: str) -> ReviewReport:
+            return ReviewReport(reviewer="quality", verdict=Verdict.APPROVED, summary="ok")
+
+    class ApprovedSecurityAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def review(self, diff_text: str) -> ReviewReport:
+            return ReviewReport(reviewer="security_architecture", verdict=Verdict.APPROVED, summary="ok")
+
+    monkeypatch.setattr("agentlab.orchestrator.FunctionalTestAgent", FailingFunctionalTestAgent)
+    monkeypatch.setattr("agentlab.orchestrator.BuildSecurityTestAgent", PassingBuildSecurityAgent)
+    monkeypatch.setattr("agentlab.orchestrator.CodeQualityReviewAgent", ApprovedQualityAgent)
+    monkeypatch.setattr("agentlab.orchestrator.SecurityArchitectureReviewAgent", ApprovedSecurityAgent)
+    cfg = AppConfig(
+        gitlab_url="https://gitlab.example.com",
+        project_id=1,
+        target_repo_path=Path("."),
+        workspace_root=Path(".runs"),
+        auto_merge_enabled=True,
+        supply_chain_enabled=False,
+    )
+    orchestrator = ReadmeOnlyGateOrchestrator(cfg)
+
+    decision = orchestrator.review_and_gate(
+        AgentTask(id="docs-readme", title="Docs README", task_type=TaskType.DOCS, affected_files=["README.md"], approved=True)
+    )
+
+    assert decision.allowed is True
+    assert decision.check_statuses["docs_check"] == "passed"
+    assert "docs_check_report" in orchestrator.artifacts.payloads
+    docs_report = orchestrator.artifacts.payloads["docs_check_report"]
+    assert getattr(docs_report, "docs_check") == "passed"
+    assert getattr(docs_report, "structure_evidence_check") == "skipped"
+    functional = orchestrator.artifacts.payloads["functional_test_report"]
+    assert getattr(functional, "status") == ReportStatus.SKIPPED

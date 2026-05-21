@@ -110,6 +110,7 @@ schedule:
   review_comments:
     enabled: false
     cron: "*/10 * * * *"
+    process_history: false
     max_comments_per_run: 1
     cooldown_minutes: 10
     allowed_commands:
