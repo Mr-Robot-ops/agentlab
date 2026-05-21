@@ -107,30 +107,36 @@ def generate_k8s(
             git_author_name=git_author_name,
             git_author_email=git_author_email,
         )
+    cron_commands: dict[str, list[str]] = {}
+    cron_schedules: dict[str, str] = {}
     if schedule_enabled:
-        cron_commands = {
-            "scheduler-watch": ["scheduler-watch", "--config", "/etc/agentlab/config.yaml"],
-            "scheduler-plan": ["scheduler-plan", "--config", "/etc/agentlab/config.yaml"],
-            "scheduler-action": ["scheduler-action", "--config", "/etc/agentlab/config.yaml"],
-        }
-        cron_schedules = {
-            "scheduler-watch": schedule_watch_cron,
-            "scheduler-plan": schedule_plan_cron,
-            "scheduler-action": schedule_action_cron,
-        }
-        if schedule_review_comments_enabled:
-            cron_commands["scheduler-review-comments"] = ["scheduler-review-comments", "--config", "/etc/agentlab/config.yaml"]
-            cron_schedules["scheduler-review-comments"] = schedule_review_comments_cron
-        for name, command in cron_commands.items():
-            files[f"cronjob-{name}.yaml"] = render_cronjob(
-                namespace=namespace,
-                image=image,
-                job_name=name,
-                command=command,
-                cron=cron_schedules[name],
-                git_author_name=git_author_name,
-                git_author_email=git_author_email,
-            )
+        cron_commands.update(
+            {
+                "scheduler-watch": ["scheduler-watch", "--config", "/etc/agentlab/config.yaml"],
+                "scheduler-plan": ["scheduler-plan", "--config", "/etc/agentlab/config.yaml"],
+                "scheduler-action": ["scheduler-action", "--config", "/etc/agentlab/config.yaml"],
+            }
+        )
+        cron_schedules.update(
+            {
+                "scheduler-watch": schedule_watch_cron,
+                "scheduler-plan": schedule_plan_cron,
+                "scheduler-action": schedule_action_cron,
+            }
+        )
+    if schedule_review_comments_enabled:
+        cron_commands["scheduler-review-comments"] = ["scheduler-review-comments", "--config", "/etc/agentlab/config.yaml"]
+        cron_schedules["scheduler-review-comments"] = schedule_review_comments_cron
+    for name, command in cron_commands.items():
+        files[f"cronjob-{name}.yaml"] = render_cronjob(
+            namespace=namespace,
+            image=image,
+            job_name=name,
+            command=command,
+            cron=cron_schedules[name],
+            git_author_name=git_author_name,
+            git_author_email=git_author_email,
+        )
     for name, content in files.items():
         write_file(out / name, content)
     if emit_komodo:
@@ -440,8 +446,9 @@ kubectl apply -f deploy/kubernetes/generated/job-scheduler-review-comments.yaml
 ```
 
 For `job-run-task.yaml`, create a ConfigMap named `agentlab-task` with `task.json` first.
-Manual `job-scheduler-*.yaml` manifests are always generated for testing. `cronjob-scheduler-*.yaml`
-manifests are generated only when scheduling is enabled.
+Manual `job-scheduler-*.yaml` manifests are always generated for testing. Watch, plan, and action CronJobs
+are generated when scheduling is enabled; the review-comment CronJob is generated when review-comment
+scheduling is enabled.
 """
 
 

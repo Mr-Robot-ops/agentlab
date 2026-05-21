@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
+import re
 import time
 import uuid
 from pathlib import Path
+from typing import Any
 
 from agentlab.artifacts import ArtifactStore
+from agentlab.agents.docs_check import DocsCheckAgent, is_readme_only
 from agentlab.agents.gatekeeper import Gatekeeper
 from agentlab.agents.implementer import ImplementationAgent
 from agentlab.agents.mr_agent import MergeRequestAgent
@@ -35,6 +39,7 @@ from agentlab.models import (
     SupplyChainReport,
     TaskPlan,
     TaskType,
+    TestReport,
 )
 from agentlab.preflight import PreflightChecker
 from agentlab.policies.auto_approval import AutoApprovalPolicy
@@ -334,8 +339,22 @@ class Orchestrator:
         diff_stats = git_tool.diff_stats(base_ref, self.config.protected_paths)
         risk = assess_risk(task, diff_stats.changed_files, diff_text)
         supply_chain = self.supply_chain() if self.config.supply_chain_enabled else None
-        with self.audit.span(agent="functional_test", action="run_tests"):
-            functional = FunctionalTestAgent(file_tool, test_tool).run()
+        readme_only = is_readme_only(diff_stats.changed_files)
+        docs_check = None
+        if readme_only:
+            with self.audit.span(agent="docs_check", action="run_docs_checks"):
+                docs_check = DocsCheckAgent(file_tool, self.artifacts).run(diff_stats.changed_files)
+            self.artifacts.write_json("docs_check_report", docs_check)
+        if readme_only and not self.config.required_test_commands:
+            with self.audit.span(agent="functional_test", action="skip_tests_for_readme_only"):
+                functional = TestReport(
+                    status=ReportStatus.SKIPPED,
+                    passed=False,
+                    recommendation="README-only change: docs_check_report is authoritative; functional tests are skipped unless required_test_commands are configured.",
+                )
+        else:
+            with self.audit.span(agent="functional_test", action="run_tests"):
+                functional = FunctionalTestAgent(file_tool, test_tool).run()
         self.artifacts.write_json("functional_test_report", functional)
         with self.audit.span(agent="build_security_test", action="run_build_and_security_checks"):
             build_security = BuildSecurityTestAgent(
@@ -364,6 +383,7 @@ class Orchestrator:
                 quality_review=quality_review,
                 security_review=security_review,
                 supply_chain=supply_chain,
+                docs_check=docs_check,
                 rollback_plan=rollback_plan,
                 direct_main_push=direct_main_push,
             )
@@ -379,6 +399,7 @@ class Orchestrator:
             security_review=security_review,
             rollback_plan=rollback_plan,
             supply_chain=supply_chain,
+            docs_check=docs_check,
         )
         return decision
 
@@ -556,6 +577,16 @@ class Orchestrator:
                 affected_files = git_tool.changed_files(base_ref)
             except Exception:
                 affected_files = git_tool.changed_files(self.config.default_branch)
+        revision_context = self._build_revision_context(
+            git_tool,
+            file_tool,
+            mr_iid=mr_iid,
+            source_branch=source_branch,
+            base_ref=base_ref,
+            command=command,
+            feedback=feedback,
+            changed_files=affected_files,
+        )
         task = self._review_comment_task(
             mr_iid=mr_iid,
             source_branch=source_branch,
@@ -563,6 +594,7 @@ class Orchestrator:
             feedback=feedback,
             note_id=note_id,
             affected_files=affected_files,
+            revision_context=revision_context,
         )
         self.artifacts.write_json("revision_task", task)
 
@@ -577,6 +609,8 @@ class Orchestrator:
                 "reason": "policy_blocked",
                 "source_branch": source_branch,
                 "command": command,
+                "task": task.model_dump(mode="json"),
+                "changed_files": affected_files,
                 "auto_approval": auto_approval_report,
             }
 
@@ -592,6 +626,7 @@ class Orchestrator:
                 "architecture": architecture.model_dump(mode="json"),
                 "repo_index_summary": self._repo_index_summary(repo_index),
                 "supply_chain_summary": self._supply_chain_summary(supply_chain) if supply_chain else None,
+                "revision_context": revision_context,
             },
             artifacts=self.artifacts,
             run_id=self.run_id,
@@ -622,6 +657,155 @@ class Orchestrator:
             "gate": gate.model_dump(mode="json"),
         }
 
+    def _build_revision_context(
+        self,
+        git_tool: GitTool,
+        file_tool: FileTool,
+        *,
+        mr_iid: int,
+        source_branch: str,
+        base_ref: str,
+        command: str,
+        feedback: str,
+        changed_files: list[str],
+    ) -> dict[str, Any]:
+        tracked_files = self._revision_snapshot_paths(changed_files, feedback)
+        base_snapshot = {
+            "run_id": self.run_id,
+            "ref": base_ref,
+            "source_branch": source_branch,
+            "files": [self._base_file_snapshot(git_tool, base_ref, path) for path in tracked_files],
+        }
+        mr_snapshot = {
+            "run_id": self.run_id,
+            "ref": source_branch,
+            "source_branch": source_branch,
+            "files": [self._mr_file_snapshot(file_tool, path) for path in tracked_files],
+        }
+        self.artifacts.write_json("base_file_snapshot", base_snapshot)
+        self.artifacts.write_json("mr_file_snapshot", mr_snapshot)
+
+        previous_commits = self._previous_agent_commits(git_tool, base_ref)
+        previous_artifacts = self._previous_revision_artifacts()
+        base_by_path = {str(item["path"]): item for item in base_snapshot["files"]}
+        mr_by_path = {str(item["path"]): item for item in mr_snapshot["files"]}
+        structured_diff_summary = [
+            self._structured_revision_file_summary(
+                path,
+                base_by_path.get(path, {}),
+                mr_by_path.get(path, {}),
+                feedback=feedback,
+            )
+            for path in tracked_files
+        ]
+        context = {
+            "run_id": self.run_id,
+            "mr_iid": mr_iid,
+            "source_branch": source_branch,
+            "base_ref": base_ref,
+            "command": command,
+            "user_requested_change": feedback,
+            "changed_files": changed_files,
+            "snapshot_files": tracked_files,
+            "base_file_snapshot_artifact": "base_file_snapshot.json",
+            "mr_file_snapshot_artifact": "mr_file_snapshot.json",
+            "structured_diff_summary": structured_diff_summary,
+            "previous_agent_commits": previous_commits,
+            "previous_artifacts": previous_artifacts,
+        }
+        self.artifacts.write_json("revision_context", context)
+        return context
+
+    def _revision_snapshot_paths(self, changed_files: list[str], feedback: str) -> list[str]:
+        paths = _dedupe_paths(changed_files)
+        if _feedback_requests_base_readme(feedback) and "README.md" not in paths:
+            paths.insert(0, "README.md")
+        return paths
+
+    def _base_file_snapshot(self, git_tool: GitTool, base_ref: str, path: str) -> dict[str, Any]:
+        try:
+            content = git_tool.show_file(base_ref, path)
+            return {"path": path, "exists": True, "content": content, "error": None}
+        except Exception as exc:
+            return {"path": path, "exists": False, "content": "", "error": str(exc)}
+
+    def _mr_file_snapshot(self, file_tool: FileTool, path: str) -> dict[str, Any]:
+        try:
+            content = file_tool.read_file(path)
+            return {"path": path, "exists": True, "content": content, "error": None}
+        except Exception as exc:
+            return {"path": path, "exists": False, "content": "", "error": str(exc)}
+
+    def _structured_revision_file_summary(
+        self,
+        path: str,
+        base_snapshot: dict[str, Any],
+        mr_snapshot: dict[str, Any],
+        *,
+        feedback: str,
+    ) -> dict[str, Any]:
+        base_content = str(base_snapshot.get("content") or "")
+        mr_content = str(mr_snapshot.get("content") or "")
+        base_block = _revision_relevant_block(path, base_content, feedback)
+        mr_block = _revision_relevant_block(path, mr_content, feedback)
+        return {
+            "path": path,
+            "base_branch_block": base_block,
+            "current_mr_block": mr_block,
+            "user_requested_change": feedback,
+            "intended_final_block": _intended_revision_block(path, base_block, mr_block, feedback),
+            "base_exists": bool(base_snapshot.get("exists")),
+            "mr_exists": bool(mr_snapshot.get("exists")),
+            "base_error": base_snapshot.get("error"),
+            "mr_error": mr_snapshot.get("error"),
+        }
+
+    def _previous_agent_commits(self, git_tool: GitTool, base_ref: str) -> list[dict[str, str]]:
+        try:
+            commits = git_tool.commit_log(base_ref, "HEAD", max_count=20)
+        except Exception:
+            return []
+        previous: list[dict[str, str]] = []
+        for commit in commits:
+            subject = commit.get("subject", "")
+            author = f"{commit.get('author_name', '')} {commit.get('author_email', '')}".lower()
+            if subject.startswith("agent:") or "agentlab" in author:
+                previous.append(commit)
+        return previous
+
+    def _previous_revision_artifacts(self) -> list[dict[str, Any]]:
+        names = {
+            "project_structure_evidence.json",
+            "implementation_report.json",
+            "structured_edit_apply_report.json",
+            "structured_edit_error.json",
+            "revision_context.json",
+        }
+        root = Path(self.config.workspace_root)
+        current_artifacts = self.artifacts.artifacts_dir.resolve()
+        candidates = sorted(root.glob("*/artifacts/*.json"), key=lambda path: path.stat().st_mtime, reverse=True)
+        artifacts: list[dict[str, Any]] = []
+        for path in candidates:
+            if path.name not in names:
+                continue
+            try:
+                if path.parent.resolve() == current_artifacts:
+                    continue
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            artifacts.append(
+                {
+                    "run_id": path.parent.parent.name,
+                    "name": path.name,
+                    "path": str(path),
+                    "payload": payload,
+                }
+            )
+            if len(artifacts) >= 5:
+                break
+        return artifacts
+
     def _review_comment_task(
         self,
         *,
@@ -631,6 +815,7 @@ class Orchestrator:
         feedback: str,
         note_id: int | str,
         affected_files: list[str],
+        revision_context: dict[str, Any] | None = None,
     ) -> AgentTask:
         task_type = _review_task_type(command, affected_files)
         safe_note_id = "".join(char if char.isalnum() else "-" for char in str(note_id)).strip("-") or "note"
@@ -665,6 +850,8 @@ class Orchestrator:
                 "note_id": str(note_id),
                 "command": command,
                 "source_branch": source_branch,
+                "changed_files": affected_files,
+                "revision_context": revision_context or {},
             },
         )
 
@@ -678,3 +865,75 @@ def _review_task_type(command: str, affected_files: list[str]) -> TaskType:
     if command == "fix":
         return TaskType.BUGFIX
     return TaskType.DOCS if not normalized else TaskType.REFACTOR
+
+
+README_BASE_CONTEXT_RE = re.compile(
+    r"\b(main|restore|detailtiefe|actual files|real structure|origin/main|base branch|wiederherstell|tatsaechlich|tatsächlich)\b",
+    re.IGNORECASE,
+)
+README_STRUCTURE_HEADING_RE = re.compile(
+    r"^(#{1,6})\s*((?:project|repository|file|directory)\s+structure)\s*:?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _dedupe_paths(paths: list[str]) -> list[str]:
+    seen: set[str] = set()
+    unique: list[str] = []
+    for path in paths:
+        normalized = str(path).replace("\\", "/")
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique.append(normalized)
+    return unique
+
+
+def _feedback_requests_base_readme(feedback: str) -> bool:
+    return bool(README_BASE_CONTEXT_RE.search(feedback or ""))
+
+
+def _revision_relevant_block(path: str, content: str, feedback: str) -> str:
+    if not content:
+        return ""
+    normalized = path.replace("\\", "/").lower()
+    if normalized.rsplit("/", 1)[-1].startswith("readme") and _feedback_requests_base_readme(feedback):
+        structure_block = _readme_structure_block(content)
+        if structure_block:
+            return structure_block
+    return _excerpt_text(content)
+
+
+def _readme_structure_block(content: str) -> str:
+    lines = content.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        match = README_STRUCTURE_HEADING_RE.match(line.strip())
+        if not match:
+            continue
+        level = len(match.group(1))
+        end = len(lines)
+        for candidate in range(index + 1, len(lines)):
+            heading = re.match(r"^(#{1,6})\s+", lines[candidate].strip())
+            if heading and len(heading.group(1)) <= level:
+                end = candidate
+                break
+        return "".join(lines[index:end])
+    return ""
+
+
+def _intended_revision_block(path: str, base_block: str, mr_block: str, feedback: str) -> str:
+    normalized = path.replace("\\", "/").lower()
+    if normalized.rsplit("/", 1)[-1].startswith("readme") and _feedback_requests_base_readme(feedback) and base_block:
+        return base_block
+    if mr_block:
+        return (
+            "Apply the user-requested change to the current MR block while preserving existing detail; "
+            "do not compact or simplify unless the comment explicitly asks for a summary."
+        )
+    return "No existing MR block was available; derive the final content only from explicit repository evidence."
+
+
+def _excerpt_text(content: str, limit: int = 20_000) -> str:
+    if len(content) <= limit:
+        return content
+    return content[:limit] + "\n<excerpt truncated>"

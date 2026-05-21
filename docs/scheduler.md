@@ -90,6 +90,7 @@ schedule:
   review_comments:
     enabled: false
     cron: "*/10 * * * *"
+    process_history: false
     max_comments_per_run: 1
     cooldown_minutes: 10
     allowed_commands:
@@ -171,13 +172,14 @@ schedule:
   enabled: true
   review_comments:
     enabled: true
+    process_history: false
     allowed_authors:
       - alice
       - bob
     require_author_role: []
 ```
 
-If role checks are unavailable and `allowed_authors` is empty, commands are blocked. Bot-authored comments are ignored to avoid loops. Processed notes are recorded in `<workspace_root>/scheduler/state.json` under `processed_review_comments`, so the same note is never patched or answered twice.
+If role checks are unavailable and `allowed_authors` is empty, commands are blocked. Bot-authored comments are ignored to avoid loops. On the first run with empty review-comment state, historical comments are recorded under `review_comments_seen` and skipped unless `schedule.review_comments.process_history` is true. Processed notes are recorded in `<workspace_root>/scheduler/state.json` under `processed_review_comments`, so the same note is never patched or answered twice.
 
 ## Recommended Rollout
 

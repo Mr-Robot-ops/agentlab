@@ -19,6 +19,12 @@ def test_group_project_path_is_accepted() -> None:
     assert gitlab_project_api_id(config.project_id) == "group%2Fproject"
 
 
+def test_review_comment_history_processing_defaults_off() -> None:
+    config = AppConfig(gitlab_url="https://gitlab.example.com", project_id=123, target_repo_path=Path("."))
+
+    assert config.schedule.review_comments.process_history is False
+
+
 def test_url_encoded_project_path_is_normalized() -> None:
     assert normalize_project_id("group%2Fproject") == "group/project"
 

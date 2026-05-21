@@ -8,6 +8,13 @@ from agentlab.policies.risk import detect_secret_paths
 from agentlab.tools.common import ToolError, run_subprocess
 
 
+def _safe_relative_path(path: str) -> str:
+    normalized = path.replace("\\", "/").strip()
+    if not normalized or normalized.startswith("/") or normalized.startswith("-") or ".." in Path(normalized).parts:
+        raise ToolError(f"unsafe git path: {path}")
+    return normalized
+
+
 class GitTool:
     def __init__(
         self,
@@ -110,6 +117,44 @@ class GitTool:
         if not result.ok:
             raise ToolError(result.stderr or "git diff --name-only failed")
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    def show_file(self, ref: str, path: str) -> str:
+        if ref.startswith("-") or ".." in ref:
+            raise ToolError("unsafe git ref")
+        safe_path = _safe_relative_path(path)
+        result = self._git(["show", f"{ref}:{safe_path}"])
+        if not result.ok:
+            raise ToolError(result.stderr or f"git show failed for {ref}:{safe_path}")
+        return result.stdout
+
+    def commit_log(self, base: str, head: str = "HEAD", *, max_count: int = 20) -> list[dict[str, str]]:
+        if base.startswith("-") or head.startswith("-") or ".." in base or ".." in head:
+            raise ToolError("unsafe git ref")
+        result = self._git(
+            [
+                "log",
+                f"--max-count={max_count}",
+                "--format=%H%x1f%an%x1f%ae%x1f%s",
+                f"{base}..{head}",
+            ]
+        )
+        if not result.ok:
+            raise ToolError(result.stderr or "git log failed")
+        commits: list[dict[str, str]] = []
+        for line in result.stdout.splitlines():
+            parts = line.split("\x1f")
+            if len(parts) != 4:
+                continue
+            sha, author_name, author_email, subject = parts
+            commits.append(
+                {
+                    "sha": sha,
+                    "author_name": author_name,
+                    "author_email": author_email,
+                    "subject": subject,
+                }
+            )
+        return commits
 
     def diff_stats(self, base: str = "HEAD", protected_paths: list[str] | None = None) -> DiffStats:
         result = self._git(["diff", "--numstat", base])
