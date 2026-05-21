@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol, TextIO
@@ -46,6 +47,20 @@ CRONJOBS = {
     "action": "agentlab-scheduler-action",
     "plan": "agentlab-scheduler-plan",
     "watch": "agentlab-scheduler-watch",
+}
+
+CRONJOB_MANIFESTS = {
+    "review-comments": "cronjob-scheduler-review-comments.yaml",
+    "action": "cronjob-scheduler-action.yaml",
+    "plan": "cronjob-scheduler-plan.yaml",
+    "watch": "cronjob-scheduler-watch.yaml",
+}
+
+CRONJOB_DEFAULT_CRONS = {
+    "review-comments": "*/10 * * * *",
+    "action": "30 2 * * *",
+    "plan": "0 7,19 * * *",
+    "watch": "*/30 * * * *",
 }
 
 
@@ -468,6 +483,11 @@ class K8sOperator:
 
         if apply:
             self._run(["apply", "-k", str(self.manifest_dir)])
+            for manifest in updated["enabled_cronjob_manifests"]:
+                path = self.manifest_dir / manifest
+                if not path.exists():
+                    raise K8sOperatorError(f"enabled CronJob manifest is missing after upgrade: {path}")
+                self._run(["apply", "-f", str(path)])
             report.applied = True
             if show_status or apply:
                 report.status_checked = True
@@ -624,6 +644,10 @@ def update_generated_manifests(
         preserved_sections = _merge_preserved_config_sections(config, preserved_config)
     config["auto_merge_enabled"] = False
     config["direct_main_push_enabled"] = False
+    enabled_cronjob_manifests = _enabled_cronjob_manifest_names(config)
+    for manifest in _ensure_enabled_cronjob_manifests(manifest_dir, config):
+        if manifest not in updated_manifests:
+            updated_manifests.append(manifest)
     data = configmap.setdefault("data", {})
     data["config.yaml"] = yaml.safe_dump(config, sort_keys=False)
     _write_yaml_file(configmap_path, configmap)
@@ -633,11 +657,16 @@ def update_generated_manifests(
         document = _load_yaml_file(path)
         if _set_manifest_image(document, image):
             _write_yaml_file(path, document)
-            updated_manifests.append(path.name)
+            if path.name not in updated_manifests:
+                updated_manifests.append(path.name)
 
-    if _ensure_kustomization_includes_cronjobs(manifest_dir):
+    if _ensure_kustomization_includes_cronjobs(manifest_dir, enabled_cronjob_manifests):
         updated_manifests.append("kustomization.yaml")
-    return {"updated_manifests": updated_manifests, "preserved_sections": preserved_sections}
+    return {
+        "updated_manifests": updated_manifests,
+        "preserved_sections": preserved_sections,
+        "enabled_cronjob_manifests": enabled_cronjob_manifests,
+    }
 
 
 def detect_manifest_image_drift(manifest_dir: Path) -> tuple[str | None, list[ManifestImageDrift]]:
@@ -837,6 +866,89 @@ def _merge_preserved_config_sections(target: dict[str, Any], source: dict[str, A
     return preserved
 
 
+def _enabled_cronjob_manifest_names(config: dict[str, Any]) -> list[str]:
+    return [CRONJOB_MANIFESTS[component] for component in _enabled_cronjob_specs(config)]
+
+
+def _enabled_cronjob_specs(config: dict[str, Any]) -> dict[str, str]:
+    schedule = config.get("schedule") or {}
+    if not isinstance(schedule, dict):
+        return {}
+
+    specs: dict[str, str] = {}
+    if bool(schedule.get("enabled", False)):
+        for component in ("watch", "plan", "action"):
+            entry = schedule.get(component) or {}
+            if not isinstance(entry, dict):
+                entry = {}
+            if bool(entry.get("enabled", True)):
+                specs[component] = str(entry.get("cron") or CRONJOB_DEFAULT_CRONS[component])
+
+    review_comments = schedule.get("review_comments") or {}
+    if isinstance(review_comments, dict) and bool(review_comments.get("enabled", False)):
+        specs["review-comments"] = str(review_comments.get("cron") or CRONJOB_DEFAULT_CRONS["review-comments"])
+    return specs
+
+
+def _ensure_enabled_cronjob_manifests(manifest_dir: Path, config: dict[str, Any]) -> list[str]:
+    changed: list[str] = []
+    for component, cron in _enabled_cronjob_specs(config).items():
+        path = manifest_dir / CRONJOB_MANIFESTS[component]
+        if path.exists():
+            document = _load_yaml_file(path)
+            spec = document.setdefault("spec", {})
+            if spec.get("schedule") != cron:
+                spec["schedule"] = cron
+                _write_yaml_file(path, document)
+                changed.append(path.name)
+            continue
+
+        job_path = manifest_dir / RUN_MANIFESTS[component]
+        if not job_path.exists():
+            raise K8sOperatorError(f"missing generated Job manifest for enabled CronJob {component}: {job_path}")
+        cronjob = _cronjob_from_job_manifest(component, cron, _load_yaml_file(job_path))
+        _write_yaml_file(path, cronjob)
+        changed.append(path.name)
+    return changed
+
+
+def _cronjob_from_job_manifest(component: str, cron: str, job: dict[str, Any]) -> dict[str, Any]:
+    job_spec = job.get("spec") or {}
+    template = job_spec.get("template")
+    if not isinstance(template, dict):
+        raise K8sOperatorError(f"Job manifest for enabled CronJob {component} has no pod template")
+
+    job_metadata = job.get("metadata") or {}
+    labels = dict(job_metadata.get("labels") or {})
+    labels.setdefault("app.kubernetes.io/name", "agentlab")
+    labels["app.kubernetes.io/component"] = "scheduler"
+    metadata: dict[str, Any] = {
+        "name": RUN_JOB_NAMES[component],
+        "labels": labels,
+    }
+    if job_metadata.get("namespace"):
+        metadata["namespace"] = job_metadata["namespace"]
+
+    job_template_spec: dict[str, Any] = {"template": deepcopy(template)}
+    for key in ("backoffLimit", "ttlSecondsAfterFinished", "activeDeadlineSeconds"):
+        if key in job_spec:
+            job_template_spec[key] = deepcopy(job_spec[key])
+
+    return {
+        "apiVersion": "batch/v1",
+        "kind": "CronJob",
+        "metadata": metadata,
+        "spec": {
+            "schedule": cron,
+            "concurrencyPolicy": "Forbid",
+            "successfulJobsHistoryLimit": 3,
+            "failedJobsHistoryLimit": 5,
+            "startingDeadlineSeconds": 1800,
+            "jobTemplate": {"spec": job_template_spec},
+        },
+    }
+
+
 def _set_manifest_image(document: dict[str, Any], image: str) -> bool:
     containers = _manifest_containers(document)
     if not containers:
@@ -862,7 +974,7 @@ def _manifest_containers(document: dict[str, Any]) -> list[dict[str, Any]]:
     return [container for container in containers if isinstance(container, dict)]
 
 
-def _ensure_kustomization_includes_cronjobs(manifest_dir: Path) -> bool:
+def _ensure_kustomization_includes_cronjobs(manifest_dir: Path, cronjob_manifests: list[str] | None = None) -> bool:
     path = manifest_dir / "kustomization.yaml"
     if not path.exists():
         return False
@@ -871,9 +983,10 @@ def _ensure_kustomization_includes_cronjobs(manifest_dir: Path) -> bool:
     if not isinstance(resources, list):
         raise K8sOperatorError(f"kustomization resources must be a list: {path}")
     changed = False
-    for cronjob in sorted(manifest_dir.glob("cronjob-*.yaml")):
-        if cronjob.name not in resources:
-            resources.append(cronjob.name)
+    manifests = cronjob_manifests if cronjob_manifests is not None else [path.name for path in manifest_dir.glob("cronjob-*.yaml")]
+    for manifest in sorted(manifests):
+        if manifest not in resources:
+            resources.append(manifest)
             changed = True
     if changed:
         _write_yaml_file(path, document)
