@@ -35,6 +35,7 @@ from agentlab.models import (
     RiskLevel,
     RollbackReport,
     PostMergeMonitorResult,
+    StructuredEditProposal,
     StewardReport,
     SupplyChainReport,
     TaskPlan,
@@ -558,6 +559,7 @@ class Orchestrator:
         feedback: str,
         note_id: int | str,
         changed_files: list[str] | None = None,
+        propose_only: bool = False,
     ) -> dict[str, object]:
         if not source_branch.startswith("agent/"):
             raise RuntimeError("revision source_branch must be an agent/* branch")
@@ -609,6 +611,7 @@ class Orchestrator:
                 "reason": "policy_blocked",
                 "source_branch": source_branch,
                 "command": command,
+                "propose_only": propose_only,
                 "task": task.model_dump(mode="json"),
                 "changed_files": affected_files,
                 "auto_approval": auto_approval_report,
@@ -616,7 +619,7 @@ class Orchestrator:
 
         repo_index, architecture = self.index_repository()
         supply_chain = self.supply_chain() if self.config.supply_chain_enabled else None
-        implementation = ImplementationAgent(
+        implementation_agent = ImplementationAgent(
             self.config,
             git_tool,
             file_tool,
@@ -630,7 +633,53 @@ class Orchestrator:
             },
             artifacts=self.artifacts,
             run_id=self.run_id,
-        ).revise_on_branch(approved_task, source_branch)
+        )
+        if propose_only:
+            implementation = implementation_agent.propose_on_branch(approved_task, source_branch)
+            self.artifacts.write_json("implementation_report", implementation)
+            cleanup = self._ensure_proposal_worktree_clean(git_tool, implementation.changed_files)
+            if not cleanup["clean"]:
+                return {
+                    "run_id": self.run_id,
+                    "status": "failed",
+                    "reason": "proposal_cleanup_failed",
+                    "source_branch": source_branch,
+                    "command": command,
+                    "propose_only": True,
+                    "implementation": implementation.model_dump(mode="json"),
+                    "auto_approval": auto_approval_report,
+                    "cleanup": cleanup,
+                }
+            if implementation.status != ReportStatus.PASSED:
+                return {
+                    "run_id": self.run_id,
+                    "status": "failed",
+                    "reason": "proposal_failed",
+                    "source_branch": source_branch,
+                    "command": command,
+                    "propose_only": True,
+                    "implementation": implementation.model_dump(mode="json"),
+                    "auto_approval": auto_approval_report,
+                    "changed_files": implementation.changed_files,
+                    "proposal_artifacts": _proposal_artifacts_from_report(implementation),
+                }
+            proposal_validation = self._validate_proposal(approved_task, implementation, file_tool)
+            return {
+                "run_id": self.run_id,
+                "status": "passed",
+                "reason": "proposal_generated",
+                "source_branch": source_branch,
+                "command": command,
+                "propose_only": True,
+                "commit_sha": None,
+                "changed_files": implementation.changed_files,
+                "implementation": implementation.model_dump(mode="json"),
+                "auto_approval": auto_approval_report,
+                "proposal_validation": proposal_validation,
+                "proposal_artifacts": _proposal_artifacts_from_report(implementation),
+            }
+
+        implementation = implementation_agent.revise_on_branch(approved_task, source_branch)
         self.artifacts.write_json("implementation_report", implementation)
         if implementation.status != ReportStatus.PASSED:
             return {
@@ -656,6 +705,140 @@ class Orchestrator:
             "auto_approval": auto_approval_report,
             "gate": gate.model_dump(mode="json"),
         }
+
+    def _validate_proposal(
+        self,
+        task: AgentTask,
+        implementation: ImplementationReport,
+        file_tool: FileTool,
+    ) -> dict[str, Any]:
+        proposed_diff = self._artifact_text("proposed.diff")
+        risk = assess_risk(task, implementation.changed_files, proposed_diff)
+        blockers: list[str] = []
+        checks: dict[str, str] = {
+            "risk": "failed" if risk.blocked else "passed",
+            "docs_check": "skipped",
+            "structure_evidence_check": "skipped",
+        }
+        if risk.blocked:
+            blockers.extend(risk.reasons or ["risk assessment blocked proposed patch"])
+
+        proposal_report = self._artifact_json("structured_proposal_report.json")
+        if int(proposal_report.get("added_lines") or 0) > self.config.max_added_lines:
+            checks["added_lines_under_limit"] = "failed"
+            blockers.append("too many added lines")
+        else:
+            checks["added_lines_under_limit"] = "passed"
+        if int(proposal_report.get("deleted_lines") or 0) > self.config.max_deleted_lines:
+            checks["deleted_lines_under_limit"] = "failed"
+            blockers.append("too many deleted lines")
+        else:
+            checks["deleted_lines_under_limit"] = "passed"
+        if len(implementation.changed_files) > self.config.max_changed_files:
+            checks["changed_files_under_limit"] = "failed"
+            blockers.append("too many changed files")
+        else:
+            checks["changed_files_under_limit"] = "passed"
+        touched_protected = proposal_report.get("touched_protected_paths")
+        if isinstance(touched_protected, list) and touched_protected:
+            checks["no_protected_paths"] = "failed"
+            blockers.append("protected paths touched: " + ", ".join(str(path) for path in touched_protected))
+        else:
+            checks["no_protected_paths"] = "passed"
+        if proposal_report.get("sensitive_content_detected") is True:
+            checks["sensitive_content_absent"] = "failed"
+            blockers.append("secrets touched")
+        else:
+            checks["sensitive_content_absent"] = "passed"
+
+        docs_check = None
+        if is_readme_only(implementation.changed_files):
+            proposed_contents = self._proposal_content_overrides(file_tool)
+            docs_check = DocsCheckAgent(file_tool, self.artifacts, content_overrides=proposed_contents).run(implementation.changed_files)
+            self.artifacts.write_json("docs_check_report", docs_check)
+            checks["docs_check"] = docs_check.docs_check
+            checks["structure_evidence_check"] = docs_check.structure_evidence_check
+            if docs_check.docs_check == "failed":
+                blockers.append("docs check failed")
+            if docs_check.structure_evidence_check == "failed":
+                blockers.append("project structure evidence failed")
+            for finding in docs_check.findings:
+                if finding.blocked and finding.title not in blockers:
+                    blockers.append(finding.title)
+
+        validation = {
+            "status": "failed" if blockers else "passed",
+            "blockers": blockers,
+            "checks": checks,
+            "risk_score": risk.score,
+            "risk_reasons": risk.reasons,
+            "docs_check": docs_check.model_dump(mode="json") if docs_check is not None else None,
+        }
+        self.artifacts.write_json("proposal_validation_report", validation)
+        self._update_structured_proposal_report(implementation, validation)
+        return validation
+
+    def _proposal_content_overrides(self, file_tool: FileTool) -> dict[str, str]:
+        path = self.artifacts.artifacts_dir / "structured_proposal.json"
+        if not path.exists():
+            return {}
+        try:
+            proposal = StructuredEditProposal.model_validate_json(path.read_text(encoding="utf-8"))
+            _, _, proposed_files = file_tool.preview_structured_edits(proposal)
+            return proposed_files
+        except Exception:
+            return {}
+
+    def _ensure_proposal_worktree_clean(self, git_tool: GitTool, changed_files: list[str]) -> dict[str, Any]:
+        dirty_before = git_tool.status_porcelain()
+        if not dirty_before:
+            return {"clean": True, "dirty_before": "", "dirty_after": "", "cleanup_attempted": False}
+        cleanup = git_tool.restore_paths(changed_files)
+        dirty_after = git_tool.status_porcelain()
+        return {
+            "clean": not dirty_after,
+            "dirty_before": dirty_before,
+            "dirty_after": dirty_after,
+            "cleanup_attempted": True,
+            "cleanup_command": cleanup.command,
+            "cleanup_exit_code": cleanup.exit_code,
+            "cleanup_stderr": cleanup.stderr,
+        }
+
+    def _artifact_text(self, name: str) -> str:
+        path = self.artifacts.artifacts_dir / name
+        if not path.exists():
+            return ""
+        try:
+            return path.read_text(encoding="utf-8")
+        except Exception:
+            return ""
+
+    def _artifact_json(self, name: str) -> dict[str, Any]:
+        path = self.artifacts.artifacts_dir / name
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _update_structured_proposal_report(
+        self,
+        implementation: ImplementationReport,
+        proposal_validation: dict[str, Any],
+    ) -> None:
+        payload = self._artifact_json("structured_proposal_report.json")
+        payload.update(
+            {
+                "run_id": self.run_id,
+                "source_branch": implementation.branch,
+                "status": "proposal_validation_" + str(proposal_validation.get("status") or "unknown"),
+                "proposal_validation": proposal_validation,
+            }
+        )
+        self.artifacts.write_json("structured_proposal_report", payload)
 
     def _build_revision_context(
         self,
@@ -819,7 +1002,12 @@ class Orchestrator:
     ) -> AgentTask:
         task_type = _review_task_type(command, affected_files)
         safe_note_id = "".join(char if char.isalnum() else "-" for char in str(note_id)).strip("-") or "note"
-        title = f"Revise MR !{mr_iid} from review comment" if command == "revise" else f"Fix MR !{mr_iid} from review comment"
+        if command == "fix":
+            title = f"Fix MR !{mr_iid} from review comment"
+        elif command in {"propose", "dry-run"}:
+            title = f"Propose MR !{mr_iid} revision from review comment"
+        else:
+            title = f"Revise MR !{mr_iid} from review comment"
         return AgentTask(
             id=f"mr-{mr_iid}-{command}-{safe_note_id}"[:80].strip("-"),
             title=title,
@@ -887,6 +1075,12 @@ def _dedupe_paths(paths: list[str]) -> list[str]:
         seen.add(normalized)
         unique.append(normalized)
     return unique
+
+
+def _proposal_artifacts_from_report(report: ImplementationReport) -> list[str]:
+    wanted = ["structured_proposal.json", "proposed.diff", "structured_proposal_report.json"]
+    present = {str(name) for name in report.patch_artifacts}
+    return [name for name in wanted if name in present]
 
 
 def _feedback_requests_base_readme(feedback: str) -> bool:

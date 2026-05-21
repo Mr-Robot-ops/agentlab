@@ -227,6 +227,18 @@ class GitTool:
             raise ToolError("default branch push must run on default branch")
         return self._git(["push", remote, self.default_branch])
 
+    def restore_paths(self, paths: list[str]) -> CommandResult:
+        safe_paths = [_safe_relative_path(path) for path in paths]
+        if not safe_paths:
+            return CommandResult(command="git restore (skipped)", cwd=str(self.repo_path), exit_code=0)
+        restore = self._git(["restore", "--staged", "--worktree", "--", *safe_paths])
+        clean = self._git(["clean", "-f", "--", *safe_paths])
+        if not restore.ok and not clean.ok:
+            return restore
+        if not clean.ok:
+            return clean
+        return restore if restore.ok else clean
+
     def cherry_pick(self, commit_sha: str, *, no_commit: bool = False, allow_default_branch: bool = False) -> CommandResult:
         if self.current_branch() == self.default_branch and not allow_default_branch:
             raise ToolError("refusing to cherry-pick on default branch")
