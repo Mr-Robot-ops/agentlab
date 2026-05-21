@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from datetime import UTC, datetime
 
 from agentlab.config import AppConfig
 from agentlab.models import AgentTask, RiskLevel, TaskPlan, TaskType
@@ -188,7 +189,7 @@ def test_scheduler_action_skips_limits_and_cooldown(tmp_path: Path) -> None:
     scheduler = HelperScheduler(config(tmp_path), gitlab=FakeGitLab(open_mrs=0))
     state, _ = scheduler.state_store.read()
     state["new_mrs_today"] = 1
-    state["new_mrs_date"] = "2026-05-20"
+    state["new_mrs_date"] = datetime.now(UTC).date().isoformat()
     scheduler.state_store.write(state)
     assert scheduler.action()["reason"] == "daily_mr_limit_reached"
 
