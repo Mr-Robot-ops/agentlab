@@ -74,6 +74,40 @@ agentlab k8s run doctor
 
 The command deletes the fixed-name Job if it already exists, applies the generated manifest from `deploy/kubernetes/generated`, and streams logs by default. It does not generate ad-hoc Job YAML and does not use `/tmp` manifests.
 
+## Upgrade Generated Manifests
+
+Update all generated manifests to a new AgentLab image:
+
+```bash
+agentlab k8s upgrade --image 10.159.21.58:5000/agentlab:0.1.13
+```
+
+Apply the generated manifests after updating them:
+
+```bash
+agentlab k8s upgrade --image 10.159.21.58:5000/agentlab:0.1.13 --apply
+```
+
+Preserve operator-tuned config from the live cluster ConfigMap:
+
+```bash
+agentlab k8s upgrade --image 10.159.21.58:5000/agentlab:0.1.13 --preserve-cluster-config --apply
+```
+
+Preserve operator-tuned config from the local generated `configmap.yaml` when the cluster is not reachable:
+
+```bash
+agentlab k8s upgrade --image 10.159.21.58:5000/agentlab:0.1.13 --preserve-local-config
+```
+
+Run the doctor job and clean stale failed resources after a successful apply:
+
+```bash
+agentlab k8s upgrade --image 10.159.21.58:5000/agentlab:0.1.13 --apply --run-doctor --cleanup-failed
+```
+
+The upgrade command updates `configmap.yaml` annotation `agentlab.io/image`, all generated `job-*.yaml` and `cronjob-*.yaml` container images, and ensures generated CronJobs are included in `kustomization.yaml`. It can preserve `auto_approve`, `schedule`, `schedule.review_comments`, `schedule.limits`, `schedule.behavior`, and `required_test_commands`. It does not preserve image annotations, Secrets, GitLab tokens, `auto_merge_enabled`, or `direct_main_push_enabled`.
+
 ## Artifacts
 
 Show the latest proposed diff:
@@ -121,6 +155,28 @@ agentlab k8s reset-state
 
 This is an alias for running `reset-state` through the generated `job-scheduler-reset-state.yaml` manifest. If the manifest is missing, rerun Kubernetes bootstrap.
 
+## Cleanup Failed Jobs And Pods
+
+Preview old failed AgentLab Jobs and Pods without deleting anything:
+
+```bash
+agentlab k8s cleanup-failed --dry-run
+```
+
+Delete failed AgentLab Jobs and failed AgentLab Pods after confirmation:
+
+```bash
+agentlab k8s cleanup-failed
+```
+
+Skip the confirmation prompt:
+
+```bash
+agentlab k8s cleanup-failed --yes
+```
+
+The cleanup command only targets failed resources in the selected namespace whose names start with `agentlab-`. It never deletes CronJobs, PVCs, Secrets, ConfigMaps, ServiceAccounts, running Pods, active Jobs, completed Pods without failure, or non-AgentLab resources.
+
 ## Suspend And Resume CronJobs
 
 Pause a noisy review-comment CronJob:
@@ -156,6 +212,8 @@ The TUI provides:
 7. CronJob pausieren
 8. CronJob fortsetzen
 9. Artifact shell öffnen
-10. Beenden
+10. Upgrade / reconcile deployment
+11. Cleanup failed resources
+12. Beenden
 
 Mutating actions require confirmation. If no interactive TTY is available, the TUI fails clearly and suggests equivalent non-interactive commands.

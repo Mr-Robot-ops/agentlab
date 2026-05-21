@@ -4,9 +4,11 @@ import json
 from pathlib import Path
 
 import pytest
+import yaml
 
 from agentlab.k8s_operator import (
     ArtifactNotFoundError,
+    FailedResources,
     K8sOperator,
     K8sOperatorError,
     K8sTUI,
@@ -15,6 +17,7 @@ from agentlab.k8s_operator import (
     artifact_path,
     cronjob_for_component,
     detect_manifest_image_drift,
+    format_upgrade_report,
     job_prefix_for_component,
     kubectl_args,
     manifest_for_component,
@@ -65,6 +68,7 @@ class FakeTTY:
 
 class FakeOperator:
     def __init__(self) -> None:
+        self.namespace = "agentlab"
         self.calls: list[tuple[str, object]] = []
 
     def status(self):
@@ -94,6 +98,153 @@ class FakeOperator:
     def shell(self):
         self.calls.append(("shell", None))
         return 0
+
+    def failed_resources(self):
+        self.calls.append(("failed_resources", None))
+        return FailedResources(jobs=["agentlab-failed-job"], pods=["agentlab-failed-pod"])
+
+    def cleanup_failed(self, *, dry_run: bool = False):
+        self.calls.append(("cleanup_failed", dry_run))
+        return type(
+            "Cleanup",
+            (),
+            {
+                "namespace": "agentlab",
+                "deleted_jobs": ["agentlab-failed-job"],
+                "deleted_pods": ["agentlab-failed-pod"],
+                "skipped_resources": [],
+                "dry_run": dry_run,
+            },
+        )()
+
+    def upgrade(self, **kwargs):
+        self.calls.append(("upgrade", kwargs))
+        return type(
+            "Upgrade",
+            (),
+            {
+                "namespace": "agentlab",
+                "manifest_dir": "generated",
+                "image": kwargs["image"],
+                "updated_manifests": ["configmap.yaml"],
+                "preserved_sections": [],
+                "apply": kwargs.get("apply", False),
+                "applied": kwargs.get("apply", False),
+                "run_doctor": kwargs.get("run_doctor", False),
+                "doctor_status": "not requested",
+                "cleanup_failed": kwargs.get("cleanup_failed", False),
+                "cleanup_report": None,
+                "status_checked": False,
+                "image_drift": [],
+            },
+        )()
+
+
+def job_item(name: str, *, failed: int = 0, active: int = 0, succeeded: int = 0) -> dict[str, object]:
+    return {
+        "metadata": {"name": name},
+        "status": {"failed": failed, "active": active, "succeeded": succeeded},
+    }
+
+
+def pod_item(name: str, *, phase: str, reason: str | None = None) -> dict[str, object]:
+    container_status = {}
+    if reason is not None:
+        container_status = {"state": {"terminated": {"reason": reason}}}
+    return {
+        "metadata": {"name": name},
+        "status": {
+            "phase": phase,
+            "containerStatuses": [container_status] if container_status else [],
+        },
+    }
+
+
+def write_upgrade_manifests(path: Path, *, image: str = "registry/agentlab:old") -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "configmap.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "kind": "ConfigMap",
+                "metadata": {
+                    "name": "agentlab-config",
+                    "annotations": {"agentlab.io/image": image},
+                },
+                "data": {
+                    "config.yaml": yaml.safe_dump(
+                        {
+                            "project_id": "group/project",
+                            "target_repo_url": "https://gitlab.local/group/project.git",
+                            "auto_merge_enabled": False,
+                            "direct_main_push_enabled": False,
+                            "schedule": {"enabled": False, "review_comments": {"enabled": False}},
+                            "required_test_commands": [],
+                        },
+                        sort_keys=False,
+                    )
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    for name in (
+        "job-doctor.yaml",
+        "job-scheduler-watch.yaml",
+        "job-scheduler-review-comments.yaml",
+        "job-scheduler-reset-state.yaml",
+    ):
+        (path / name).write_text(
+            yaml.safe_dump(
+                {
+                    "kind": "Job",
+                    "spec": {"template": {"spec": {"containers": [{"name": "agentlab", "image": image}]}}},
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+    for name in ("cronjob-scheduler-watch.yaml", "cronjob-scheduler-review-comments.yaml"):
+        (path / name).write_text(
+            yaml.safe_dump(
+                {
+                    "kind": "CronJob",
+                    "spec": {
+                        "jobTemplate": {
+                            "spec": {
+                                "template": {
+                                    "spec": {"containers": [{"name": "agentlab", "image": image}]}
+                                }
+                            }
+                        }
+                    },
+                },
+                sort_keys=False,
+            ),
+            encoding="utf-8",
+        )
+    (path / "kustomization.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "kind": "Kustomization",
+                "resources": ["configmap.yaml"],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def manifest_image(path: Path) -> str:
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if document["kind"] == "CronJob":
+        return document["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]["image"]
+    return document["spec"]["template"]["spec"]["containers"][0]["image"]
+
+
+def configmap_config(path: Path) -> dict[str, object]:
+    configmap = yaml.safe_load((path / "configmap.yaml").read_text(encoding="utf-8"))
+    return yaml.safe_load(configmap["data"]["config.yaml"])
 
 
 def test_component_mappings() -> None:
@@ -269,6 +420,327 @@ spec:
     assert drifts[0].path == "job-scheduler-action.yaml"
 
 
+def test_upgrade_updates_configmap_annotation_and_all_workload_images(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path)
+
+    report = K8sOperator(manifest_dir=tmp_path, runner=FakeRunner()).upgrade(image="registry/agentlab:new")
+
+    configmap = yaml.safe_load((tmp_path / "configmap.yaml").read_text(encoding="utf-8"))
+    assert configmap["metadata"]["annotations"]["agentlab.io/image"] == "registry/agentlab:new"
+    for path in [*tmp_path.glob("job-*.yaml"), *tmp_path.glob("cronjob-*.yaml")]:
+        assert manifest_image(path) == "registry/agentlab:new"
+    assert "job-scheduler-reset-state.yaml" in report.updated_manifests
+    assert "cronjob-scheduler-review-comments.yaml" in report.updated_manifests
+    assert report.image_drift == []
+
+
+def test_upgrade_preserves_selected_local_config_sections(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path)
+    configmap = yaml.safe_load((tmp_path / "configmap.yaml").read_text(encoding="utf-8"))
+    config = yaml.safe_load(configmap["data"]["config.yaml"])
+    config["auto_approve"] = {"enabled": True, "allowed_paths": ["README.md"]}
+    config["schedule"] = {
+        "enabled": True,
+        "review_comments": {"enabled": True, "cron": "*/1 * * * *"},
+        "limits": {"max_daily_mrs": 3},
+        "behavior": {"skip_if_open_agent_mr_exists": False},
+    }
+    config["required_test_commands"] = ["python -m pytest"]
+    config["auto_merge_enabled"] = True
+    configmap["metadata"]["annotations"]["agentlab.io/image"] = "registry/agentlab:old"
+    configmap["data"]["config.yaml"] = yaml.safe_dump(config, sort_keys=False)
+    (tmp_path / "configmap.yaml").write_text(yaml.safe_dump(configmap, sort_keys=False), encoding="utf-8")
+
+    report = K8sOperator(manifest_dir=tmp_path, runner=FakeRunner()).upgrade(
+        image="registry/agentlab:new",
+        preserve_local_config=True,
+    )
+
+    new_configmap = yaml.safe_load((tmp_path / "configmap.yaml").read_text(encoding="utf-8"))
+    merged = yaml.safe_load(new_configmap["data"]["config.yaml"])
+    assert new_configmap["metadata"]["annotations"]["agentlab.io/image"] == "registry/agentlab:new"
+    assert merged["auto_approve"] == {"enabled": True, "allowed_paths": ["README.md"]}
+    assert merged["schedule"]["review_comments"]["enabled"] is True
+    assert merged["schedule"]["limits"]["max_daily_mrs"] == 3
+    assert merged["schedule"]["behavior"]["skip_if_open_agent_mr_exists"] is False
+    assert merged["required_test_commands"] == ["python -m pytest"]
+    assert merged["auto_merge_enabled"] is False
+    assert merged["direct_main_push_enabled"] is False
+    assert "auto_approve" in report.preserved_sections
+    assert "schedule.review_comments" in report.preserved_sections
+    assert "schedule.limits" in report.preserved_sections
+    assert "schedule.behavior" in report.preserved_sections
+
+
+def test_upgrade_preserves_cluster_config_and_rejects_conflicting_preserve_sources(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path)
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"],
+        json.dumps(
+            {
+                "data": {
+                    "config.yaml": yaml.safe_dump(
+                        {
+                            "auto_approve": {"enabled": True},
+                            "schedule": {"review_comments": {"enabled": True}},
+                        },
+                        sort_keys=False,
+                    )
+                }
+            }
+        ),
+    )
+
+    K8sOperator(manifest_dir=tmp_path, runner=runner).upgrade(
+        image="registry/agentlab:new",
+        preserve_cluster_config=True,
+    )
+
+    assert configmap_config(tmp_path)["auto_approve"]["enabled"] is True
+    with pytest.raises(K8sOperatorError, match="Choose either"):
+        K8sOperator(manifest_dir=tmp_path, runner=runner).upgrade(
+            image="registry/agentlab:new",
+            preserve_cluster_config=True,
+            preserve_local_config=True,
+        )
+
+
+def test_upgrade_fails_if_manifest_dir_missing(tmp_path: Path) -> None:
+    with pytest.raises(K8sOperatorError, match="manifest dir is missing"):
+        K8sOperator(manifest_dir=tmp_path / "missing", runner=FakeRunner()).upgrade(image="registry/agentlab:new")
+
+
+def test_upgrade_detects_manifest_image_drift_after_update(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path)
+    (tmp_path / "custom.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "kind": "Job",
+                "spec": {"template": {"spec": {"containers": [{"image": "registry/agentlab:old"}]}}},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    report = K8sOperator(manifest_dir=tmp_path, runner=FakeRunner()).upgrade(image="registry/agentlab:new")
+
+    assert report.image_drift == ["custom.yaml: registry/agentlab:old != registry/agentlab:new"]
+
+
+def test_upgrade_dry_run_does_not_apply_but_apply_does(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path)
+    runner = FakeRunner()
+
+    K8sOperator(manifest_dir=tmp_path, runner=runner).upgrade(image="registry/agentlab:new")
+
+    assert not any(call[0][2:4] == ["apply", "-k"] for call in runner.calls)
+
+    K8sOperator(manifest_dir=tmp_path, runner=runner).upgrade(image="registry/agentlab:new", apply=True)
+
+    assert ["-n", "agentlab", "apply", "-k", str(tmp_path)] in [call[0] for call in runner.calls]
+
+
+def test_upgrade_run_doctor_and_cleanup_after_successful_apply(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path)
+    runner = FakeRunner()
+    runner.respond(["-n", "agentlab", "get", "jobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(["-n", "agentlab", "get", "pods", "-o", "json"], json.dumps({"items": []}))
+
+    report = K8sOperator(manifest_dir=tmp_path, runner=runner).upgrade(
+        image="registry/agentlab:new",
+        apply=True,
+        run_doctor=True,
+        cleanup_failed=True,
+    )
+
+    calls = [call[0] for call in runner.calls]
+    assert ["-n", "agentlab", "delete", "job", "agentlab-doctor", "--ignore-not-found=true"] in calls
+    assert ["-n", "agentlab", "apply", "-f", str(tmp_path / "job-doctor.yaml")] in calls
+    assert report.doctor_status == "completed"
+    assert report.cleanup_report is not None
+
+
+def test_format_upgrade_report_mentions_drift() -> None:
+    rendered = format_upgrade_report(
+        type(
+            "Upgrade",
+            (),
+            {
+                "namespace": "agentlab",
+                "manifest_dir": "generated",
+                "image": "image:new",
+                "updated_manifests": ["configmap.yaml"],
+                "preserved_sections": ["auto_approve"],
+                "apply": True,
+                "applied": False,
+                "run_doctor": True,
+                "doctor_status": "warning",
+                "cleanup_failed": True,
+                "cleanup_report": None,
+                "image_drift": ["cronjob old image"],
+            },
+        )()
+    )
+
+    assert "AgentLab Kubernetes upgrade plan" in rendered
+    assert "- image drift: cronjob old image" in rendered
+
+
+def test_failed_agentlab_job_is_selected() -> None:
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "jobs", "-o", "json"],
+        json.dumps({"items": [job_item("agentlab-failed", failed=1)]}),
+    )
+    runner.respond(["-n", "agentlab", "get", "pods", "-o", "json"], json.dumps({"items": []}))
+
+    resources = K8sOperator(runner=runner).failed_resources()
+
+    assert resources.jobs == ["agentlab-failed"]
+
+
+def test_non_agentlab_failed_job_is_ignored() -> None:
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "jobs", "-o", "json"],
+        json.dumps({"items": [job_item("other-failed", failed=1)]}),
+    )
+    runner.respond(["-n", "agentlab", "get", "pods", "-o", "json"], json.dumps({"items": []}))
+
+    resources = K8sOperator(runner=runner).failed_resources()
+
+    assert resources.jobs == []
+    assert resources.skipped_resources == ["job/other-failed: not an AgentLab resource"]
+
+
+def test_active_agentlab_job_is_ignored() -> None:
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "jobs", "-o", "json"],
+        json.dumps({"items": [job_item("agentlab-active", failed=1, active=1)]}),
+    )
+    runner.respond(["-n", "agentlab", "get", "pods", "-o", "json"], json.dumps({"items": []}))
+
+    resources = K8sOperator(runner=runner).failed_resources()
+
+    assert resources.jobs == []
+    assert resources.skipped_resources == ["job/agentlab-active: still active"]
+
+
+def test_failed_agentlab_pod_is_selected() -> None:
+    runner = FakeRunner()
+    runner.respond(["-n", "agentlab", "get", "jobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(
+        ["-n", "agentlab", "get", "pods", "-o", "json"],
+        json.dumps({"items": [pod_item("agentlab-failed-pod", phase="Failed")]}),
+    )
+
+    resources = K8sOperator(runner=runner).failed_resources()
+
+    assert resources.pods == ["agentlab-failed-pod"]
+
+
+def test_agentlab_pod_with_error_reason_is_selected() -> None:
+    runner = FakeRunner()
+    runner.respond(["-n", "agentlab", "get", "jobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(
+        ["-n", "agentlab", "get", "pods", "-o", "json"],
+        json.dumps({"items": [pod_item("agentlab-error-pod", phase="Unknown", reason="Error")]}),
+    )
+
+    resources = K8sOperator(runner=runner).failed_resources()
+
+    assert resources.pods == ["agentlab-error-pod"]
+
+
+def test_running_agentlab_pod_is_ignored() -> None:
+    runner = FakeRunner()
+    runner.respond(["-n", "agentlab", "get", "jobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(
+        ["-n", "agentlab", "get", "pods", "-o", "json"],
+        json.dumps({"items": [pod_item("agentlab-running-pod", phase="Running", reason="Error")]}),
+    )
+
+    resources = K8sOperator(runner=runner).failed_resources()
+
+    assert resources.pods == []
+    assert resources.skipped_resources == ["pod/agentlab-running-pod: still running"]
+
+
+def test_completed_pod_without_failure_is_ignored() -> None:
+    runner = FakeRunner()
+    runner.respond(["-n", "agentlab", "get", "jobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(
+        ["-n", "agentlab", "get", "pods", "-o", "json"],
+        json.dumps({"items": [pod_item("agentlab-complete-pod", phase="Succeeded", reason="Completed")]}),
+    )
+
+    resources = K8sOperator(runner=runner).failed_resources()
+
+    assert resources.pods == []
+
+
+def test_cleanup_failed_dry_run_does_not_delete() -> None:
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "jobs", "-o", "json"],
+        json.dumps({"items": [job_item("agentlab-failed", failed=1)]}),
+    )
+    runner.respond(
+        ["-n", "agentlab", "get", "pods", "-o", "json"],
+        json.dumps({"items": [pod_item("agentlab-failed-pod", phase="Failed")]}),
+    )
+
+    report = K8sOperator(runner=runner).cleanup_failed(dry_run=True)
+
+    assert report.dry_run is True
+    assert report.deleted_jobs == ["agentlab-failed"]
+    assert report.deleted_pods == ["agentlab-failed-pod"]
+    assert not any(call[0][2:4] == ["delete", "job"] for call in runner.calls)
+    assert not any(call[0][2:4] == ["delete", "pod"] for call in runner.calls)
+
+
+def test_cleanup_failed_deletes_only_selected_agentlab_jobs_and_pods() -> None:
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "jobs", "-o", "json"],
+        json.dumps(
+            {
+                "items": [
+                    job_item("agentlab-failed", failed=1),
+                    job_item("agentlab-active", failed=1, active=1),
+                    job_item("other-failed", failed=1),
+                ]
+            }
+        ),
+    )
+    runner.respond(
+        ["-n", "agentlab", "get", "pods", "-o", "json"],
+        json.dumps(
+            {
+                "items": [
+                    pod_item("agentlab-failed-pod", phase="Failed"),
+                    pod_item("agentlab-running-pod", phase="Running"),
+                    pod_item("other-failed-pod", phase="Failed"),
+                ]
+            }
+        ),
+    )
+
+    report = K8sOperator(runner=runner).cleanup_failed()
+
+    assert report.deleted_jobs == ["agentlab-failed"]
+    assert report.deleted_pods == ["agentlab-failed-pod"]
+    delete_calls = [call[0] for call in runner.calls if "delete" in call[0]]
+    assert delete_calls == [
+        ["-n", "agentlab", "delete", "job", "agentlab-failed"],
+        ["-n", "agentlab", "delete", "pod", "agentlab-failed-pod"],
+    ]
+    assert not any(resource in call for call in delete_calls for resource in ("cronjob", "pvc", "configmap", "secret", "serviceaccount"))
+
+
 def test_tui_action_mapping_calls_same_operator_helpers() -> None:
     operator = FakeOperator()
     answers = iter(["3"])
@@ -282,6 +754,51 @@ def test_tui_action_mapping_calls_same_operator_helpers() -> None:
     tui.run_once("4")
 
     assert operator.calls == [("run_component", ("action", True))]
+
+
+def test_tui_cleanup_failed_maps_to_same_helper() -> None:
+    operator = FakeOperator()
+    tui = K8sTUI(
+        operator,  # type: ignore[arg-type]
+        input_func=lambda _prompt: "",
+        output_func=lambda _text: None,
+        confirm_func=lambda _message: True,
+    )
+
+    tui.run_once("11")
+
+    assert operator.calls == [
+        ("failed_resources", None),
+        ("cleanup_failed", False),
+    ]
+
+
+def test_tui_upgrade_action_calls_same_upgrade_helper() -> None:
+    operator = FakeOperator()
+    answers = iter(["registry/agentlab:new", "2"])
+    confirmations = iter([True, True, True])
+    tui = K8sTUI(
+        operator,  # type: ignore[arg-type]
+        input_func=lambda _prompt: next(answers),
+        output_func=lambda _text: None,
+        confirm_func=lambda _message: next(confirmations),
+    )
+
+    tui.run_once("10")
+
+    assert operator.calls == [
+        (
+            "upgrade",
+            {
+                "image": "registry/agentlab:new",
+                "apply": True,
+                "preserve_local_config": True,
+                "preserve_cluster_config": False,
+                "run_doctor": True,
+                "cleanup_failed": True,
+            },
+        )
+    ]
 
 
 def test_tui_non_interactive_fallback() -> None:
