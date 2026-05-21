@@ -276,6 +276,10 @@ def test_kubernetes_bootstrap_generates_scheduler_cronjobs_when_enabled(tmp_path
     config = config_from_configmap(out)
     assert config["schedule"]["enabled"] is True
     assert config["schedule"]["watch"]["cron"] == "*/15 * * * *"
+    kustomization = yaml.safe_load((out / "kustomization.yaml").read_text(encoding="utf-8"))
+    assert {"cronjob-scheduler-watch.yaml", "cronjob-scheduler-plan.yaml", "cronjob-scheduler-action.yaml"}.issubset(
+        set(kustomization["resources"])
+    )
 
 
 def test_kubernetes_bootstrap_generates_manual_scheduler_jobs(tmp_path):
@@ -356,6 +360,8 @@ def test_kubernetes_bootstrap_generates_review_comment_cronjob_when_enabled(tmp_
     assert config["schedule"]["review_comments"]["enabled"] is True
     assert config["schedule"]["review_comments"]["cron"] == "*/1 * * * *"
     assert config["schedule"]["review_comments"]["process_history"] is False
+    kustomization = yaml.safe_load((out / "kustomization.yaml").read_text(encoding="utf-8"))
+    assert "cronjob-scheduler-review-comments.yaml" in kustomization["resources"]
 
 
 def test_review_comment_cronjob_matches_other_scheduler_cronjob_pod_settings(tmp_path):

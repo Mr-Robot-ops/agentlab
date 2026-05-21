@@ -37,6 +37,28 @@ class FakeOperator:
             dry_run=dry_run,
         )
 
+    def upgrade(self, **kwargs):
+        self.calls.append(("upgrade", kwargs))
+        return type(
+            "Upgrade",
+            (),
+            {
+                "namespace": "agentlab",
+                "manifest_dir": "deploy/kubernetes/generated",
+                "image": kwargs["image"],
+                "updated_manifests": ["configmap.yaml", "job-doctor.yaml"],
+                "preserved_sections": ["auto_approve"] if kwargs.get("preserve_local_config") else [],
+                "apply": kwargs.get("apply", False),
+                "applied": kwargs.get("apply", False),
+                "run_doctor": kwargs.get("run_doctor", False),
+                "doctor_status": "not requested",
+                "cleanup_failed": kwargs.get("cleanup_failed", False),
+                "cleanup_report": None,
+                "status_checked": False,
+                "image_drift": [],
+            },
+        )()
+
 
 class EmptyCleanupOperator(FakeOperator):
     def failed_resources(self) -> FailedResources:
@@ -130,3 +152,54 @@ def test_cleanup_failed_prints_when_nothing_found(monkeypatch) -> None:
     assert result.exit_code == 0
     assert "No failed AgentLab resources found." in result.output
     assert fake.calls == [("failed_resources", None)]
+
+
+def test_upgrade_command_invokes_operator_without_apply_by_default(monkeypatch) -> None:
+    fake = FakeOperator()
+    monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
+
+    result = runner.invoke(app, ["k8s", "upgrade", "--image", "registry/agentlab:new"])
+
+    assert result.exit_code == 0
+    assert "AgentLab Kubernetes upgrade plan" in result.output
+    assert fake.calls == [
+        (
+            "upgrade",
+            {
+                "image": "registry/agentlab:new",
+                "apply": False,
+                "preserve_cluster_config": False,
+                "preserve_local_config": False,
+                "run_doctor": False,
+                "show_status": False,
+                "cleanup_failed": False,
+            },
+        )
+    ]
+
+
+def test_upgrade_apply_with_yes_invokes_apply_options(monkeypatch) -> None:
+    fake = FakeOperator()
+    monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
+
+    result = runner.invoke(
+        app,
+        [
+            "k8s",
+            "upgrade",
+            "--image",
+            "registry/agentlab:new",
+            "--apply",
+            "--yes",
+            "--preserve-local-config",
+            "--run-doctor",
+            "--cleanup-failed",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Continue?" not in result.output
+    assert fake.calls[0][1]["apply"] is True
+    assert fake.calls[0][1]["preserve_local_config"] is True
+    assert fake.calls[0][1]["run_doctor"] is True
+    assert fake.calls[0][1]["cleanup_failed"] is True
