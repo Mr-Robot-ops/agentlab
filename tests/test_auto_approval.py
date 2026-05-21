@@ -47,6 +47,8 @@ def test_auto_approve_disabled_does_not_approve_task() -> None:
     assert approved.approved is False
     assert approved == original
     assert report["enabled"] is False
+    assert report["rejected_tasks"][0]["reasons"] == ["auto_approve_disabled"]
+    assert report["rejected_tasks"][0]["details"]["task_type"] == "docs"
 
 
 def test_low_risk_docs_task_on_readme_is_approved() -> None:
@@ -75,7 +77,7 @@ def test_task_over_risk_limit_is_rejected() -> None:
     approved, report = apply_one(task(risk_score=4))
 
     assert approved.approved is False
-    assert report["rejected_tasks"][0]["reasons"] == ["risk_score_above_limit"]
+    assert report["rejected_tasks"][0]["reasons"] == ["risk_score_too_high"]
 
 
 def test_high_or_critical_risk_is_rejected() -> None:
@@ -164,7 +166,7 @@ def test_auto_approval_report_includes_risk_and_type_details() -> None:
     )
 
     rejected = report["rejected_tasks"][0]
-    assert "risk_score_above_limit" in rejected["reasons"]
+    assert "risk_score_too_high" in rejected["reasons"]
     assert "risk_level_too_high" in rejected["reasons"]
     assert "task_type_not_allowed" in rejected["reasons"]
     details = rejected["details"]

@@ -31,12 +31,21 @@ class AutoApprovalPolicy:
                 "policy_name": POLICY_NAME,
                 "policy_version": POLICY_VERSION,
                 "evaluated_tasks": [
-                    {"task_id": task.id, "approved": task.approved, "reasons": ["auto_approve_disabled"]}
+                    {
+                        "task_id": task.id,
+                        "approved": task.approved,
+                        "reasons": ["auto_approve_disabled"],
+                        "details": self._details(task),
+                    }
                     for task in plan.tasks
                 ],
                 "approved_tasks": [task.id for task in plan.tasks if task.approved],
                 "rejected_tasks": [
-                    {"task_id": task.id, "reasons": ["auto_approve_disabled"]}
+                    {
+                        "task_id": task.id,
+                        "reasons": ["auto_approve_disabled"],
+                        "details": self._details(task),
+                    }
                     for task in plan.tasks
                     if not task.approved
                 ],
@@ -96,7 +105,7 @@ class AutoApprovalPolicy:
         if self.config.direct_main_push_enabled or self.config.auto_merge_enabled:
             reasons.append("unsafe_flow_flags_enabled")
         if task.risk_score > self.policy.max_risk_score:
-            reasons.append("risk_score_above_limit")
+            reasons.append("risk_score_too_high")
         if task.risk_level in {RiskLevel.HIGH, RiskLevel.CRITICAL}:
             reasons.append("risk_level_too_high")
         if task.task_type.value not in self.policy.allowed_task_types:

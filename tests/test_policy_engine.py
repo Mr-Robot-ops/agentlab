@@ -6,6 +6,7 @@ from agentlab.models import (
     BuildSecurityReport,
     CommandResult,
     DiffStats,
+    DocsCheckReport,
     Finding,
     FindingSeverity,
     ReportStatus,
@@ -149,3 +150,133 @@ def test_supply_chain_lockfile_policy_blocks_when_required() -> None:
     assert decision.allowed is False
     assert "supply chain analysis did not pass" in decision.blockers
     assert "dependency lockfiles missing: pyproject.toml" in decision.blockers
+
+
+def docs_report(
+    *,
+    docs_check: str = "passed",
+    structure_evidence_check: str = "skipped",
+    findings: list[Finding] | None = None,
+) -> DocsCheckReport:
+    return DocsCheckReport(
+        status=ReportStatus.PASSED if docs_check == "passed" and structure_evidence_check != "failed" else ReportStatus.FAILED,
+        passed=docs_check == "passed" and structure_evidence_check != "failed",
+        checks={
+            "docs_check": docs_check,
+            "structure_evidence_check": structure_evidence_check,
+        },
+        findings=findings or [],
+    )
+
+
+def readme_task() -> AgentTask:
+    return AgentTask(id="docs-readme", title="Docs README", task_type=TaskType.DOCS, approved=True, affected_files=["README.md"])
+
+
+def skipped_tests() -> AgentTestReport:
+    return AgentTestReport(status=ReportStatus.SKIPPED, passed=False, recommendation="README-only change.")
+
+
+def test_readme_only_changes_do_not_require_functional_tests_without_required_commands() -> None:
+    decision = PolicyEngine(config(auto_merge_enabled=True)).evaluate(
+        **inputs(
+            task=readme_task(),
+            diff_stats=DiffStats(changed_files=["README.md"], added_lines=1),
+            functional_tests=skipped_tests(),
+        ),
+        docs_check=docs_report(),
+    )  # type: ignore[arg-type]
+
+    assert decision.allowed is True
+    assert "functional tests did not pass" not in decision.blockers
+    assert decision.policy_checks["functional_tests_passed"] is True
+    assert decision.check_statuses["docs_check"] == "passed"
+    assert decision.check_statuses["structure_evidence_check"] == "skipped"
+
+
+def test_readme_only_changes_still_require_configured_required_tests() -> None:
+    decision = PolicyEngine(config(auto_merge_enabled=True, required_test_commands=["python -m pytest"])).evaluate(
+        **inputs(
+            task=readme_task(),
+            diff_stats=DiffStats(changed_files=["README.md"], added_lines=1),
+            functional_tests=skipped_tests(),
+        ),
+        docs_check=docs_report(),
+    )  # type: ignore[arg-type]
+
+    assert decision.allowed is False
+    assert "required test commands were not executed: python -m pytest" in decision.blockers
+    assert "functional tests did not pass" in decision.blockers
+
+
+def test_failed_docs_check_blocks_readme_only_change() -> None:
+    decision = PolicyEngine(config(auto_merge_enabled=True)).evaluate(
+        **inputs(
+            task=readme_task(),
+            diff_stats=DiffStats(changed_files=["README.md"], added_lines=1),
+            functional_tests=skipped_tests(),
+        ),
+        docs_check=docs_report(docs_check="failed"),
+    )  # type: ignore[arg-type]
+
+    assert decision.allowed is False
+    assert "docs check failed" in decision.blockers
+    assert decision.check_statuses["docs_check"] == "failed"
+
+
+def test_failed_structure_evidence_blocks_readme_only_change() -> None:
+    decision = PolicyEngine(config(auto_merge_enabled=True)).evaluate(
+        **inputs(
+            task=readme_task(),
+            diff_stats=DiffStats(changed_files=["README.md"], added_lines=1),
+            functional_tests=skipped_tests(),
+        ),
+        docs_check=docs_report(
+            structure_evidence_check="failed",
+            findings=[
+                Finding(
+                    tool="docs_check",
+                    severity=FindingSeverity.HIGH,
+                    title="README project structure removes existing files",
+                    blocked=True,
+                )
+            ],
+        ),
+    )  # type: ignore[arg-type]
+
+    assert decision.allowed is False
+    assert "project structure evidence failed" in decision.blockers
+    assert "README project structure removes existing files" in decision.blockers
+    assert decision.check_statuses["structure_evidence_check"] == "failed"
+
+
+def test_broken_readme_docs_check_blocks_readme_only_change() -> None:
+    decision = PolicyEngine(config(auto_merge_enabled=True)).evaluate(
+        **inputs(
+            task=readme_task(),
+            diff_stats=DiffStats(changed_files=["README.md"], added_lines=1),
+            functional_tests=skipped_tests(),
+        ),
+        docs_check=docs_report(
+            docs_check="failed",
+            findings=[
+                Finding(
+                    tool="docs_check",
+                    severity=FindingSeverity.HIGH,
+                    title="Markdown fence is not closed",
+                    blocked=True,
+                )
+            ],
+        ),
+    )  # type: ignore[arg-type]
+
+    assert decision.allowed is False
+    assert "docs check failed" in decision.blockers
+    assert "Markdown fence is not closed" in decision.blockers
+
+
+def test_non_docs_gate_decision_keeps_empty_check_statuses() -> None:
+    decision = PolicyEngine(config(auto_merge_enabled=True)).evaluate(**inputs())  # type: ignore[arg-type]
+
+    assert decision.allowed is True
+    assert decision.check_statuses == {}
