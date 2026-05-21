@@ -74,10 +74,15 @@ class FakeGitTool:
         self.pushed = False
         self.created_branch: str | None = None
         self.pushed_branch: str | None = None
+        self.checked_out: str | None = None
 
     def create_branch(self, branch: str, base: str) -> CommandResult:
         self.created_branch = branch
         return CommandResult(command=f"git checkout -B {branch} {base}", cwd=".", exit_code=0)
+
+    def checkout(self, branch: str) -> CommandResult:
+        self.checked_out = branch
+        return CommandResult(command=f"git checkout {branch}", cwd=".", exit_code=0)
 
     def commit(self, message: str) -> str:
         self.committed = True
@@ -258,6 +263,13 @@ def init_repo(tmp_path: Path, content: str = "# AgentLab\n") -> Path:
     subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     (repo / "README.md").write_text(content, encoding="utf-8")
     return repo
+
+
+def commit_all(repo: Path, message: str = "initial") -> None:
+    subprocess.run(["git", "config", "user.email", "agentlab@example.com"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "AgentLab"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-m", message], cwd=repo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def file_tool_for(repo: Path) -> FileTool:
@@ -901,6 +913,73 @@ def test_successful_structured_edit_pushes_only_when_enabled(tmp_path: Path) -> 
     assert git.committed is True
     assert git.pushed is True
     assert report.pushed is True
+
+
+def test_propose_on_branch_writes_stable_artifacts_without_commit_push_or_dirty_tree(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    commit_all(repo)
+    store = ArtifactStore(tmp_path / "run", "run")
+    cfg = config(repo).model_copy(update={"push_agent_branches_enabled": True})
+    git = FakeGitTool()
+
+    report = ImplementationAgent(
+        cfg,
+        git,
+        FileTool(repo, cfg),
+        FakeOllama([structured_proposal()]),
+        artifacts=store,
+    ).propose_on_branch(docs_task(), "agent/docs")
+
+    assert report.status == ReportStatus.PASSED
+    assert report.applied is False
+    assert report.pushed is False
+    assert report.commit_sha is None
+    assert report.no_changes_committed is True
+    assert report.no_branch_pushed is True
+    assert git.committed is False
+    assert git.pushed is False
+    assert git.checked_out == "agent/docs"
+    assert "structured_proposal.json" in report.patch_artifacts
+    assert "proposed.diff" in report.patch_artifacts
+    assert "structured_proposal_report.json" in report.patch_artifacts
+    assert "+More docs" in read_artifact(store, "proposed.diff")
+    proposal_report = json.loads(read_artifact(store, "structured_proposal_report.json"))
+    assert proposal_report["proposal_artifacts"] == ["structured_proposal.json", "proposed.diff", "structured_proposal_report.json"]
+    assert proposal_report["sensitive_content_detected"] is False
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=repo, check=True, capture_output=True, text=True)
+    assert status.stdout.strip() == ""
+
+
+def test_propose_on_branch_project_structure_evidence_blocks_removed_existing_files(tmp_path: Path) -> None:
+    repo = init_repo(
+        tmp_path,
+        content=(
+            "# AgentLab\n\n## Project Structure\n\n```text\n.\n+-- rust-backend/\n"
+            "    +-- src/\n        +-- routes/\n            +-- health.rs\n```\n"
+        ),
+    )
+    (repo / "rust-backend/src/routes").mkdir(parents=True)
+    (repo / "rust-backend/src/routes/health.rs").write_text("health\n", encoding="utf-8")
+    commit_all(repo)
+    proposed = (repo / "README.md").read_text(encoding="utf-8").replace("            +-- health.rs\n", "")
+    store = ArtifactStore(tmp_path / "run", "run")
+    git = FakeGitTool()
+
+    report = ImplementationAgent(
+        config(repo),
+        git,
+        FileTool(repo, config(repo)),
+        FakeOllama([structure_replace_proposal((repo / "README.md").read_text(encoding="utf-8"), proposed)]),
+        artifacts=store,
+    ).propose_on_branch(docs_task(), "agent/docs")
+
+    assert report.status == ReportStatus.FAILED
+    assert report.failure_reason == "project_structure_validation_failed"
+    assert git.committed is False
+    assert git.pushed is False
+    evidence = json.loads(read_artifact(store, "project_structure_evidence.json"))
+    assert evidence["validation_status"] == "blocked"
+    assert evidence["removed_existing_entries"] == ["rust-backend/src/routes/health.rs"]
 
 
 def test_repeated_runs_use_distinct_agent_branches(tmp_path: Path) -> None:

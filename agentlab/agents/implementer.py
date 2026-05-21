@@ -573,6 +573,149 @@ class ImplementationAgent:
                 implementation_mode=implementation_mode,  # type: ignore[arg-type]
             )
 
+    def propose_on_branch(self, task: AgentTask, branch: str) -> ImplementationReport:
+        errors: list[str] = []
+        patch_artifacts: list[str] = []
+        implementation_mode = "structured_edit" if self._is_docs_task(task) else "patch"
+
+        if not branch.startswith("agent/"):
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                errors=["revision branch must be an agent/* branch"],
+                no_changes_committed=True,
+                no_branch_pushed=True,
+                implementation_mode=implementation_mode,  # type: ignore[arg-type]
+            )
+        if not task.approved:
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                errors=["task is not approved for proposal generation"],
+                no_changes_committed=True,
+                no_branch_pushed=True,
+                implementation_mode=implementation_mode,  # type: ignore[arg-type]
+            )
+
+        try:
+            checkout = self.git_tool.checkout(branch)
+            if not checkout.ok:
+                raise ToolError(checkout.stderr or f"could not checkout revision branch {branch}")
+
+            if implementation_mode == "structured_edit":
+                try:
+                    structured, raw_response = self._structured_proposal(task)
+                except OllamaSchemaValidationError as exc:
+                    patch_artifacts.extend(self._persist_structured_schema_error(exc))
+                    raise StructuredEditSchemaError(self._structured_schema_message(exc.raw_response)) from exc
+                patch_artifacts.extend(self._persist_structured_inputs(raw_response, structured))
+                try:
+                    self._ensure_structured_task_scope(task, structured)
+                    evidence_artifacts = self._validate_readme_project_structure_edit(
+                        task,
+                        structured,
+                        source_branch=branch,
+                        base_ref=self.config.default_branch,
+                    )
+                    patch_artifacts.extend(evidence_artifacts)
+                    diff_stats, proposed_diff, _ = self.file_tool.preview_structured_edits(structured)
+                except Exception as exc:
+                    patch_artifacts.extend(self._project_structure_artifacts_from_error(exc))
+                    patch_artifacts.extend(self._persist_structured_error(exc))
+                    raise StructuredEditApplyError(self._structured_failure_reason(exc), str(exc)) from exc
+                summary = structured.summary
+                expected_tests = structured.expected_tests
+                risk_input = structured.model_dump_json()
+                patch_artifacts.extend(self._persist_proposal_artifacts(structured, proposed_diff, diff_stats))
+            else:
+                proposal, raw_response = self._proposal(task)
+                patch_artifacts.extend(self._persist_patch_inputs(raw_response, proposal))
+                self._ensure_task_scope(task, proposal)
+                diff_stats = self.file_tool.validate_patch(proposal)
+                summary = proposal.summary
+                expected_tests = proposal.expected_tests
+                risk_input = proposal.patch
+                patch_artifacts.extend(self._persist_proposal_artifacts(proposal, proposal.patch, diff_stats))
+
+            risk = assess_risk(task, diff_stats.changed_files, risk_input)
+            if risk.blocked:
+                raise ToolError("risk assessment blocked proposed patch: " + ", ".join(risk.reasons))
+
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.PASSED,
+                applied=False,
+                pushed=False,
+                commit_sha=None,
+                patch_summary=summary,
+                changed_files=diff_stats.changed_files,
+                risk_score=risk.score,
+                tests_recommended=expected_tests,
+                patch_artifacts=patch_artifacts,
+                no_changes_committed=True,
+                no_branch_pushed=True,
+                implementation_mode=implementation_mode,  # type: ignore[arg-type]
+            )
+        except StructuredEditApplyError as exc:
+            errors.append(str(exc))
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                errors=errors,
+                failure_stage="structured_edit_apply",
+                failure_reason=exc.reason,
+                patch_artifacts=patch_artifacts,
+                no_changes_committed=True,
+                no_branch_pushed=True,
+                implementation_mode="structured_edit",
+            )
+        except StructuredEditSchemaError as exc:
+            errors.append(str(exc))
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                errors=errors,
+                failure_stage="structured_edit_schema_validation",
+                failure_reason=exc.reason,
+                patch_artifacts=patch_artifacts,
+                no_changes_committed=True,
+                no_branch_pushed=True,
+                implementation_mode="structured_edit",
+            )
+        except (PatchApplyError, UnifiedDiffValidationError) as exc:
+            errors.append(str(exc))
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                errors=errors,
+                failure_stage="patch_validation",
+                failure_reason=getattr(exc, "reason", "patch_validation_failed"),
+                patch_artifacts=patch_artifacts,
+                no_changes_committed=True,
+                no_branch_pushed=True,
+                implementation_mode=implementation_mode,  # type: ignore[arg-type]
+            )
+        except Exception as exc:
+            errors.append(str(exc))
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                errors=errors,
+                failure_stage="proposal_generation",
+                failure_reason="proposal_generation_failed",
+                patch_artifacts=patch_artifacts,
+                no_changes_committed=True,
+                no_branch_pushed=True,
+                implementation_mode=implementation_mode,  # type: ignore[arg-type]
+            )
+
     def _proposal(self, task: AgentTask) -> tuple[PatchProposal, str]:
         if self.ollama is None:
             raise ToolError("OllamaClient is required for active implementation patches")
@@ -847,6 +990,38 @@ class ImplementationAgent:
             },
         )
         return [record.name]
+
+    def _persist_proposal_artifacts(
+        self,
+        proposal: PatchProposal | StructuredEditProposal,
+        proposed_diff: str,
+        stats: DiffStats,
+    ) -> list[str]:
+        if self.artifacts is None:
+            return []
+        records = []
+        artifact_names = ["proposed.diff", "structured_proposal_report.json"]
+        if isinstance(proposal, StructuredEditProposal):
+            records.append(self.artifacts.write_json("structured_proposal", proposal))
+            artifact_names.insert(0, "structured_proposal.json")
+        records.append(self.artifacts.write_text("proposed.diff", proposed_diff))
+        records.append(
+            self.artifacts.write_json(
+                "structured_proposal_report",
+                {
+                    "status": "generated",
+                    "summary": proposal.summary,
+                    "changed_files": stats.changed_files,
+                    "added_lines": stats.added_lines,
+                    "deleted_lines": stats.deleted_lines,
+                    "secrets_touched": stats.secrets_touched,
+                    "sensitive_content_detected": stats.secrets_touched,
+                    "touched_protected_paths": stats.touched_protected_paths,
+                    "proposal_artifacts": artifact_names,
+                },
+            )
+        )
+        return [record.name for record in records]
 
     def _persist_structured_error(
         self,

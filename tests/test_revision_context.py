@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from agentlab.config import AppConfig
-from agentlab.models import AgentTask, GateDecision, ImplementationReport, ReportStatus
+from agentlab.models import AgentTask, CommandResult, GateDecision, ImplementationReport, ReportStatus
 from agentlab.orchestrator import Orchestrator
 
 
@@ -88,6 +88,47 @@ class CapturingImplementationAgent:
         )
 
 
+class CapturingProposalImplementationAgent:
+    captured: dict[str, Any] = {}
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.artifacts = kwargs["artifacts"]
+        CapturingProposalImplementationAgent.captured["repo_context"] = kwargs.get("repo_context", {})
+
+    def propose_on_branch(self, task: AgentTask, branch: str) -> ImplementationReport:
+        CapturingProposalImplementationAgent.captured["task"] = task
+        CapturingProposalImplementationAgent.captured["branch"] = branch
+        self.artifacts.write_text("proposed.diff", "diff --git a/README.md b/README.md\n")
+        self.artifacts.write_json(
+            "structured_proposal_report",
+            {
+                "status": "generated",
+                "changed_files": ["README.md"],
+                "added_lines": 1,
+                "deleted_lines": 0,
+                "secrets_touched": False,
+                "touched_protected_paths": [],
+                "proposal_artifacts": ["proposed.diff", "structured_proposal_report.json"],
+            },
+        )
+        return ImplementationReport(
+            task_id=task.id,
+            branch=branch,
+            status=ReportStatus.PASSED,
+            applied=False,
+            pushed=False,
+            commit_sha=None,
+            changed_files=["README.md"],
+            patch_artifacts=["proposed.diff", "structured_proposal_report.json"],
+            no_changes_committed=True,
+            no_branch_pushed=True,
+            implementation_mode="structured_edit",
+        )
+
+    def revise_on_branch(self, task: AgentTask, branch: str) -> ImplementationReport:
+        raise AssertionError("propose-only must not use the real revision path")
+
+
 def test_agent_revise_context_includes_base_and_mr_readme(monkeypatch, tmp_path: Path) -> None:
     repo = make_revision_repo(tmp_path)
     cfg = config(tmp_path, repo)
@@ -147,3 +188,61 @@ def test_agent_revise_context_includes_base_and_mr_readme(monkeypatch, tmp_path:
     assert captured_context["structured_diff_summary"][0]["base_branch_block"]
     assert CapturingImplementationAgent.captured["task"].metadata["changed_files"] == ["README.md", "docs/new.md"]
     assert revision_task["metadata"]["changed_files"] == ["README.md", "docs/new.md"]
+
+
+def test_agent_propose_only_uses_revision_context_without_gate_claim(monkeypatch, tmp_path: Path) -> None:
+    repo = make_revision_repo(tmp_path)
+    cfg = config(tmp_path, repo)
+
+    monkeypatch.setattr("agentlab.orchestrator.ImplementationAgent", CapturingProposalImplementationAgent)
+    monkeypatch.setattr(
+        Orchestrator,
+        "review_and_gate",
+        lambda self, task, direct_main_push=False: (_ for _ in ()).throw(AssertionError("gate must not run for propose-only")),
+    )
+
+    orchestrator = Orchestrator(cfg, run_id="proposal-run")
+    result = orchestrator.revise_existing_mr(
+        mr_iid=15,
+        source_branch="agent/docs",
+        command="propose",
+        feedback="Bitte nur vorschlagen.",
+        note_id=2,
+        changed_files=["README.md"],
+        propose_only=True,
+    )
+
+    assert result["status"] == "passed"
+    assert result["reason"] == "proposal_generated"
+    assert result["propose_only"] is True
+    assert result["commit_sha"] is None
+    assert result["proposal_validation"]["status"] == "passed"
+    assert "gate" not in result
+    assert CapturingProposalImplementationAgent.captured["branch"] == "agent/docs"
+    assert CapturingProposalImplementationAgent.captured["task"].metadata["revision_context"]
+
+
+class DirtyAfterRestoreGit:
+    def __init__(self) -> None:
+        self.restored: list[str] = []
+        self.calls = 0
+
+    def status_porcelain(self) -> str:
+        self.calls += 1
+        return " M README.md"
+
+    def restore_paths(self, paths: list[str]) -> CommandResult:
+        self.restored = paths
+        return CommandResult(command="git restore", cwd=".", exit_code=0)
+
+
+def test_propose_cleanup_failure_reports_unclean_worktree(tmp_path: Path) -> None:
+    repo = make_revision_repo(tmp_path)
+    orchestrator = Orchestrator(config(tmp_path, repo), run_id="cleanup-run")
+    git = DirtyAfterRestoreGit()
+
+    cleanup = orchestrator._ensure_proposal_worktree_clean(git, ["README.md"])  # type: ignore[arg-type]
+
+    assert cleanup["clean"] is False
+    assert cleanup["cleanup_attempted"] is True
+    assert git.restored == ["README.md"]

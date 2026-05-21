@@ -276,7 +276,8 @@ class Scheduler:
                         state_warning=warning,
                     )
 
-                if parsed.command in {"revise", "fix"} and stopped_key in state.get("stopped_mrs", {}):
+                revision_command = _is_revision_command(parsed.command, parsed.propose_only)
+                if revision_command and stopped_key in state.get("stopped_mrs", {}):
                     response = "AgentLab ignored this revision command because this MR is stopped. Use `/agent resume` first."
                     return self._post_and_finish(
                         gitlab,
@@ -293,7 +294,7 @@ class Scheduler:
                         state_warning=warning,
                     )
 
-                if parsed.command in {"revise", "fix"} and self._review_cooldown_active(state, stopped_key):
+                if revision_command and self._review_cooldown_active(state, stopped_key):
                     cooldown_until = state.get("review_comment_cooldowns", {}).get(stopped_key)
                     response = f"AgentLab skipped this revision command because the MR review-comment cooldown is active until `{cooldown_until}`."
                     return self._post_and_finish(
@@ -389,7 +390,14 @@ class Scheduler:
                         state_warning=warning,
                     )
 
-                revision = self._run_revision(gitlab, mr_info, parsed.command, parsed.feedback, note_id)
+                revision = self._run_revision(
+                    gitlab,
+                    mr_info,
+                    parsed.command,
+                    parsed.feedback,
+                    note_id,
+                    propose_only=parsed.propose_only,
+                )
                 response = self._revision_response(parsed.command, revision)
                 status = "passed" if revision.get("status") == "passed" else "failed"
                 reason = str(revision.get("reason") or "revision_failed")
@@ -592,6 +600,8 @@ class Scheduler:
         command: str,
         feedback: str,
         note_id: int | str,
+        *,
+        propose_only: bool = False,
     ) -> dict[str, Any]:
         mr_iid = int(mr_info["iid"])
         try:
@@ -603,6 +613,7 @@ class Scheduler:
                 feedback=feedback,
                 note_id=note_id,
                 changed_files=changed_files,
+                propose_only=propose_only,
             )
             return result
         except Exception as exc:
@@ -612,6 +623,7 @@ class Scheduler:
                 "reason": "revision_failed",
                 "source_branch": mr_info["source_branch"],
                 "command": command,
+                "propose_only": propose_only,
                 "error": str(exc),
             }
 
@@ -675,6 +687,8 @@ class Scheduler:
         if revision.get("reason") == "policy_blocked":
             auto = revision.get("auto_approval") if isinstance(revision.get("auto_approval"), dict) else {}
             return _policy_blocked_response(auto, revision, self.config)
+        if revision.get("propose_only") or revision.get("reason") == "proposal_generated":
+            return _proposal_response(command, revision, self.run_id)
         if revision.get("status") != "passed":
             return (
                 "AgentLab could not apply this request.\n\n"
@@ -732,6 +746,10 @@ def _mr_created(result: dict[str, Any]) -> bool:
     return isinstance(mr, dict) and mr.get("status") == "created"
 
 
+def _is_revision_command(command: str, propose_only: bool = False) -> bool:
+    return propose_only or command in {"revise", "fix"}
+
+
 def _gate_status(gate: Any) -> str:
     if not isinstance(gate, dict):
         return "unknown"
@@ -742,6 +760,47 @@ def _gate_status(gate: Any) -> str:
     if gate.get("allowed") is False:
         return "blocked"
     return "unknown"
+
+
+def _proposal_response(command: str, revision: dict[str, Any], run_id: str) -> str:
+    if revision.get("status") != "passed":
+        return (
+            "AgentLab could not generate a proposed revision.\n\n"
+            f"Reason: {revision.get('reason') or 'proposal_failed'}\n"
+            "Commit: none\n"
+            "Push: skipped"
+        )
+
+    changed = revision.get("changed_files") or []
+    artifacts = _proposal_artifacts(revision.get("proposal_artifacts") or revision.get("patch_artifacts") or [])
+    validation = revision.get("proposal_validation") if isinstance(revision.get("proposal_validation"), dict) else {}
+    validation_status = str(validation.get("status") or "unknown")
+    validation_blockers = validation.get("blockers") if isinstance(validation.get("blockers"), list) else []
+    policy = revision.get("auto_approval") if isinstance(revision.get("auto_approval"), dict) else {}
+    return (
+        "AgentLab generated a proposed revision but did not push it.\n\n"
+        f"Run: {revision.get('run_id') or run_id}\n"
+        "Commit: none\n"
+        "Push: skipped\n"
+        "Changed files proposed:\n"
+        f"{_bullet_list(changed)}\n\n"
+        "Proposal validation:\n"
+        f"- {validation_status}\n"
+        f"- blockers: {', '.join(str(item) for item in validation_blockers) if validation_blockers else 'None'}\n\n"
+        "Policy:\n"
+        f"- {_policy_status(policy)}\n"
+        f"- risk_score: {_policy_risk_score(policy)}\n\n"
+        "Patch artifact:\n"
+        f"{_bullet_list(artifacts)}"
+    )
+
+
+def _proposal_artifacts(values: Any) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    wanted = ["structured_proposal.json", "proposed.diff", "structured_proposal_report.json"]
+    present = {str(value) for value in values}
+    return [name for name in wanted if name in present]
 
 
 def _policy_status(policy: Any) -> str:

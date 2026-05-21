@@ -116,6 +116,8 @@ schedule:
     allowed_commands:
       - revise
       - fix
+      - propose
+      - dry-run
       - status
       - explain
       - stop
