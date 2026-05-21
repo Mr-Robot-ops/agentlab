@@ -7,6 +7,7 @@ import pytest
 
 from agentlab.k8s_operator import (
     ArtifactNotFoundError,
+    FailedResources,
     K8sOperator,
     K8sOperatorError,
     K8sTUI,
@@ -65,6 +66,7 @@ class FakeTTY:
 
 class FakeOperator:
     def __init__(self) -> None:
+        self.namespace = "agentlab"
         self.calls: list[tuple[str, object]] = []
 
     def status(self):
@@ -94,6 +96,44 @@ class FakeOperator:
     def shell(self):
         self.calls.append(("shell", None))
         return 0
+
+    def failed_resources(self):
+        self.calls.append(("failed_resources", None))
+        return FailedResources(jobs=["agentlab-failed-job"], pods=["agentlab-failed-pod"])
+
+    def cleanup_failed(self, *, dry_run: bool = False):
+        self.calls.append(("cleanup_failed", dry_run))
+        return type(
+            "Cleanup",
+            (),
+            {
+                "namespace": "agentlab",
+                "deleted_jobs": ["agentlab-failed-job"],
+                "deleted_pods": ["agentlab-failed-pod"],
+                "skipped_resources": [],
+                "dry_run": dry_run,
+            },
+        )()
+
+
+def job_item(name: str, *, failed: int = 0, active: int = 0, succeeded: int = 0) -> dict[str, object]:
+    return {
+        "metadata": {"name": name},
+        "status": {"failed": failed, "active": active, "succeeded": succeeded},
+    }
+
+
+def pod_item(name: str, *, phase: str, reason: str | None = None) -> dict[str, object]:
+    container_status = {}
+    if reason is not None:
+        container_status = {"state": {"terminated": {"reason": reason}}}
+    return {
+        "metadata": {"name": name},
+        "status": {
+            "phase": phase,
+            "containerStatuses": [container_status] if container_status else [],
+        },
+    }
 
 
 def test_component_mappings() -> None:
@@ -269,6 +309,159 @@ spec:
     assert drifts[0].path == "job-scheduler-action.yaml"
 
 
+def test_failed_agentlab_job_is_selected() -> None:
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "jobs", "-o", "json"],
+        json.dumps({"items": [job_item("agentlab-failed", failed=1)]}),
+    )
+    runner.respond(["-n", "agentlab", "get", "pods", "-o", "json"], json.dumps({"items": []}))
+
+    resources = K8sOperator(runner=runner).failed_resources()
+
+    assert resources.jobs == ["agentlab-failed"]
+
+
+def test_non_agentlab_failed_job_is_ignored() -> None:
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "jobs", "-o", "json"],
+        json.dumps({"items": [job_item("other-failed", failed=1)]}),
+    )
+    runner.respond(["-n", "agentlab", "get", "pods", "-o", "json"], json.dumps({"items": []}))
+
+    resources = K8sOperator(runner=runner).failed_resources()
+
+    assert resources.jobs == []
+    assert resources.skipped_resources == ["job/other-failed: not an AgentLab resource"]
+
+
+def test_active_agentlab_job_is_ignored() -> None:
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "jobs", "-o", "json"],
+        json.dumps({"items": [job_item("agentlab-active", failed=1, active=1)]}),
+    )
+    runner.respond(["-n", "agentlab", "get", "pods", "-o", "json"], json.dumps({"items": []}))
+
+    resources = K8sOperator(runner=runner).failed_resources()
+
+    assert resources.jobs == []
+    assert resources.skipped_resources == ["job/agentlab-active: still active"]
+
+
+def test_failed_agentlab_pod_is_selected() -> None:
+    runner = FakeRunner()
+    runner.respond(["-n", "agentlab", "get", "jobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(
+        ["-n", "agentlab", "get", "pods", "-o", "json"],
+        json.dumps({"items": [pod_item("agentlab-failed-pod", phase="Failed")]}),
+    )
+
+    resources = K8sOperator(runner=runner).failed_resources()
+
+    assert resources.pods == ["agentlab-failed-pod"]
+
+
+def test_agentlab_pod_with_error_reason_is_selected() -> None:
+    runner = FakeRunner()
+    runner.respond(["-n", "agentlab", "get", "jobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(
+        ["-n", "agentlab", "get", "pods", "-o", "json"],
+        json.dumps({"items": [pod_item("agentlab-error-pod", phase="Unknown", reason="Error")]}),
+    )
+
+    resources = K8sOperator(runner=runner).failed_resources()
+
+    assert resources.pods == ["agentlab-error-pod"]
+
+
+def test_running_agentlab_pod_is_ignored() -> None:
+    runner = FakeRunner()
+    runner.respond(["-n", "agentlab", "get", "jobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(
+        ["-n", "agentlab", "get", "pods", "-o", "json"],
+        json.dumps({"items": [pod_item("agentlab-running-pod", phase="Running", reason="Error")]}),
+    )
+
+    resources = K8sOperator(runner=runner).failed_resources()
+
+    assert resources.pods == []
+    assert resources.skipped_resources == ["pod/agentlab-running-pod: still running"]
+
+
+def test_completed_pod_without_failure_is_ignored() -> None:
+    runner = FakeRunner()
+    runner.respond(["-n", "agentlab", "get", "jobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(
+        ["-n", "agentlab", "get", "pods", "-o", "json"],
+        json.dumps({"items": [pod_item("agentlab-complete-pod", phase="Succeeded", reason="Completed")]}),
+    )
+
+    resources = K8sOperator(runner=runner).failed_resources()
+
+    assert resources.pods == []
+
+
+def test_cleanup_failed_dry_run_does_not_delete() -> None:
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "jobs", "-o", "json"],
+        json.dumps({"items": [job_item("agentlab-failed", failed=1)]}),
+    )
+    runner.respond(
+        ["-n", "agentlab", "get", "pods", "-o", "json"],
+        json.dumps({"items": [pod_item("agentlab-failed-pod", phase="Failed")]}),
+    )
+
+    report = K8sOperator(runner=runner).cleanup_failed(dry_run=True)
+
+    assert report.dry_run is True
+    assert report.deleted_jobs == ["agentlab-failed"]
+    assert report.deleted_pods == ["agentlab-failed-pod"]
+    assert not any(call[0][2:4] == ["delete", "job"] for call in runner.calls)
+    assert not any(call[0][2:4] == ["delete", "pod"] for call in runner.calls)
+
+
+def test_cleanup_failed_deletes_only_selected_agentlab_jobs_and_pods() -> None:
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "jobs", "-o", "json"],
+        json.dumps(
+            {
+                "items": [
+                    job_item("agentlab-failed", failed=1),
+                    job_item("agentlab-active", failed=1, active=1),
+                    job_item("other-failed", failed=1),
+                ]
+            }
+        ),
+    )
+    runner.respond(
+        ["-n", "agentlab", "get", "pods", "-o", "json"],
+        json.dumps(
+            {
+                "items": [
+                    pod_item("agentlab-failed-pod", phase="Failed"),
+                    pod_item("agentlab-running-pod", phase="Running"),
+                    pod_item("other-failed-pod", phase="Failed"),
+                ]
+            }
+        ),
+    )
+
+    report = K8sOperator(runner=runner).cleanup_failed()
+
+    assert report.deleted_jobs == ["agentlab-failed"]
+    assert report.deleted_pods == ["agentlab-failed-pod"]
+    delete_calls = [call[0] for call in runner.calls if "delete" in call[0]]
+    assert delete_calls == [
+        ["-n", "agentlab", "delete", "job", "agentlab-failed"],
+        ["-n", "agentlab", "delete", "pod", "agentlab-failed-pod"],
+    ]
+    assert not any(resource in call for call in delete_calls for resource in ("cronjob", "pvc", "configmap", "secret", "serviceaccount"))
+
+
 def test_tui_action_mapping_calls_same_operator_helpers() -> None:
     operator = FakeOperator()
     answers = iter(["3"])
@@ -282,6 +475,23 @@ def test_tui_action_mapping_calls_same_operator_helpers() -> None:
     tui.run_once("4")
 
     assert operator.calls == [("run_component", ("action", True))]
+
+
+def test_tui_cleanup_failed_maps_to_same_helper() -> None:
+    operator = FakeOperator()
+    tui = K8sTUI(
+        operator,  # type: ignore[arg-type]
+        input_func=lambda _prompt: "",
+        output_func=lambda _text: None,
+        confirm_func=lambda _message: True,
+    )
+
+    tui.run_once("10")
+
+    assert operator.calls == [
+        ("failed_resources", None),
+        ("cleanup_failed", False),
+    ]
 
 
 def test_tui_non_interactive_fallback() -> None:
