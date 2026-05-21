@@ -15,6 +15,7 @@ from agentlab.k8s_operator import (
     format_failed_resources,
     format_runs,
     format_status,
+    format_upgrade_report,
     manifest_for_component,
     run_job_name_for_component,
     run_tui,
@@ -237,6 +238,43 @@ def cleanup_failed(
         typer.echo(format_cleanup_report(operator.cleanup_failed(dry_run=False)))
     except K8sOperatorError as exc:
         _fail(str(exc))
+
+
+@k8s_app.command()
+def upgrade(
+    image: str = typer.Option(..., "--image", help="New AgentLab container image for generated manifests."),
+    namespace: str = typer.Option(DEFAULT_NAMESPACE, "--namespace"),
+    manifest_dir: Path = typer.Option(DEFAULT_MANIFEST_DIR, "--manifest-dir"),
+    apply: bool = typer.Option(False, "--apply/--no-apply"),
+    preserve_cluster_config: bool = typer.Option(False, "--preserve-cluster-config"),
+    preserve_local_config: bool = typer.Option(False, "--preserve-local-config"),
+    run_doctor: bool = typer.Option(False, "--run-doctor"),
+    status: bool = typer.Option(False, "--status"),
+    cleanup_failed: bool = typer.Option(False, "--cleanup-failed"),
+    yes: bool = typer.Option(False, "--yes", help="Skip apply confirmation when --apply is set."),
+) -> None:
+    """Upgrade generated AgentLab Kubernetes manifests to a new image."""
+    operator = _operator(namespace, manifest_dir)
+    if apply and not yes:
+        typer.echo(
+            "AgentLab Kubernetes upgrade will update generated manifests and apply them to the cluster."
+        )
+        if not typer.confirm("Continue?", default=False):
+            typer.echo("Upgrade cancelled.")
+            return
+    try:
+        report = operator.upgrade(
+            image=image,
+            apply=apply,
+            preserve_cluster_config=preserve_cluster_config,
+            preserve_local_config=preserve_local_config,
+            run_doctor=run_doctor,
+            show_status=status,
+            cleanup_failed=cleanup_failed,
+        )
+    except K8sOperatorError as exc:
+        _fail(str(exc))
+    typer.echo(format_upgrade_report(report))
 
 
 @k8s_app.command()
