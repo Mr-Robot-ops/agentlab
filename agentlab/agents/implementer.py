@@ -337,6 +337,191 @@ class ImplementationAgent:
                 fallback_reason=fallback_reason,
             )
 
+    def revise_on_branch(self, task: AgentTask, branch: str) -> ImplementationReport:
+        errors: list[str] = []
+        patch_artifacts: list[str] = []
+        commit_sha: str | None = None
+        commit_created = False
+        branch_pushed = False
+        implementation_mode = "structured_edit" if self._is_docs_task(task) else "patch"
+
+        if not branch.startswith("agent/"):
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                errors=["revision branch must be an agent/* branch"],
+                no_changes_committed=True,
+                no_branch_pushed=True,
+                implementation_mode=implementation_mode,  # type: ignore[arg-type]
+            )
+        if not task.approved:
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                errors=["task is not approved for implementation"],
+                no_changes_committed=True,
+                no_branch_pushed=True,
+                implementation_mode=implementation_mode,  # type: ignore[arg-type]
+            )
+
+        try:
+            checkout = self.git_tool.checkout(branch)
+            if not checkout.ok:
+                raise ToolError(checkout.stderr or f"could not checkout revision branch {branch}")
+
+            if implementation_mode == "structured_edit":
+                try:
+                    structured, raw_response = self._structured_proposal(task)
+                except OllamaSchemaValidationError as exc:
+                    patch_artifacts.extend(self._persist_structured_schema_error(exc))
+                    raise StructuredEditSchemaError(self._structured_schema_message(exc.raw_response)) from exc
+                patch_artifacts.extend(self._persist_structured_inputs(raw_response, structured))
+                try:
+                    diff_stats = self._validate_and_apply_structured(task, structured)
+                except Exception as exc:
+                    patch_artifacts.extend(self._persist_structured_error(exc))
+                    raise StructuredEditApplyError(self._structured_failure_reason(exc), str(exc)) from exc
+                patch_artifacts.extend(self._persist_structured_apply_report(structured, diff_stats))
+                summary = structured.summary
+                expected_tests = structured.expected_tests
+                risk_input = structured.model_dump_json()
+            else:
+                proposal, raw_response = self._proposal(task)
+                patch_artifacts.extend(self._persist_patch_inputs(raw_response, proposal))
+                try:
+                    diff_stats = self._validate_and_apply(task, proposal)
+                except (PatchApplyError, UnifiedDiffValidationError) as exc:
+                    patch_artifacts.extend(self._persist_patch_failure(exc))
+                    raise
+                summary = proposal.summary
+                expected_tests = proposal.expected_tests
+                risk_input = proposal.patch
+
+            risk = assess_risk(task, diff_stats.changed_files, risk_input)
+            if risk.blocked:
+                raise ToolError("risk assessment blocked patch: " + ", ".join(risk.reasons))
+            commit_sha = self.git_tool.commit(f"agent: revise MR feedback for {task.title}")
+            commit_created = commit_sha is not None
+            pushed = False
+            if self.config.push_agent_branches_enabled and not self.dry_run and commit_created:
+                push = self.git_tool.push(branch)
+                if not push.ok:
+                    raise GitPushError(self._push_failure_reason(push.stderr), self._short_error(push.stderr or "git push failed"))
+                pushed = True
+                branch_pushed = True
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.PASSED,
+                applied=not self.dry_run,
+                pushed=pushed,
+                commit_sha=commit_sha,
+                patch_summary=summary,
+                changed_files=diff_stats.changed_files,
+                risk_score=risk.score,
+                tests_recommended=expected_tests,
+                patch_artifacts=patch_artifacts,
+                no_changes_committed=not commit_created,
+                no_branch_pushed=not branch_pushed,
+                implementation_mode=implementation_mode,  # type: ignore[arg-type]
+            )
+        except StructuredEditApplyError as exc:
+            errors.append(str(exc))
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                errors=errors,
+                failure_stage="structured_edit_apply",
+                failure_reason=exc.reason,
+                patch_artifacts=patch_artifacts,
+                no_changes_committed=not commit_created,
+                no_branch_pushed=not branch_pushed,
+                implementation_mode="structured_edit",
+            )
+        except StructuredEditSchemaError as exc:
+            errors.append(str(exc))
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                errors=errors,
+                failure_stage="structured_edit_schema_validation",
+                failure_reason=exc.reason,
+                patch_artifacts=patch_artifacts,
+                no_changes_committed=not commit_created,
+                no_branch_pushed=not branch_pushed,
+                implementation_mode="structured_edit",
+            )
+        except PatchApplyError as exc:
+            errors.append(str(exc))
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                errors=errors,
+                failure_stage="patch_apply",
+                failure_reason="corrupt_patch" if self._is_corrupt_patch(exc.stderr) else "patch_apply_failed",
+                patch_artifacts=patch_artifacts,
+                no_changes_committed=not commit_created,
+                no_branch_pushed=not branch_pushed,
+                implementation_mode=implementation_mode,  # type: ignore[arg-type]
+            )
+        except UnifiedDiffValidationError as exc:
+            errors.append(str(exc))
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                errors=errors,
+                failure_stage="patch_validation",
+                failure_reason=exc.reason,
+                patch_artifacts=patch_artifacts,
+                no_changes_committed=not commit_created,
+                no_branch_pushed=not branch_pushed,
+                implementation_mode=implementation_mode,  # type: ignore[arg-type]
+            )
+        except GitPushError as exc:
+            errors.append(str(exc))
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                applied=not self.dry_run,
+                pushed=False,
+                commit_sha=commit_sha,
+                errors=errors,
+                failure_stage="git_push",
+                failure_reason=exc.reason,
+                patch_artifacts=patch_artifacts,
+                no_changes_committed=not commit_created,
+                no_branch_pushed=not branch_pushed,
+                implementation_mode=implementation_mode,  # type: ignore[arg-type]
+            )
+        except Exception as exc:
+            errors.append(str(exc))
+            failure_stage = None
+            failure_reason = None
+            if self._is_git_author_identity_missing(exc):
+                failure_stage = "git_commit"
+                failure_reason = "git_author_identity_missing"
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                errors=errors,
+                pushed=False,
+                commit_sha=commit_sha,
+                failure_stage=failure_stage,
+                failure_reason=failure_reason,
+                patch_artifacts=patch_artifacts,
+                no_changes_committed=not commit_created,
+                no_branch_pushed=not branch_pushed,
+                implementation_mode=implementation_mode,  # type: ignore[arg-type]
+            )
+
     def _proposal(self, task: AgentTask) -> tuple[PatchProposal, str]:
         if self.ollama is None:
             raise ToolError("OllamaClient is required for active implementation patches")

@@ -10,6 +10,13 @@ from agentlab.models import MergeRequestInfo
 
 MERGEABLE_DETAILED_STATUSES = {"mergeable", "can_be_merged"}
 MERGEABLE_STATUSES = {"can_be_merged"}
+GITLAB_ACCESS_ROLES = {
+    10: "guest",
+    20: "reporter",
+    30: "developer",
+    40: "maintainer",
+    50: "owner",
+}
 
 
 class GitLabTool:
@@ -87,6 +94,11 @@ class GitLabTool:
     def comment_mr(self, mr_id: int, body: str) -> None:
         mr = self.project.mergerequests.get(mr_id)
         mr.notes.create({"body": body})
+
+    def post_merge_request_note(self, mr_iid: int, body: str) -> dict[str, Any]:
+        mr = self.project.mergerequests.get(mr_iid)
+        note = mr.notes.create({"body": body})
+        return _asdict(note)
 
     def add_labels_to_mr(self, mr_id: int, labels: list[str]) -> MergeRequestInfo:
         mr = self.project.mergerequests.get(mr_id)
@@ -239,8 +251,90 @@ class GitLabTool:
                 result.append(self._mr_info(mr))
         return result
 
+    def list_open_agent_merge_requests(self) -> list[MergeRequestInfo]:
+        mrs = self.project.mergerequests.list(
+            state="opened",
+            target_branch=self.config.default_branch,
+            labels="agent/generated",
+            all=True,
+        )
+        result: list[MergeRequestInfo] = []
+        for mr in mrs:
+            info = self._mr_info(mr)
+            if (
+                info.source_branch.startswith("agent/")
+                and info.target_branch == self.config.default_branch
+                and "agent/generated" in info.labels
+            ):
+                result.append(info)
+        return result
+
+    def get_merge_request(self, mr_iid: int) -> MergeRequestInfo:
+        return self._mr_info(self.project.mergerequests.get(mr_iid))
+
+    def list_merge_request_notes(self, mr_iid: int) -> list[dict[str, Any]]:
+        mr = self.project.mergerequests.get(mr_iid)
+        return [_asdict(note) for note in mr.notes.list(all=True)]
+
+    def list_merge_request_discussions(self, mr_iid: int) -> list[dict[str, Any]]:
+        mr = self.project.mergerequests.get(mr_iid)
+        discussions = getattr(mr, "discussions", None)
+        if discussions is None:
+            return []
+        return [_asdict(discussion) for discussion in discussions.list(all=True)]
+
+    def get_merge_request_changes(self, mr_iid: int) -> list[str]:
+        mr = self.project.mergerequests.get(mr_iid)
+        changes = mr.changes()
+        return [
+            str(change.get("new_path") or change.get("old_path"))
+            for change in changes.get("changes", [])
+            if change.get("new_path") or change.get("old_path")
+        ]
+
+    def get_current_user(self) -> dict[str, Any]:
+        user = getattr(self.client, "user", None)
+        if user is None:
+            self.client.auth()
+            user = getattr(self.client, "user", None)
+        return _asdict(user) if user is not None else {}
+
+    def get_project_member_role(self, user_id: int) -> dict[str, Any]:
+        member = None
+        members_all = getattr(self.project, "members_all", None)
+        if members_all is not None:
+            try:
+                member = members_all.get(user_id)
+            except Exception:
+                member = None
+        if member is None:
+            member = self.project.members.get(user_id)
+        access_level = int(getattr(member, "access_level", 0) or 0)
+        return {"access_level": access_level, "role": GITLAB_ACCESS_ROLES.get(access_level, "unknown")}
+
+    def author_is_allowed(
+        self,
+        author: dict[str, Any],
+        *,
+        allowed_authors: list[str],
+        require_author_role: list[str],
+    ) -> bool:
+        username = str(author.get("username") or "").lower()
+        if username and username in {item.lower() for item in allowed_authors}:
+            return True
+        user_id = author.get("id")
+        if user_id is None or not require_author_role:
+            return False
+        try:
+            role = self.get_project_member_role(int(user_id)).get("role")
+        except Exception:
+            return False
+        return str(role).lower() in {item.lower() for item in require_author_role}
+
     def _mr_info(self, mr: Any) -> MergeRequestInfo:
         labels = getattr(mr, "labels", []) or []
+        if isinstance(labels, str):
+            labels = [label.strip() for label in labels.split(",") if label.strip()]
         return MergeRequestInfo(
             mr_id=int(mr.id),
             iid=int(getattr(mr, "iid", mr.id)),
@@ -250,3 +344,19 @@ class GitLabTool:
             target_branch=mr.target_branch,
             labels=list(labels),
         )
+
+
+def _asdict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "asdict"):
+        return value.asdict()
+    if hasattr(value, "attributes"):
+        attributes = getattr(value, "attributes")
+        if isinstance(attributes, dict):
+            return dict(attributes)
+    result: dict[str, Any] = {}
+    for key in ("id", "iid", "body", "author", "created_at", "updated_at", "system", "notes", "username", "name", "access_level"):
+        if hasattr(value, key):
+            result[key] = getattr(value, key)
+    return result
