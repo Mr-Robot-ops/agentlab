@@ -188,6 +188,26 @@ class ArtifactResult:
     content: str
 
 
+@dataclass
+class FailedResources:
+    jobs: list[str] = field(default_factory=list)
+    pods: list[str] = field(default_factory=list)
+    skipped_resources: list[str] = field(default_factory=list)
+
+    @property
+    def found(self) -> bool:
+        return bool(self.jobs or self.pods)
+
+
+@dataclass
+class CleanupReport:
+    namespace: str
+    deleted_jobs: list[str] = field(default_factory=list)
+    deleted_pods: list[str] = field(default_factory=list)
+    skipped_resources: list[str] = field(default_factory=list)
+    dry_run: bool = False
+
+
 class K8sOperator:
     def __init__(
         self,
@@ -325,6 +345,58 @@ class K8sOperator:
         self._run(["patch", "cronjob", cronjob, "--type", "merge", "-p", payload])
         item = self._run_json(["get", "cronjob", cronjob, "-o", "json"])
         return _cronjob_status(item, None)
+
+    def failed_resources(self) -> FailedResources:
+        jobs: list[str] = []
+        pods: list[str] = []
+        skipped: list[str] = []
+        for item in self._items("jobs"):
+            name = _resource_name(item)
+            if not name:
+                continue
+            if not name.startswith("agentlab-"):
+                if _job_failed(item):
+                    skipped.append(f"job/{name}: not an AgentLab resource")
+                continue
+            if _job_active(item):
+                skipped.append(f"job/{name}: still active")
+                continue
+            if _job_failed(item):
+                jobs.append(name)
+
+        for item in self._items("pods"):
+            name = _resource_name(item)
+            if not name:
+                continue
+            if not name.startswith("agentlab-"):
+                if _pod_failed(item):
+                    skipped.append(f"pod/{name}: not an AgentLab resource")
+                continue
+            if _pod_running(item):
+                skipped.append(f"pod/{name}: still running")
+                continue
+            if _pod_failed(item):
+                pods.append(name)
+        return FailedResources(jobs=sorted(jobs), pods=sorted(pods), skipped_resources=skipped)
+
+    def cleanup_failed(self, *, dry_run: bool = False) -> CleanupReport:
+        resources = self.failed_resources()
+        deleted_jobs: list[str] = []
+        deleted_pods: list[str] = []
+        if not dry_run:
+            for job in resources.jobs:
+                self._run(["delete", "job", job])
+                deleted_jobs.append(job)
+            for pod in resources.pods:
+                self._run(["delete", "pod", pod])
+                deleted_pods.append(pod)
+        return CleanupReport(
+            namespace=self.namespace,
+            deleted_jobs=resources.jobs if dry_run else deleted_jobs,
+            deleted_pods=resources.pods if dry_run else deleted_pods,
+            skipped_resources=resources.skipped_resources,
+            dry_run=dry_run,
+        )
 
     def _run_artifact_status(self, run_id: str, *, shell_pod: str) -> tuple[str, str]:
         for artifact in (
@@ -503,11 +575,57 @@ def format_runs(runs: list[RunSummary]) -> str:
     return "\n".join(f"- {run.run_id}: {run.mtime} | {run.status} | {run.reason}".rstrip() for run in runs)
 
 
+def format_failed_resources(resources: FailedResources, *, namespace: str) -> str:
+    if not resources.found:
+        return "No failed AgentLab resources found."
+    lines = [
+        f"Found failed AgentLab resources in namespace {namespace}:",
+        "",
+        "Jobs:",
+    ]
+    lines.extend(f"- {name}" for name in resources.jobs)
+    if not resources.jobs:
+        lines.append("- none")
+    lines.extend(["", "Pods:"])
+    lines.extend(f"- {name}" for name in resources.pods)
+    if not resources.pods:
+        lines.append("- none")
+    if resources.skipped_resources:
+        lines.extend(["", "Skipped resources:"])
+        lines.extend(f"- {item}" for item in resources.skipped_resources)
+    return "\n".join(lines)
+
+
+def format_cleanup_report(report: CleanupReport) -> str:
+    if report.dry_run:
+        header = f"Dry run: no resources deleted in namespace {report.namespace}."
+    else:
+        header = f"Cleanup summary for namespace {report.namespace}:"
+    lines = [header, "", "Deleted jobs:"]
+    lines.extend(f"- job/{name}" for name in report.deleted_jobs)
+    if not report.deleted_jobs:
+        lines.append("- none")
+    lines.extend(["", "Deleted pods:"])
+    lines.extend(f"- pod/{name}" for name in report.deleted_pods)
+    if not report.deleted_pods:
+        lines.append("- none")
+    lines.extend(["", "Skipped resources:"])
+    lines.extend(f"- {item}" for item in report.skipped_resources)
+    if not report.skipped_resources:
+        lines.append("- none")
+    return "\n".join(lines)
+
+
 def _configmap_image(configmap: dict[str, Any]) -> str | None:
     metadata = configmap.get("metadata") or {}
     annotations = metadata.get("annotations") or {}
     image = annotations.get("agentlab.io/image")
     return str(image) if image else None
+
+
+def _resource_name(item: dict[str, Any]) -> str:
+    metadata = item.get("metadata") or {}
+    return str(metadata.get("name") or "")
 
 
 def _cronjob_status(item: dict[str, Any], expected_image: str | None) -> CronJobStatus:
@@ -545,6 +663,21 @@ def _job_status(item: dict[str, Any]) -> JobStatus:
     )
 
 
+def _job_failed(item: dict[str, Any]) -> bool:
+    status = item.get("status") or {}
+    if int(status.get("failed") or 0) > 0:
+        return True
+    for condition in status.get("conditions") or []:
+        if condition.get("type") == "Failed" and condition.get("status") == "True":
+            return True
+    return False
+
+
+def _job_active(item: dict[str, Any]) -> bool:
+    status = item.get("status") or {}
+    return int(status.get("active") or 0) > 0
+
+
 def _pod_status(item: dict[str, Any]) -> PodStatus:
     metadata = item.get("metadata") or {}
     status = item.get("status") or {}
@@ -556,6 +689,26 @@ def _pod_status(item: dict[str, Any]) -> PodStatus:
             reason = str(waiting.get("reason"))
             break
     return PodStatus(name=str(metadata.get("name") or ""), phase=str(status.get("phase") or "Unknown"), reason=reason)
+
+
+def _pod_failed(item: dict[str, Any]) -> bool:
+    status = item.get("status") or {}
+    if status.get("phase") == "Failed":
+        return True
+    if status.get("phase") in {"Running", "Succeeded"}:
+        return False
+    for container in status.get("containerStatuses") or []:
+        state = container.get("state") or {}
+        terminated = state.get("terminated") or {}
+        waiting = state.get("waiting") or {}
+        if terminated.get("reason") == "Error" or waiting.get("reason") == "Error":
+            return True
+    return False
+
+
+def _pod_running(item: dict[str, Any]) -> bool:
+    status = item.get("status") or {}
+    return status.get("phase") == "Running"
 
 
 def _is_agentlab_job(name: str) -> bool:
@@ -668,6 +821,11 @@ class K8sTUI:
             if self._confirm("Create artifact-shell pod if missing and open shell?"):
                 self.operator.shell()
         elif choice == "10":
+            resources = self.operator.failed_resources()
+            self.output(format_failed_resources(resources, namespace=self.operator.namespace))
+            if resources.found and self._confirm("Delete failed AgentLab resources?"):
+                self.output(format_cleanup_report(self.operator.cleanup_failed()))
+        elif choice == "11":
             return False
         else:
             self.output("Unknown selection.")
@@ -688,7 +846,8 @@ class K8sTUI:
                         "7. CronJob pausieren",
                         "8. CronJob fortsetzen",
                         "9. Artifact shell öffnen",
-                        "10. Beenden",
+                        "10. Cleanup failed resources",
+                        "11. Beenden",
                     ]
                 )
             )

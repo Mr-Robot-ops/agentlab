@@ -11,6 +11,8 @@ from agentlab.k8s_operator import (
     K8sOperator,
     K8sOperatorError,
     TuiUnavailableError,
+    format_cleanup_report,
+    format_failed_resources,
     format_runs,
     format_status,
     manifest_for_component,
@@ -201,6 +203,38 @@ def reset_state(
     try:
         operator.run_component("reset-state", follow=False)
         operator.job_logs(run_job_name_for_component("reset-state"), follow=True)
+    except K8sOperatorError as exc:
+        _fail(str(exc))
+
+
+@k8s_app.command("cleanup-failed")
+def cleanup_failed(
+    namespace: str = typer.Option(DEFAULT_NAMESPACE, "--namespace"),
+    yes: bool = typer.Option(False, "--yes", help="Delete without prompting for confirmation."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show resources that would be deleted without deleting them."),
+) -> None:
+    """Delete failed AgentLab Jobs and Pods from the namespace."""
+    operator = _operator(namespace)
+    try:
+        resources = operator.failed_resources()
+    except K8sOperatorError as exc:
+        _fail(str(exc))
+    typer.echo(format_failed_resources(resources, namespace=namespace))
+    if not resources.found:
+        return
+    if dry_run:
+        try:
+            typer.echo("")
+            typer.echo(format_cleanup_report(operator.cleanup_failed(dry_run=True)))
+        except K8sOperatorError as exc:
+            _fail(str(exc))
+        return
+    if not yes and not typer.confirm("Delete these resources?", default=False):
+        typer.echo("Cleanup cancelled.")
+        return
+    try:
+        typer.echo("")
+        typer.echo(format_cleanup_report(operator.cleanup_failed(dry_run=False)))
     except K8sOperatorError as exc:
         _fail(str(exc))
 

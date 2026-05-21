@@ -121,6 +121,28 @@ agentlab k8s reset-state
 
 This is an alias for running `reset-state` through the generated `job-scheduler-reset-state.yaml` manifest. If the manifest is missing, rerun Kubernetes bootstrap.
 
+## Cleanup Failed Jobs And Pods
+
+Preview old failed AgentLab Jobs and Pods without deleting anything:
+
+```bash
+agentlab k8s cleanup-failed --dry-run
+```
+
+Delete failed AgentLab Jobs and failed AgentLab Pods after confirmation:
+
+```bash
+agentlab k8s cleanup-failed
+```
+
+Skip the confirmation prompt:
+
+```bash
+agentlab k8s cleanup-failed --yes
+```
+
+The cleanup command only targets failed resources in the selected namespace whose names start with `agentlab-`. It never deletes CronJobs, PVCs, Secrets, ConfigMaps, ServiceAccounts, running Pods, active Jobs, completed Pods without failure, or non-AgentLab resources.
+
 ## Suspend And Resume CronJobs
 
 Pause a noisy review-comment CronJob:
@@ -156,6 +178,7 @@ The TUI provides:
 7. CronJob pausieren
 8. CronJob fortsetzen
 9. Artifact shell öffnen
-10. Beenden
+10. Cleanup failed resources
+11. Beenden
 
 Mutating actions require confirmation. If no interactive TTY is available, the TUI fails clearly and suggests equivalent non-interactive commands.
