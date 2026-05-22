@@ -80,7 +80,7 @@ agentlab k8s config set schedule.action.enabled false
 agentlab k8s config set schedule.review_comments.cooldown_minutes 0
 ```
 
-The command validates paths against an allowlist, supports bool, int, and string values, prints before/after values, and patches only `data.config.yaml`. It does not read or modify Secrets, and it leaves ConfigMap metadata and annotations such as `agentlab.io/image` untouched.
+The command validates paths against an allowlist, supports bool, int, and string values, prints before/after values, and patches only `data.config.yaml`. It does not read or modify Secrets, and it leaves ConfigMap metadata and annotations such as `mr-robot-ops.github.io/agentlab-image` untouched.
 
 ## Logs
 
@@ -156,7 +156,7 @@ Run the doctor job and clean stale failed resources after a successful apply:
 agentlab k8s upgrade --image 10.159.21.58:5000/agentlab:0.1.13 --apply --run-doctor --cleanup-failed
 ```
 
-The upgrade command updates `configmap.yaml` annotation `agentlab.io/image`, all generated `job-*.yaml` and `cronjob-*.yaml` container images, and ensures enabled generated CronJobs are included in `kustomization.yaml`. If preserved config enables a CronJob such as `schedule.review_comments.enabled`, upgrade recreates the missing generated CronJob manifest from the matching generated Job manifest and applies enabled CronJob manifests after `kubectl apply -k`. It can preserve `auto_approve`, `schedule`, `schedule.review_comments`, `schedule.limits`, `schedule.behavior`, and `required_test_commands`. It does not preserve image annotations, Secrets, GitLab tokens, `auto_merge_enabled`, or `direct_main_push_enabled`.
+The upgrade command updates `configmap.yaml` annotation `mr-robot-ops.github.io/agentlab-image`, all generated `job-*.yaml` and `cronjob-*.yaml` container images, and ensures enabled generated CronJobs are included in `kustomization.yaml`. Existing clusters using the deprecated `agentlab.io/image` annotation remain readable during migration, but generated manifests and upgrades write only `mr-robot-ops.github.io/agentlab-image`. If preserved config enables a CronJob such as `schedule.review_comments.enabled`, upgrade recreates the missing generated CronJob manifest from the matching generated Job manifest and applies enabled CronJob manifests after `kubectl apply -k`. It can preserve `auto_approve`, `schedule`, `schedule.review_comments`, `schedule.limits`, `schedule.behavior`, and `required_test_commands`. It does not preserve image annotations, Secrets, GitLab tokens, `auto_merge_enabled`, or `direct_main_push_enabled`.
 
 ## Artifacts
 

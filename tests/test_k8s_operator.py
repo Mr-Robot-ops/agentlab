@@ -10,7 +10,10 @@ import yaml
 
 from agentlab.k8s_operator import (
     ArtifactNotFoundError,
+    DEPRECATED_K8S_IMAGE_ANNOTATION,
+    DEPRECATED_K8S_IMAGE_ANNOTATION_WARNING,
     FailedResources,
+    K8S_IMAGE_ANNOTATION,
     K8sOperator,
     K8sOperatorError,
     K8sTUI,
@@ -220,7 +223,7 @@ def write_upgrade_manifests(
                 "kind": "ConfigMap",
                 "metadata": {
                     "name": "agentlab-config",
-                    "annotations": {"agentlab.io/image": image},
+                    "annotations": {K8S_IMAGE_ANNOTATION: image},
                 },
                 "data": {
                     "config.yaml": yaml.safe_dump(
@@ -305,7 +308,7 @@ def configmap_config(path: Path) -> dict[str, object]:
 
 
 def cronjob_names_json(*, configmap_image: str, cronjob_images: dict[str, str]) -> tuple[str, str]:
-    configmap = json.dumps({"metadata": {"annotations": {"agentlab.io/image": configmap_image}}})
+    configmap = json.dumps({"metadata": {"annotations": {K8S_IMAGE_ANNOTATION: configmap_image}}})
     cronjobs = json.dumps(
         {
             "items": [
@@ -341,7 +344,7 @@ def configmap_with_app_config(extra_config: dict[str, object] | None = None) -> 
         config.update(extra_config)
     return json.dumps(
         {
-            "metadata": {"annotations": {"agentlab.io/image": "registry/agentlab:new"}},
+            "metadata": {"annotations": {K8S_IMAGE_ANNOTATION: "registry/agentlab:new"}},
             "data": {"config.yaml": yaml.safe_dump(config, sort_keys=False)},
         }
     )
@@ -575,7 +578,7 @@ def test_image_drift_detection_from_mocked_cluster_output() -> None:
     runner = FakeRunner()
     runner.respond(
         ["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"],
-        json.dumps({"metadata": {"annotations": {"agentlab.io/image": "registry/agentlab:new"}}}),
+        json.dumps({"metadata": {"annotations": {K8S_IMAGE_ANNOTATION: "registry/agentlab:new"}}}),
     )
     runner.respond(
         ["-n", "agentlab", "get", "cronjobs", "-o", "json"],
@@ -608,13 +611,60 @@ def test_image_drift_detection_from_mocked_cluster_output() -> None:
     assert status.cronjobs[0].image_drift is True
 
 
+def test_status_reads_deprecated_image_annotation_with_warning() -> None:
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"],
+        json.dumps({"metadata": {"annotations": {DEPRECATED_K8S_IMAGE_ANNOTATION: "registry/agentlab:new"}}}),
+    )
+    runner.respond(
+        ["-n", "agentlab", "get", "cronjobs", "-o", "json"],
+        json.dumps({"items": []}),
+    )
+    runner.respond(["-n", "agentlab", "get", "jobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(["-n", "agentlab", "get", "pods", "-o", "json"], json.dumps({"items": []}))
+
+    status = K8sOperator(runner=runner).status()
+
+    assert status.configmap_image == "registry/agentlab:new"
+    assert status.image_annotation_warning == DEPRECATED_K8S_IMAGE_ANNOTATION_WARNING
+    assert DEPRECATED_K8S_IMAGE_ANNOTATION_WARNING in format_status(status)
+
+
+def test_status_prefers_new_image_annotation_when_both_exist() -> None:
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"],
+        json.dumps(
+            {
+                "metadata": {
+                    "annotations": {
+                        DEPRECATED_K8S_IMAGE_ANNOTATION: "registry/agentlab:old",
+                        K8S_IMAGE_ANNOTATION: "registry/agentlab:new",
+                    }
+                }
+            }
+        ),
+    )
+    runner.respond(
+        ["-n", "agentlab", "get", "cronjobs", "-o", "json"],
+        json.dumps({"items": []}),
+    )
+    runner.respond(["-n", "agentlab", "get", "jobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(["-n", "agentlab", "get", "pods", "-o", "json"], json.dumps({"items": []}))
+
+    status = K8sOperator(runner=runner).status()
+
+    assert status.configmap_image == "registry/agentlab:new"
+
+
 def test_manifest_image_drift_detection(tmp_path: Path) -> None:
     (tmp_path / "configmap.yaml").write_text(
         """
 kind: ConfigMap
 metadata:
   annotations:
-    agentlab.io/image: registry/agentlab:new
+    mr-robot-ops.github.io/agentlab-image: registry/agentlab:new
 """,
         encoding="utf-8",
     )
@@ -636,18 +686,51 @@ spec:
     assert drifts[0].path == "job-scheduler-action.yaml"
 
 
+def test_manifest_image_drift_reads_deprecated_annotation_fallback(tmp_path: Path) -> None:
+    (tmp_path / "configmap.yaml").write_text(
+        f"""
+kind: ConfigMap
+metadata:
+  annotations:
+    {DEPRECATED_K8S_IMAGE_ANNOTATION}: registry/agentlab:new
+""",
+        encoding="utf-8",
+    )
+
+    image, drifts = detect_manifest_image_drift(tmp_path)
+
+    assert image == "registry/agentlab:new"
+    assert drifts == []
+
+
 def test_upgrade_updates_configmap_annotation_and_all_workload_images(tmp_path: Path) -> None:
     write_upgrade_manifests(tmp_path)
 
     report = K8sOperator(manifest_dir=tmp_path, runner=FakeRunner()).upgrade(image="registry/agentlab:new")
 
     configmap = yaml.safe_load((tmp_path / "configmap.yaml").read_text(encoding="utf-8"))
-    assert configmap["metadata"]["annotations"]["agentlab.io/image"] == "registry/agentlab:new"
+    assert configmap["metadata"]["annotations"][K8S_IMAGE_ANNOTATION] == "registry/agentlab:new"
+    assert DEPRECATED_K8S_IMAGE_ANNOTATION not in configmap["metadata"]["annotations"]
     for path in [*tmp_path.glob("job-*.yaml"), *tmp_path.glob("cronjob-*.yaml")]:
         assert manifest_image(path) == "registry/agentlab:new"
     assert "job-scheduler-reset-state.yaml" in report.updated_manifests
     assert "cronjob-scheduler-review-comments.yaml" in report.updated_manifests
     assert report.image_drift == []
+
+
+def test_upgrade_migrates_deprecated_configmap_image_annotation(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path)
+    configmap = yaml.safe_load((tmp_path / "configmap.yaml").read_text(encoding="utf-8"))
+    annotations = configmap["metadata"]["annotations"]
+    annotations.pop(K8S_IMAGE_ANNOTATION)
+    annotations[DEPRECATED_K8S_IMAGE_ANNOTATION] = "registry/agentlab:old"
+    (tmp_path / "configmap.yaml").write_text(yaml.safe_dump(configmap, sort_keys=False), encoding="utf-8")
+
+    K8sOperator(manifest_dir=tmp_path, runner=FakeRunner()).upgrade(image="registry/agentlab:new")
+
+    migrated = yaml.safe_load((tmp_path / "configmap.yaml").read_text(encoding="utf-8"))
+    assert migrated["metadata"]["annotations"][K8S_IMAGE_ANNOTATION] == "registry/agentlab:new"
+    assert DEPRECATED_K8S_IMAGE_ANNOTATION not in migrated["metadata"]["annotations"]
 
 
 def test_upgrade_preserves_selected_local_config_sections(tmp_path: Path) -> None:
@@ -663,7 +746,7 @@ def test_upgrade_preserves_selected_local_config_sections(tmp_path: Path) -> Non
     }
     config["required_test_commands"] = ["python -m pytest"]
     config["auto_merge_enabled"] = True
-    configmap["metadata"]["annotations"]["agentlab.io/image"] = "registry/agentlab:old"
+    configmap["metadata"]["annotations"][K8S_IMAGE_ANNOTATION] = "registry/agentlab:old"
     configmap["data"]["config.yaml"] = yaml.safe_dump(config, sort_keys=False)
     (tmp_path / "configmap.yaml").write_text(yaml.safe_dump(configmap, sort_keys=False), encoding="utf-8")
 
@@ -674,7 +757,8 @@ def test_upgrade_preserves_selected_local_config_sections(tmp_path: Path) -> Non
 
     new_configmap = yaml.safe_load((tmp_path / "configmap.yaml").read_text(encoding="utf-8"))
     merged = yaml.safe_load(new_configmap["data"]["config.yaml"])
-    assert new_configmap["metadata"]["annotations"]["agentlab.io/image"] == "registry/agentlab:new"
+    assert new_configmap["metadata"]["annotations"][K8S_IMAGE_ANNOTATION] == "registry/agentlab:new"
+    assert DEPRECATED_K8S_IMAGE_ANNOTATION not in new_configmap["metadata"]["annotations"]
     assert merged["auto_approve"] == {"enabled": True, "allowed_paths": ["README.md"]}
     assert merged["schedule"]["review_comments"]["enabled"] is True
     assert merged["schedule"]["limits"]["max_daily_mrs"] == 3
@@ -756,7 +840,7 @@ def test_config_set_patches_only_config_yaml_and_preserves_annotations() -> None
             {
                 "metadata": {
                     "annotations": {
-                        "agentlab.io/image": "registry/agentlab:current",
+                        K8S_IMAGE_ANNOTATION: "registry/agentlab:current",
                         "operator.note": "keep-me",
                     }
                 },
@@ -968,7 +1052,7 @@ def test_upgrade_apply_reapplies_preserved_review_comments_cronjob_and_clears_dr
         ["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"],
         json.dumps(
             {
-                "metadata": {"annotations": {"agentlab.io/image": "registry/agentlab:new"}},
+                "metadata": {"annotations": {K8S_IMAGE_ANNOTATION: "registry/agentlab:new"}},
                 "data": {
                     "config.yaml": yaml.safe_dump(
                         {"schedule": {"review_comments": {"enabled": True}}},

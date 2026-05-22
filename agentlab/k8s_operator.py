@@ -25,6 +25,12 @@ DEFAULT_NAMESPACE = "agentlab"
 DEFAULT_MANIFEST_DIR = Path("deploy/kubernetes/generated")
 RUNS_ROOT = "/var/lib/agentlab/runs"
 ARTIFACT_SHELL_IMAGE = "busybox:1.36"
+K8S_IMAGE_ANNOTATION = "mr-robot-ops.github.io/agentlab-image"
+DEPRECATED_K8S_IMAGE_ANNOTATION = "agentlab.io/image"
+DEPRECATED_K8S_IMAGE_ANNOTATION_WARNING = (
+    f"Deprecated annotation key `{DEPRECATED_K8S_IMAGE_ANNOTATION}` found; "
+    f"use `{K8S_IMAGE_ANNOTATION}`."
+)
 
 JOB_PREFIXES = {
     "review-comments": "agentlab-scheduler-review-comments",
@@ -263,6 +269,7 @@ class ManifestImageDrift:
 class ClusterStatus:
     namespace: str
     configmap_image: str | None
+    image_annotation_warning: str | None = None
     open_agent_mrs: list[dict[str, Any]] = field(default_factory=list)
     open_agent_mrs_count: int | None = None
     open_agent_mrs_warning: str | None = None
@@ -271,6 +278,7 @@ class ClusterStatus:
     failed_jobs: list[JobStatus] = field(default_factory=list)
     failed_pods: list[PodStatus] = field(default_factory=list)
     manifest_configmap_image: str | None = None
+    manifest_image_annotation_warning: str | None = None
     manifest_image_drifts: list[ManifestImageDrift] = field(default_factory=list)
 
 
@@ -385,6 +393,7 @@ class K8sOperator:
     def status(self, *, manifest_dir: str | Path | None = None) -> ClusterStatus:
         configmap = self._run_json(["get", "configmap", "agentlab-config", "-o", "json"], check=False)
         configmap_image = _configmap_image(configmap)
+        image_annotation_warning = _configmap_image_annotation_warning(configmap)
         open_agent_mrs, open_agent_mrs_warning = self._open_agent_mrs_from_configmap(configmap)
         cronjobs = [_cronjob_status(item, configmap_image) for item in self._items("cronjobs")]
         cronjobs = [item for item in cronjobs if item.name.startswith("agentlab-scheduler-")]
@@ -400,6 +409,7 @@ class K8sOperator:
         status = ClusterStatus(
             namespace=self.namespace,
             configmap_image=configmap_image,
+            image_annotation_warning=image_annotation_warning,
             open_agent_mrs=open_agent_mrs,
             open_agent_mrs_count=len(open_agent_mrs),
             open_agent_mrs_warning=open_agent_mrs_warning,
@@ -409,7 +419,11 @@ class K8sOperator:
             failed_pods=failed_pods,
         )
         if manifest_dir is not None:
+            manifest_path = Path(manifest_dir) / "configmap.yaml"
             status.manifest_configmap_image, status.manifest_image_drifts = detect_manifest_image_drift(Path(manifest_dir))
+            if manifest_path.exists():
+                manifest_configmap = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+                status.manifest_image_annotation_warning = _configmap_image_annotation_warning(manifest_configmap)
         return status
 
     def latest_job_name(self, component: str) -> str:
@@ -1009,7 +1023,8 @@ def update_generated_manifests(
     configmap = _load_yaml_file(configmap_path)
     metadata = configmap.setdefault("metadata", {})
     annotations = metadata.setdefault("annotations", {})
-    annotations["agentlab.io/image"] = image
+    annotations.pop(DEPRECATED_K8S_IMAGE_ANNOTATION, None)
+    annotations[K8S_IMAGE_ANNOTATION] = image
     config = _config_from_configmap_document(configmap)
     if preserved_config:
         preserved_sections = _merge_preserved_config_sections(config, preserved_config)
@@ -1111,6 +1126,10 @@ def format_status(status: ClusterStatus) -> str:
     )
     if status.open_agent_mrs_warning:
         warnings.append(status.open_agent_mrs_warning)
+    if status.image_annotation_warning:
+        warnings.append(status.image_annotation_warning)
+    if status.manifest_image_annotation_warning:
+        warnings.append(f"Generated manifest: {status.manifest_image_annotation_warning}")
     if status.manifest_configmap_image:
         lines.extend(["", f"Generated manifest ConfigMap image: {status.manifest_configmap_image}"])
     if warnings:
@@ -1378,6 +1397,10 @@ def _health_warnings(
     failed_resources: dict[str, Any],
 ) -> list[str]:
     warnings: list[str] = []
+    if status.image_annotation_warning:
+        warnings.append(status.image_annotation_warning)
+    if status.manifest_image_annotation_warning:
+        warnings.append(f"Generated manifest: {status.manifest_image_annotation_warning}")
     if status.open_agent_mrs_warning:
         warnings.append(status.open_agent_mrs_warning)
     if state_meta.get("warning"):
@@ -1411,8 +1434,16 @@ def _health_overall_status(
 def _configmap_image(configmap: dict[str, Any]) -> str | None:
     metadata = configmap.get("metadata") or {}
     annotations = metadata.get("annotations") or {}
-    image = annotations.get("agentlab.io/image")
+    image = annotations.get(K8S_IMAGE_ANNOTATION) or annotations.get(DEPRECATED_K8S_IMAGE_ANNOTATION)
     return str(image) if image else None
+
+
+def _configmap_image_annotation_warning(configmap: dict[str, Any]) -> str | None:
+    metadata = configmap.get("metadata") or {}
+    annotations = metadata.get("annotations") or {}
+    if DEPRECATED_K8S_IMAGE_ANNOTATION in annotations:
+        return DEPRECATED_K8S_IMAGE_ANNOTATION_WARNING
+    return None
 
 
 def _open_agent_mr_details(mrs: list[Any]) -> list[dict[str, Any]]:
