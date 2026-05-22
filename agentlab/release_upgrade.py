@@ -54,6 +54,8 @@ class ReleaseUpgradeOptions:
     namespace: str = DEFAULT_NAMESPACE
     skip_git_pull: bool = False
     allow_dirty: bool = False
+    allow_generated_dirty: bool = True
+    pull_ff_only: bool = True
     skip_tests: bool = False
     test_command: list[str] | None = None
     skip_build: bool = False
@@ -68,6 +70,18 @@ class ReleaseUpgradeOptions:
     cleanup_failed: bool | None = None
     status: bool | None = None
     dry_run: bool = False
+    prepare_only: bool = False
+    bootstrap_k8s: bool = False
+    gitlab_url: str | None = None
+    project_id: str | None = None
+    target_repo_url: str | None = None
+    target_repo_ref: str = "main"
+    ollama_url: str | None = None
+    model: str = "qwen3.6:35b"
+    git_author_name: str = "AgentLab Bot"
+    git_author_email: str = "agentlab-bot@example.local"
+    mode: str = "safe-dry-run"
+    schedule_enabled: bool = False
 
     def resolved_repo(self) -> Path:
         return self.repo.resolve()
@@ -93,6 +107,9 @@ class ReleaseUpgradeOptions:
 
     def pytest_command(self) -> list[str]:
         return self.test_command or [sys.executable, "-m", "pytest"]
+
+    def git_pull_command(self) -> list[str]:
+        return ["git", "pull", "--ff-only"] if self.pull_ff_only else ["git", "pull"]
 
     def docker_build_command(self) -> list[str]:
         command = [self.docker_bin, "build", "-t", self.image]
@@ -144,6 +161,39 @@ class ReleaseUpgradeOptions:
             "--manifest-dir",
             str(self.manifest_dir),
         ]
+
+    def bootstrap_command(self) -> list[str]:
+        command = [
+            sys.executable,
+            "scripts/bootstrap_k8s.py",
+            "--namespace",
+            self.namespace,
+            "--image",
+            self.image,
+            "--gitlab-url",
+            self.gitlab_url or "",
+            "--project-id",
+            self.project_id or "",
+            "--target-repo-url",
+            self.target_repo_url or "",
+            "--target-repo-ref",
+            self.target_repo_ref,
+            "--ollama-url",
+            self.ollama_url or "",
+            "--model",
+            self.model,
+            "--mode",
+            self.mode,
+            "--git-author-name",
+            self.git_author_name,
+            "--git-author-email",
+            self.git_author_email,
+            "--output-dir",
+            str(self.manifest_dir),
+        ]
+        if self.schedule_enabled:
+            command.append("--schedule-enabled")
+        return command
 
 
 @dataclass
@@ -202,23 +252,28 @@ class ReleaseUpgrader:
             self._add_dry_run_steps(options, report)
             return report
 
-        status = self._run_command(report, "Git status", ["git", "status", "--porcelain"], cwd=repo)
-        dirty = bool(status.stdout.strip())
-        if dirty and not options.allow_dirty:
-            status.status = "failed"
-            status.detail = "dirty working tree"
-            raise ReleaseUpgradeError("Working tree is dirty. Use --allow-dirty to continue.", report)
-        status.detail = "dirty allowed" if dirty else "clean"
+        self._check_git_status(report, options, "Git status", cwd=repo)
 
         if options.skip_git_pull:
             report.steps.append(ReleaseStep(name="Git pull", status="skipped", detail="--skip-git-pull"))
         else:
-            self._run_command(report, "Git pull", ["git", "pull"], cwd=repo)
+            self._run_command(report, "Git pull", options.git_pull_command(), cwd=repo)
+            self._check_git_status(report, options, "Git status after pull", cwd=repo)
+
+        if not options.prepare_only or options.bootstrap_k8s:
+            self._ensure_manifest_dir(options, report, repo=repo, manifest_dir=manifest_dir)
 
         if options.skip_tests:
             report.steps.append(ReleaseStep(name="Tests", status="skipped", detail="--skip-tests"))
         else:
             self._run_command(report, "Tests", options.pytest_command(), cwd=repo)
+
+        if options.prepare_only:
+            report.steps.append(ReleaseStep(name="Docker build", status="skipped", detail="--prepare-only"))
+            report.steps.append(ReleaseStep(name="Docker push", status="skipped", detail="--prepare-only"))
+            report.steps.append(ReleaseStep(name="Kubernetes upgrade", status="skipped", detail="--prepare-only"))
+            report.steps.append(ReleaseStep(name="Status", status="skipped", detail="--prepare-only"))
+            return report
 
         if options.skip_build:
             report.steps.append(ReleaseStep(name="Docker build", status="skipped", detail="--skip-build"))
@@ -303,17 +358,43 @@ class ReleaseUpgrader:
                 )
             )
             raise ReleaseUpgradeError("Choose either --preserve-cluster-config or --preserve-local-config, not both.", report)
+        if options.bootstrap_k8s:
+            missing = [
+                name
+                for name, value in {
+                    "gitlab-url": options.gitlab_url,
+                    "project-id": options.project_id,
+                    "target-repo-url": options.target_repo_url,
+                    "ollama-url": options.ollama_url,
+                }.items()
+                if not value
+            ]
+            if missing:
+                detail = "Missing required bootstrap options: " + ", ".join(f"--{name}" for name in missing)
+                report.steps.append(ReleaseStep(name="Validate options", status="failed", detail=detail))
+                raise ReleaseUpgradeError(detail, report)
 
     def _add_dry_run_steps(self, options: ReleaseUpgradeOptions, report: ReleaseUpgradeReport) -> None:
         report.steps.append(ReleaseStep(name="Git status", status="planned", command=["git", "status", "--porcelain"]))
         if options.skip_git_pull:
             report.steps.append(ReleaseStep(name="Git pull", status="skipped", detail="--skip-git-pull"))
         else:
-            report.steps.append(ReleaseStep(name="Git pull", status="planned", command=["git", "pull"]))
+            report.steps.append(ReleaseStep(name="Git pull", status="planned", command=options.git_pull_command()))
+            report.steps.append(ReleaseStep(name="Git status after pull", status="planned", command=["git", "status", "--porcelain"]))
+        if not options.prepare_only or options.bootstrap_k8s:
+            if options.bootstrap_k8s:
+                report.steps.append(ReleaseStep(name="Kubernetes bootstrap", status="planned", command=options.bootstrap_command()))
+            report.steps.append(ReleaseStep(name="Kubernetes manifest preflight", status="planned"))
         if options.skip_tests:
             report.steps.append(ReleaseStep(name="Tests", status="skipped", detail="--skip-tests"))
         else:
             report.steps.append(ReleaseStep(name="Tests", status="planned", command=options.pytest_command()))
+        if options.prepare_only:
+            report.steps.append(ReleaseStep(name="Docker build", status="skipped", detail="--prepare-only"))
+            report.steps.append(ReleaseStep(name="Docker push", status="skipped", detail="--prepare-only"))
+            report.steps.append(ReleaseStep(name="Kubernetes upgrade", status="skipped", detail="--prepare-only"))
+            report.steps.append(ReleaseStep(name="Status", status="skipped", detail="--prepare-only"))
+            return
         if options.skip_build:
             report.steps.append(ReleaseStep(name="Docker build", status="skipped", detail="--skip-build"))
         else:
@@ -342,6 +423,48 @@ class ReleaseUpgrader:
         if result.returncode != 0:
             raise ReleaseUpgradeError(f"{name} failed.", report)
         return step
+
+    def _check_git_status(self, report: ReleaseUpgradeReport, options: ReleaseUpgradeOptions, name: str, *, cwd: Path) -> ReleaseStep:
+        step = self._run_command(report, name, ["git", "status", "--porcelain"], cwd=cwd)
+        dirty = _dirty_paths(step.stdout)
+        if not dirty:
+            step.detail = "clean"
+            return step
+        if _only_generated_dirty(dirty, repo=cwd, manifest_dir=options.resolved_manifest_dir()) and options.allow_generated_dirty:
+            step.detail = "generated manifests dirty allowed"
+            return step
+        if options.allow_dirty:
+            step.detail = "dirty allowed"
+            return step
+        step.status = "failed"
+        step.detail = "dirty working tree"
+        raise ReleaseUpgradeError("Working tree is dirty. Use --allow-dirty to continue.", report)
+
+    def _ensure_manifest_dir(
+        self,
+        options: ReleaseUpgradeOptions,
+        report: ReleaseUpgradeReport,
+        *,
+        repo: Path,
+        manifest_dir: Path,
+    ) -> None:
+        if manifest_dir.exists() and not manifest_dir.is_dir():
+            detail = f"Kubernetes manifest path is not a directory: {manifest_dir}."
+            report.steps.append(ReleaseStep(name="Kubernetes manifest preflight", status="failed", detail=detail))
+            raise ReleaseUpgradeError("Kubernetes manifest preflight failed.", report)
+        if manifest_dir.exists():
+            report.steps.append(ReleaseStep(name="Kubernetes manifest preflight", status="passed", detail="present"))
+            return
+        if not options.bootstrap_k8s:
+            detail = f"Kubernetes manifest dir is missing: {manifest_dir}. Run bootstrap first or use --bootstrap-k8s."
+            report.steps.append(ReleaseStep(name="Kubernetes manifest preflight", status="failed", detail=detail))
+            raise ReleaseUpgradeError("Kubernetes manifest preflight failed.", report)
+        self._run_command(report, "Kubernetes bootstrap", options.bootstrap_command(), cwd=repo)
+        if not manifest_dir.exists() or not manifest_dir.is_dir():
+            detail = f"Kubernetes manifest dir is still missing after bootstrap: {manifest_dir}."
+            report.steps.append(ReleaseStep(name="Kubernetes manifest preflight", status="failed", detail=detail))
+            raise ReleaseUpgradeError("Kubernetes manifest preflight failed.", report)
+        report.steps.append(ReleaseStep(name="Kubernetes manifest preflight", status="passed", detail="present after bootstrap"))
 
 
 def parse_command_text(value: str | None) -> list[str] | None:
@@ -390,6 +513,30 @@ def _stderr_snippet(value: str, *, limit: int = 500) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
+
+
+def _dirty_paths(porcelain: str) -> list[str]:
+    paths: list[str] = []
+    for raw_line in porcelain.splitlines():
+        if not raw_line.strip():
+            continue
+        path_text = raw_line[3:] if len(raw_line) > 3 else raw_line
+        for item in path_text.split(" -> "):
+            normalized = item.strip().strip('"').replace("\\", "/")
+            if normalized:
+                paths.append(normalized)
+    return paths
+
+
+def _only_generated_dirty(paths: list[str], *, repo: Path, manifest_dir: Path) -> bool:
+    try:
+        generated = manifest_dir.resolve().relative_to(repo.resolve()).as_posix()
+    except ValueError:
+        generated = manifest_dir.as_posix()
+    generated = generated.rstrip("/")
+    if not generated:
+        return False
+    return all(path == generated or path.startswith(f"{generated}/") for path in paths)
 
 
 def _status_has_image_drift(status: ClusterStatus) -> bool:
