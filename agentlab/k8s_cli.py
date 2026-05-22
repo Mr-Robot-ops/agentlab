@@ -1,18 +1,25 @@
 from __future__ import annotations
 
+import json
+from dataclasses import asdict
 from pathlib import Path
 
 import typer
 
 from agentlab.k8s_operator import (
+    CONFIG_SETTING_PATHS,
     DEFAULT_MANIFEST_DIR,
     DEFAULT_NAMESPACE,
     ArtifactNotFoundError,
+    ConfigSetReport,
+    ConfigValueReport,
     K8sOperator,
     K8sOperatorError,
     TuiUnavailableError,
     format_cleanup_report,
     format_failed_resources,
+    format_health,
+    format_mrs,
     format_runs,
     format_status,
     format_upgrade_report,
@@ -23,6 +30,8 @@ from agentlab.k8s_operator import (
 
 
 k8s_app = typer.Typer(help="Operate AgentLab Kubernetes runtime resources.")
+config_app = typer.Typer(help="Read and safely update allowed AgentLab ConfigMap settings.")
+k8s_app.add_typer(config_app, name="config")
 
 LOG_COMPONENT_COMPLETIONS = ("latest", "watch", "plan", "action", "review-comments", "doctor")
 RUN_COMPONENT_COMPLETIONS = ("watch", "plan", "action", "review-comments", "doctor", "reset-state")
@@ -71,6 +80,10 @@ def complete_artifact(incomplete: str = "") -> list[str]:
     return _complete_static(ARTIFACT_COMPLETIONS, incomplete)
 
 
+def complete_config_path(incomplete: str = "") -> list[str]:
+    return _complete_static(CONFIG_SETTING_PATHS, incomplete)
+
+
 def _operator(namespace: str, manifest_dir: Path = DEFAULT_MANIFEST_DIR) -> K8sOperator:
     return K8sOperator(namespace=namespace, manifest_dir=manifest_dir)
 
@@ -78,6 +91,29 @@ def _operator(namespace: str, manifest_dir: Path = DEFAULT_MANIFEST_DIR) -> K8sO
 def _fail(message: str, *, code: int = 1) -> None:
     typer.echo(message, err=True)
     raise typer.Exit(code=code)
+
+
+def _format_config_value(value: object, *, exists: bool = True) -> str:
+    if not exists:
+        return "<unset>"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def format_config_value_report(report: ConfigValueReport) -> str:
+    return f"{report.path}: {_format_config_value(report.value, exists=report.exists)}"
+
+
+def format_config_set_report(report: ConfigSetReport) -> str:
+    return "\n".join(
+        [
+            report.path,
+            f"Before: {_format_config_value(report.before, exists=report.before_exists)}",
+            f"After: {_format_config_value(report.after)}",
+            f"Changed: {'yes' if report.changed else 'no'}",
+        ]
+    )
 
 
 @k8s_app.command()
@@ -88,6 +124,58 @@ def status(
     """Show current AgentLab Kubernetes status."""
     operator = _operator(namespace, manifest_dir or DEFAULT_MANIFEST_DIR)
     typer.echo(format_status(operator.status(manifest_dir=manifest_dir)))
+
+
+@k8s_app.command()
+def mrs(
+    namespace: str = typer.Option(DEFAULT_NAMESPACE, "--namespace"),
+    state: str = typer.Option("opened", "--state", help="GitLab merge request state to list."),
+    label: str = typer.Option("agent/generated", "--label", help="Required merge request label."),
+    secret_name: str = typer.Option("agentlab-secrets", "--secret-name", help="Kubernetes Secret containing the GitLab token."),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON."),
+) -> None:
+    """List AgentLab-generated GitLab merge requests."""
+    try:
+        report = _operator(namespace).mrs(state=state, label=label, secret_name=secret_name)
+    except K8sOperatorError as exc:
+        _fail(str(exc))
+    if json_output:
+        typer.echo(
+            json.dumps(
+                {
+                    "namespace": report.namespace,
+                    "state": report.state,
+                    "label": report.label,
+                    "merge_requests": report.merge_requests,
+                },
+                indent=2,
+            )
+        )
+        return
+    typer.echo(format_mrs(report))
+
+
+@k8s_app.command()
+def health(
+    namespace: str = typer.Option(DEFAULT_NAMESPACE, "--namespace"),
+    manifest_dir: Path | None = typer.Option(DEFAULT_MANIFEST_DIR, "--manifest-dir"),
+    pvc: str = typer.Option("agentlab-runs", "--pvc"),
+    shell_pod: str = typer.Option("artifact-shell", "--shell-pod"),
+    json_output: bool = typer.Option(False, "--json", help="Output JSON."),
+) -> None:
+    """Show a compact AgentLab runtime health summary."""
+    try:
+        report = _operator(namespace, manifest_dir or DEFAULT_MANIFEST_DIR).health(
+            manifest_dir=manifest_dir,
+            pvc=pvc,
+            shell_pod=shell_pod,
+        )
+    except K8sOperatorError as exc:
+        _fail(str(exc))
+    if json_output:
+        typer.echo(json.dumps(asdict(report), indent=2))
+        return
+    typer.echo(format_health(report))
 
 
 @k8s_app.command()
@@ -110,6 +198,33 @@ def logs(
         _fail(str(exc))
     if output:
         typer.echo(output)
+
+
+@config_app.command("get")
+def config_get(
+    path: str = typer.Argument(..., autocompletion=complete_config_path),
+    namespace: str = typer.Option(DEFAULT_NAMESPACE, "--namespace"),
+) -> None:
+    """Read an allowed AgentLab ConfigMap setting."""
+    try:
+        report = _operator(namespace).config_get(path)
+    except K8sOperatorError as exc:
+        _fail(str(exc))
+    typer.echo(format_config_value_report(report))
+
+
+@config_app.command("set")
+def config_set(
+    path: str = typer.Argument(..., autocompletion=complete_config_path),
+    value: str = typer.Argument(...),
+    namespace: str = typer.Option(DEFAULT_NAMESPACE, "--namespace"),
+) -> None:
+    """Update an allowed AgentLab ConfigMap setting."""
+    try:
+        report = _operator(namespace).config_set(path, value)
+    except K8sOperatorError as exc:
+        _fail(str(exc))
+    typer.echo(format_config_set_report(report))
 
 
 @k8s_app.command()
