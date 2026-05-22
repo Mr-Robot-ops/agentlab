@@ -17,6 +17,8 @@ from agentlab.k8s_operator import (
     KubectlResult,
     FallbackTUIAdapter,
     QuestionaryTUIAdapter,
+    QUESTIONARY_TUI_INSTALL_HINT,
+    QUESTIONARY_TUI_STYLE_RULES,
     TuiChoice,
     TuiUnavailableError,
     artifact_path,
@@ -29,6 +31,8 @@ from agentlab.k8s_operator import (
     job_prefix_for_component,
     kubectl_args,
     manifest_for_component,
+    build_questionary_tui_style,
+    create_tui_adapter,
     resolve_tui_choice,
     run_tui,
 )
@@ -1745,6 +1749,10 @@ def test_fallback_confirm_defaults_match_prompt() -> None:
 
 
 def test_questionary_adapter_select_confirm_and_text() -> None:
+    class FakeStyle:
+        def __init__(self, rules):
+            self.rules = rules
+
     class FakePrompt:
         def __init__(self, answer):
             self.answer = answer
@@ -1753,6 +1761,8 @@ def test_questionary_adapter_select_confirm_and_text() -> None:
             return self.answer
 
     class FakeQuestionary:
+        Style = FakeStyle
+
         def __init__(self) -> None:
             self.calls: list[tuple[str, object]] = []
 
@@ -1760,12 +1770,12 @@ def test_questionary_adapter_select_confirm_and_text() -> None:
             self.calls.append(("select", (message, kwargs)))
             return FakePrompt("Doctor")
 
-        def confirm(self, message, *, default=False):
-            self.calls.append(("confirm", (message, default)))
+        def confirm(self, message, **kwargs):
+            self.calls.append(("confirm", (message, kwargs)))
             return FakePrompt(None)
 
-        def text(self, message, *, default=""):
-            self.calls.append(("text", (message, default)))
+        def text(self, message, **kwargs):
+            self.calls.append(("text", (message, kwargs)))
             return FakePrompt("")
 
     questionary = FakeQuestionary()
@@ -1774,6 +1784,42 @@ def test_questionary_adapter_select_confirm_and_text() -> None:
     assert adapter.select("Component", [TuiChoice("doctor", "Doctor")]) == "doctor"
     assert adapter.confirm("Run doctor after apply?", default=True) is True
     assert adapter.text("Run ID", default="latest") == "latest"
+
+    assert adapter.style is not None
+    assert adapter.style.rules == QUESTIONARY_TUI_STYLE_RULES
+    assert questionary.calls[0][1][1]["style"] is adapter.style
+    assert questionary.calls[1][1][1]["style"] is adapter.style
+    assert questionary.calls[2][1][1]["style"] is adapter.style
+
+
+def test_questionary_tui_style_uses_pointer_without_background() -> None:
+    class FakeStyle:
+        def __init__(self, rules):
+            self.rules = dict(rules)
+
+    class FakeQuestionary:
+        Style = FakeStyle
+
+    style = build_questionary_tui_style(FakeQuestionary)
+
+    assert style.rules["pointer"] == "bold"
+    assert style.rules["highlighted"] == "bold"
+    assert style.rules["selected"] == ""
+    assert all("bg:" not in rule for rule in style.rules.values())
+
+
+def test_create_tui_adapter_missing_questionary_prints_install_hint_once(monkeypatch) -> None:
+    def fake_import_module(name: str):
+        assert name == "questionary"
+        raise ImportError(name)
+
+    output: list[str] = []
+    monkeypatch.setattr("agentlab.k8s_operator.importlib.import_module", fake_import_module)
+
+    adapter = create_tui_adapter(input_func=lambda _prompt: "quit", output_func=output.append)
+
+    assert isinstance(adapter, FallbackTUIAdapter)
+    assert output == [QUESTIONARY_TUI_INSTALL_HINT]
 
 
 def test_tui_artifact_shell_prompt_defaults_to_yes() -> None:
