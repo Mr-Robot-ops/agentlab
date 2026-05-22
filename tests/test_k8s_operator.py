@@ -765,6 +765,58 @@ def test_upgrade_treats_doctor_warning_as_nonfatal(tmp_path: Path) -> None:
     assert report.applied is True
 
 
+def test_doctor_empty_logs_are_retried_until_warning(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path)
+    runner = FakeRunner()
+    args = ["-n", "agentlab", "logs", "job/agentlab-doctor"]
+    runner.respond_many(
+        args,
+        [
+            KubectlResult(args=args, stdout="", returncode=0),
+            KubectlResult(args=args, stdout="AgentLab doctor: warning\n", returncode=0),
+        ],
+    )
+
+    report = K8sOperator(
+        manifest_dir=tmp_path,
+        runner=runner,
+        log_retry_delay_seconds=0,
+    ).upgrade(
+        image="registry/agentlab:new",
+        apply=True,
+        run_doctor=True,
+    )
+
+    assert report.doctor_status == "warning"
+    assert [call[0] for call in runner.calls].count(args) == 2
+
+
+def test_doctor_partial_logs_are_retried_until_warning(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path)
+    runner = FakeRunner()
+    args = ["-n", "agentlab", "logs", "job/agentlab-doctor"]
+    runner.respond_many(
+        args,
+        [
+            KubectlResult(args=args, stdout="checking AgentLab configuration...\n", returncode=0),
+            KubectlResult(args=args, stdout="checking AgentLab configuration...\nAgentLab doctor: warning\n", returncode=0),
+        ],
+    )
+
+    report = K8sOperator(
+        manifest_dir=tmp_path,
+        runner=runner,
+        log_retry_delay_seconds=0,
+    ).upgrade(
+        image="registry/agentlab:new",
+        apply=True,
+        run_doctor=True,
+    )
+
+    assert report.doctor_status == "warning"
+    assert [call[0] for call in runner.calls].count(args) == 2
+
+
 def test_upgrade_treats_doctor_failed_as_fatal(tmp_path: Path) -> None:
     write_upgrade_manifests(tmp_path)
     runner = FakeRunner()
@@ -772,6 +824,56 @@ def test_upgrade_treats_doctor_failed_as_fatal(tmp_path: Path) -> None:
 
     with pytest.raises(K8sOperatorError, match="Doctor failed"):
         K8sOperator(manifest_dir=tmp_path, runner=runner).upgrade(
+            image="registry/agentlab:new",
+            apply=True,
+            run_doctor=True,
+        )
+
+
+def test_doctor_repeated_empty_logs_fail_clearly(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path)
+    runner = FakeRunner()
+    args = ["-n", "agentlab", "logs", "job/agentlab-doctor"]
+    runner.respond_many(
+        args,
+        [
+            KubectlResult(args=args, stdout="", returncode=0),
+            KubectlResult(args=args, stdout="", returncode=0),
+        ],
+    )
+
+    with pytest.raises(K8sOperatorError, match="Doctor logs were empty after retries"):
+        K8sOperator(
+            manifest_dir=tmp_path,
+            runner=runner,
+            log_retry_attempts=2,
+            log_retry_delay_seconds=0,
+        ).upgrade(
+            image="registry/agentlab:new",
+            apply=True,
+            run_doctor=True,
+        )
+
+
+def test_doctor_repeated_partial_logs_fail_with_last_snippet(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path)
+    runner = FakeRunner()
+    args = ["-n", "agentlab", "logs", "job/agentlab-doctor"]
+    runner.respond_many(
+        args,
+        [
+            KubectlResult(args=args, stdout="checking config\n", returncode=0),
+            KubectlResult(args=args, stdout="still checking config\n", returncode=0),
+        ],
+    )
+
+    with pytest.raises(K8sOperatorError, match="Last log snippet: still checking config"):
+        K8sOperator(
+            manifest_dir=tmp_path,
+            runner=runner,
+            log_retry_attempts=2,
+            log_retry_delay_seconds=0,
+        ).upgrade(
             image="registry/agentlab:new",
             apply=True,
             run_doctor=True,
