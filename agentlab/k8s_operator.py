@@ -2020,6 +2020,33 @@ def _invalid_tui_selection_message(raw: str, choices: list[TuiChoice]) -> str:
     return f"Invalid selection: {raw}\nValid choices: 1-{upper} or {values}"
 
 
+QUESTIONARY_TUI_STYLE_RULES = [
+    ("qmark", "bold"),
+    ("question", "bold"),
+    ("answer", "bold"),
+    ("pointer", "bold"),
+    ("highlighted", "bold"),
+    ("selected", ""),
+    ("separator", ""),
+    ("instruction", ""),
+    ("text", ""),
+    ("disabled", "fg:#888888"),
+]
+
+QUESTIONARY_TUI_INSTALL_HINT = (
+    "Arrow-key TUI support requires `questionary`.\n"
+    "Install it with: python -m pip install -e '.[tui]'\n"
+    "Falling back to numbered input."
+)
+
+
+def build_questionary_tui_style(questionary_module: Any) -> Any | None:
+    style_factory = getattr(questionary_module, "Style", None)
+    if style_factory is None:
+        return None
+    return style_factory(QUESTIONARY_TUI_STYLE_RULES)
+
+
 class TUIAdapter(Protocol):
     def select(self, label: str, choices: list[str | TuiChoice], *, default: str | None = None) -> str:
         ...
@@ -2077,8 +2104,9 @@ class FallbackTUIAdapter:
 
 
 class QuestionaryTUIAdapter:
-    def __init__(self, questionary_module: Any) -> None:
+    def __init__(self, questionary_module: Any, *, style: Any | None = None) -> None:
         self.questionary = questionary_module
+        self.style = build_questionary_tui_style(questionary_module) if style is None else style
 
     def select(self, label: str, choices: list[str | TuiChoice], *, default: str | None = None) -> str:
         normalized = [_tui_choice(choice) for choice in choices]
@@ -2088,6 +2116,8 @@ class QuestionaryTUIAdapter:
         kwargs: dict[str, Any] = {"choices": labels}
         if default_label is not None:
             kwargs["default"] = default_label
+        if self.style is not None:
+            kwargs["style"] = self.style
         answer = self._ask(self.questionary.select(label, **kwargs))
         if not answer:
             if default is not None:
@@ -2096,11 +2126,17 @@ class QuestionaryTUIAdapter:
         return values_by_label.get(str(answer), str(answer))
 
     def confirm(self, message: str, *, default: bool = False) -> bool:
-        answer = self._ask(self.questionary.confirm(message, default=default))
+        kwargs: dict[str, Any] = {"default": default}
+        if self.style is not None:
+            kwargs["style"] = self.style
+        answer = self._ask(self.questionary.confirm(message, **kwargs))
         return default if answer is None else bool(answer)
 
     def text(self, label: str, *, default: str | None = None) -> str:
-        answer = self._ask(self.questionary.text(label, default=default or ""))
+        kwargs: dict[str, Any] = {"default": default or ""}
+        if self.style is not None:
+            kwargs["style"] = self.style
+        answer = self._ask(self.questionary.text(label, **kwargs))
         if answer is None:
             raise TuiCancelled("Cancelled.")
         value = str(answer).strip()
@@ -2117,10 +2153,13 @@ def create_tui_adapter(
     *,
     input_func: Callable[[str], str] = input,
     output_func: Callable[[str], None] = print,
+    notify_missing_questionary: bool = True,
 ) -> TUIAdapter:
     try:
         questionary = importlib.import_module("questionary")
     except ImportError:
+        if notify_missing_questionary:
+            output_func(QUESTIONARY_TUI_INSTALL_HINT)
         return FallbackTUIAdapter(input_func=input_func, output_func=output_func)
     return QuestionaryTUIAdapter(questionary)
 
