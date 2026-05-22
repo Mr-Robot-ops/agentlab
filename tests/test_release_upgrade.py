@@ -35,6 +35,7 @@ class FakeK8sOperator:
         self.calls: list[tuple[str, object]] = []
         self.upgrade_image_drift: list[str] = []
         self.status_image_drift = False
+        self.doctor_status = "completed"
 
     def upgrade(self, **kwargs):
         self.calls.append(("upgrade", kwargs))
@@ -50,7 +51,7 @@ class FakeK8sOperator:
                 "apply": kwargs.get("apply", False),
                 "applied": kwargs.get("apply", False),
                 "run_doctor": kwargs.get("run_doctor", False),
-                "doctor_status": "completed" if kwargs.get("run_doctor", False) else "not requested",
+                "doctor_status": self.doctor_status if kwargs.get("run_doctor", False) else "not requested",
                 "cleanup_failed": kwargs.get("cleanup_failed", False),
                 "cleanup_report": None,
                 "status_checked": kwargs.get("show_status", False),
@@ -265,6 +266,19 @@ def test_successful_apply_flow_runs_steps_in_order(tmp_path: Path) -> None:
         },
     )
     assert operator.calls[1][0] == "status"
+    assert report.failed_step is None
+
+
+def test_release_upgrade_propagates_doctor_warning_as_nonfatal(tmp_path: Path) -> None:
+    operator = FakeK8sOperator()
+    operator.doctor_status = "warning"
+    upgrader, _runner, _operator = make_upgrader(operator)
+
+    report = upgrader.run(options(tmp_path, apply=True))
+
+    upgrade_step = next(step for step in report.steps if step.name == "Kubernetes upgrade")
+    assert upgrade_step.status == "passed"
+    assert "- doctor: warning" in upgrade_step.stdout
     assert report.failed_step is None
 
 
