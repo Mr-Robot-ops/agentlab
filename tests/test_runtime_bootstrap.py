@@ -93,6 +93,8 @@ def test_kubernetes_configmap_safe_defaults_and_connection_values(tmp_path):
     config = config_from_configmap(out)
 
     assert "registry.local/agentlab:0.1.0" in raw_configmap
+    assert "mr-robot-ops.github.io/agentlab-image" in raw_configmap
+    assert "agentlab.io/image" not in raw_configmap
     assert config["gitlab_url"] == "https://gitlab.local"
     assert config["project_id"] == "group/project"
     assert config["target_repo_url"] == "https://gitlab.local/group/project.git"
