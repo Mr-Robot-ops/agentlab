@@ -34,7 +34,7 @@ agentlab release upgrade \
   --prepare-only
 ```
 
-Prepare-only checks Git state, pulls code unless `--skip-git-pull` is used, optionally bootstraps Kubernetes manifests, and runs tests. It does not build, push, apply Kubernetes manifests, or run status verification.
+Prepare-only checks Git state, pulls code unless `--skip-git-pull` is used, verifies that Kubernetes manifests exist or bootstraps them when `--bootstrap-k8s` is supplied, and runs tests. It does not build, push, apply Kubernetes manifests, or run status verification.
 
 ## Bootstrap Missing Kubernetes Manifests
 

@@ -260,8 +260,7 @@ class ReleaseUpgrader:
             self._run_command(report, "Git pull", options.git_pull_command(), cwd=repo)
             self._check_git_status(report, options, "Git status after pull", cwd=repo)
 
-        if not options.prepare_only or options.bootstrap_k8s:
-            self._ensure_manifest_dir(options, report, repo=repo, manifest_dir=manifest_dir)
+        self._ensure_manifest_dir(options, report, repo=repo, manifest_dir=manifest_dir)
 
         if options.skip_tests:
             report.steps.append(ReleaseStep(name="Tests", status="skipped", detail="--skip-tests"))
@@ -381,10 +380,9 @@ class ReleaseUpgrader:
         else:
             report.steps.append(ReleaseStep(name="Git pull", status="planned", command=options.git_pull_command()))
             report.steps.append(ReleaseStep(name="Git status after pull", status="planned", command=["git", "status", "--porcelain"]))
-        if not options.prepare_only or options.bootstrap_k8s:
-            if options.bootstrap_k8s:
-                report.steps.append(ReleaseStep(name="Kubernetes bootstrap", status="planned", command=options.bootstrap_command()))
-            report.steps.append(ReleaseStep(name="Kubernetes manifest preflight", status="planned"))
+        if options.bootstrap_k8s:
+            report.steps.append(ReleaseStep(name="Kubernetes bootstrap", status="planned", command=options.bootstrap_command()))
+        report.steps.append(ReleaseStep(name="Kubernetes manifest preflight", status="planned"))
         if options.skip_tests:
             report.steps.append(ReleaseStep(name="Tests", status="skipped", detail="--skip-tests"))
         else:

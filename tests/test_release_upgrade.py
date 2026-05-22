@@ -434,6 +434,23 @@ def test_prepare_only_runs_tests_and_skips_docker_and_k8s(tmp_path: Path) -> Non
     assert any(step.name == "Kubernetes upgrade" and step.detail == "--prepare-only" for step in report.steps)
 
 
+def test_prepare_only_missing_manifest_dir_fails_before_tests(tmp_path: Path) -> None:
+    upgrader, runner, operator = make_upgrader()
+
+    try:
+        upgrader.run(options(tmp_path, prepare_only=True, create_manifest_dir=False, skip_tests=False))
+    except ReleaseUpgradeError as exc:
+        report = exc.report
+    else:
+        raise AssertionError("expected manifest preflight failure")
+
+    assert [call[0] for call in runner.calls] == [["git", "status", "--porcelain"]]
+    assert [sys.executable, "-m", "pytest"] not in [call[0] for call in runner.calls]
+    assert operator.calls == []
+    assert report.failed_step is not None
+    assert report.failed_step.name == "Kubernetes manifest preflight"
+
+
 def test_release_upgrade_propagates_doctor_warning_as_nonfatal(tmp_path: Path) -> None:
     operator = FakeK8sOperator()
     operator.doctor_status = "warning"
