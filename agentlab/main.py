@@ -103,9 +103,12 @@ def scheduler_plan(config: Path = typer.Option(..., "--config", exists=True, rea
 
 
 @app.command("scheduler-action")
-def scheduler_action(config: Path = typer.Option(..., "--config", exists=True, readable=True)) -> None:
+def scheduler_action(
+    config: Path = typer.Option(..., "--config", exists=True, readable=True),
+    task_id: str | None = typer.Option(None, "--task-id", help="Run a specific approved scheduler task by ID."),
+) -> None:
     cfg = load_config(config)
-    _json_echo(Scheduler(cfg).action())
+    _json_echo(Scheduler(cfg).action(task_id=task_id))
 
 
 @app.command("scheduler-review-comments")

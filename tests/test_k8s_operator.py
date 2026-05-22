@@ -324,6 +324,62 @@ def test_run_component_uses_generated_manifest_and_fixed_job_name(tmp_path: Path
     assert runner.calls[1][0] == ["-n", "agentlab", "apply", "-f", str(manifest)]
 
 
+def test_run_component_action_task_id_patches_generated_job_command(tmp_path: Path) -> None:
+    manifest = tmp_path / "job-scheduler-action.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {
+                "kind": "Job",
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "containers": [
+                                {
+                                    "name": "agentlab",
+                                    "args": ["scheduler-action", "--config", "/etc/agentlab/config.yaml"],
+                                }
+                            ]
+                        }
+                    }
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    runner = FakeRunner()
+
+    used = K8sOperator(manifest_dir=tmp_path, runner=runner).run_component(
+        "action",
+        follow=False,
+        task_id="tests-02-smoke-baseline",
+    )
+
+    assert used == str(manifest)
+    assert runner.calls[1][0] == ["-n", "agentlab", "apply", "-f", "-"]
+    applied = yaml.safe_load(runner.calls[1][1] or "")
+    args = applied["spec"]["template"]["spec"]["containers"][0]["args"]
+    assert args == [
+        "scheduler-action",
+        "--config",
+        "/etc/agentlab/config.yaml",
+        "--task-id",
+        "tests-02-smoke-baseline",
+    ]
+
+
+def test_run_component_task_id_is_action_only(tmp_path: Path) -> None:
+    manifest = tmp_path / "job-scheduler-plan.yaml"
+    manifest.write_text("kind: Job\n", encoding="utf-8")
+
+    with pytest.raises(K8sOperatorError, match="only supported for the action component"):
+        K8sOperator(manifest_dir=tmp_path, runner=FakeRunner()).run_component(
+            "plan",
+            follow=False,
+            task_id="tests-02-smoke-baseline",
+        )
+
+
 def test_run_component_fails_clearly_when_manifest_missing(tmp_path: Path) -> None:
     with pytest.raises(K8sOperatorError, match="Re-run Kubernetes bootstrap"):
         K8sOperator(manifest_dir=tmp_path, runner=FakeRunner()).run_component("reset-state", follow=False)
