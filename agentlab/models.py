@@ -243,6 +243,21 @@ class TestReport(StrictModel):
     recommendation: str = ""
 
 
+class TestQualityFinding(StrictModel):
+    path: str
+    line: int | None = Field(default=None, ge=1)
+    reason: str
+    description: str = ""
+
+
+class TestQualityReport(StrictModel):
+    status: ReportStatus
+    passed: bool
+    findings: list[TestQualityFinding] = Field(default_factory=list)
+    reason: str = ""
+    recommendation: str = ""
+
+
 class Finding(StrictModel):
     tool: str
     severity: FindingSeverity
@@ -379,6 +394,7 @@ class GateContext(StrictModel):
     risk: RiskAssessment
     diff_stats: DiffStats
     functional_tests: TestReport
+    test_quality: TestQualityReport | None = None
     build_security: BuildSecurityReport
     quality_review: ReviewReport
     security_review: ReviewReport

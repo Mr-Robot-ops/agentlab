@@ -12,6 +12,7 @@ from agentlab.models import (
     ReviewReport,
     RiskAssessment,
     SupplyChainReport,
+    TestQualityReport,
     TestReport,
     Verdict,
 )
@@ -33,6 +34,7 @@ class PolicyEngine:
         quality_review: ReviewReport,
         security_review: ReviewReport,
         rollback_plan: str | None,
+        test_quality: TestQualityReport | None = None,
         supply_chain: SupplyChainReport | None = None,
         docs_check: DocsCheckReport | None = None,
         direct_main_push: bool = False,
@@ -146,6 +148,15 @@ class PolicyEngine:
                 "project structure evidence failed",
             )
             blockers.extend(_docs_check_blockers(docs_check))
+
+        if test_quality is not None:
+            if test_quality.status != ReportStatus.SKIPPED:
+                check_statuses["test_quality"] = test_quality.status.value
+                checks["test_quality_passed"] = test_quality.status == ReportStatus.PASSED and test_quality.passed
+                if not checks["test_quality_passed"]:
+                    blockers.append("placeholder test detected")
+                    if test_quality.reason:
+                        reasons.append(test_quality.reason)
 
         if self.config.require_two_testers:
             skip_functional_tests = readme_only and not self.config.required_test_commands

@@ -18,6 +18,7 @@ from agentlab.agents.review_security_architecture import SecurityArchitectureRev
 from agentlab.agents.rollback import RollbackRecoveryAgent
 from agentlab.agents.test_build_security import BuildSecurityTestAgent
 from agentlab.agents.test_functional import FunctionalTestAgent
+from agentlab.agents.test_quality import TestQualityAgent
 from agentlab.audit import AuditLogger
 from agentlab.config import AppConfig
 from agentlab.models import (
@@ -410,8 +411,11 @@ class Orchestrator:
                 )
         else:
             with self.audit.span(agent="functional_test", action="run_tests"):
-                functional = FunctionalTestAgent(file_tool, test_tool).run()
+                functional = FunctionalTestAgent(file_tool, test_tool, changed_files=diff_stats.changed_files).run()
         self.artifacts.write_json("functional_test_report", functional)
+        with self.audit.span(agent="test_quality", action="check_tests"):
+            test_quality = TestQualityAgent(file_tool).run(diff_stats.changed_files)
+        self.artifacts.write_json("test_quality_report", test_quality)
         with self.audit.span(agent="build_security_test", action="run_build_and_security_checks"):
             build_security = BuildSecurityTestAgent(
                 file_tool,
@@ -438,6 +442,7 @@ class Orchestrator:
                 build_security=build_security,
                 quality_review=quality_review,
                 security_review=security_review,
+                test_quality=test_quality,
                 supply_chain=supply_chain,
                 docs_check=docs_check,
                 rollback_plan=rollback_plan,
@@ -450,6 +455,7 @@ class Orchestrator:
             risk=risk,
             diff_stats=diff_stats,
             functional_tests=functional,
+            test_quality=test_quality,
             build_security=build_security,
             quality_review=quality_review,
             security_review=security_review,

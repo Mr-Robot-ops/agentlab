@@ -15,6 +15,7 @@ from agentlab.models import (
     RiskLevel,
     TaskPlan,
     TaskType,
+    TestReport as AgentTestReport,
     Verdict,
 )
 from agentlab.orchestrator import Orchestrator
@@ -285,3 +286,97 @@ def test_review_and_gate_skips_functional_tests_for_readme_only_without_required
     assert getattr(docs_report, "structure_evidence_check") == "skipped"
     functional = orchestrator.artifacts.payloads["functional_test_report"]
     assert getattr(functional, "status") == ReportStatus.SKIPPED
+
+
+class FakeRustGit:
+    def diff(self, base: str = "main") -> str:
+        return "diff --git a/rust-backend/tests/smoke.rs b/rust-backend/tests/smoke.rs\n"
+
+    def diff_stats(self, base: str = "main", protected_paths: list[str] | None = None) -> DiffStats:
+        return DiffStats(changed_files=["rust-backend/tests/smoke.rs"], added_lines=4)
+
+
+class FakeRustFileTool:
+    def list_files(self) -> list[str]:
+        return ["rust-backend/Cargo.toml", "rust-backend/tests/smoke.rs"]
+
+    def read_file(self, path: str) -> str:
+        if path == "rust-backend/Cargo.toml":
+            return '[package]\nname = "rust-backend"\nversion = "0.1.0"\nedition = "2021"\n'
+        if path == "rust-backend/tests/smoke.rs":
+            return "#[test]\nfn test_smoke() {\n    assert!(true);\n}\n"
+        raise FileNotFoundError(path)
+
+
+class RustPlaceholderGateOrchestrator(Orchestrator):
+    def __init__(self, config: AppConfig) -> None:
+        self.config = config
+        self.dry_run = False
+        self.run_id = "run-1"
+        self.audit = FakeAudit()
+        self.artifacts = FakeArtifacts()
+        self.ollama = object()
+
+    def _tools(self):  # type: ignore[override]
+        return FakeRustGit(), FakeRustFileTool(), object(), object()
+
+
+def test_review_and_gate_writes_test_quality_report_and_blocks_placeholder_tests(monkeypatch) -> None:
+    class PassingFunctionalTestAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def run(self):
+            return AgentTestReport(status=ReportStatus.PASSED, passed=True)
+
+    class PassingBuildSecurityAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def run(self) -> BuildSecurityReport:
+            return BuildSecurityReport(status=ReportStatus.PASSED, passed=True)
+
+    class ApprovedQualityAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def review(self, diff_text: str) -> ReviewReport:
+            return ReviewReport(reviewer="quality", verdict=Verdict.APPROVED, summary="ok")
+
+    class ApprovedSecurityAgent:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def review(self, diff_text: str) -> ReviewReport:
+            return ReviewReport(reviewer="security_architecture", verdict=Verdict.APPROVED, summary="ok")
+
+    monkeypatch.setattr("agentlab.orchestrator.FunctionalTestAgent", PassingFunctionalTestAgent)
+    monkeypatch.setattr("agentlab.orchestrator.BuildSecurityTestAgent", PassingBuildSecurityAgent)
+    monkeypatch.setattr("agentlab.orchestrator.CodeQualityReviewAgent", ApprovedQualityAgent)
+    monkeypatch.setattr("agentlab.orchestrator.SecurityArchitectureReviewAgent", ApprovedSecurityAgent)
+    cfg = AppConfig(
+        gitlab_url="https://gitlab.example.com",
+        project_id=1,
+        target_repo_path=Path("."),
+        workspace_root=Path(".runs"),
+        auto_merge_enabled=True,
+        supply_chain_enabled=False,
+    )
+    orchestrator = RustPlaceholderGateOrchestrator(cfg)
+
+    decision = orchestrator.review_and_gate(
+        AgentTask(
+            id="tests-02-smoke-baseline",
+            title="Add smoke baseline",
+            task_type=TaskType.TESTS,
+            affected_files=["rust-backend/tests/smoke.rs"],
+            approved=True,
+        )
+    )
+
+    assert decision.allowed is False
+    assert decision.check_statuses["test_quality"] == "failed"
+    assert "placeholder test detected" in decision.blockers
+    report = orchestrator.artifacts.payloads["test_quality_report"]
+    assert getattr(report, "reason") == "placeholder_test_detected"
+    assert getattr(report, "findings")[0].path == "rust-backend/tests/smoke.rs"

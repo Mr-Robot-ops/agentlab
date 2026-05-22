@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import dataclass
 
@@ -20,6 +21,7 @@ class ParsedCommand:
 
 class CommandPolicy:
     SHELL_META = (";", "&&", "||", "|", ">", "<", "$(", "`", "\n", "\r")
+    SAFE_CD_RE = re.compile(r"\s*cd\s+([A-Za-z0-9._/-]+)\s+&&\s+(.+?)\s*")
 
     def __init__(self, *, allowed_commands: list[str], forbidden_commands: list[str]) -> None:
         self.allowed_commands = [command.strip() for command in allowed_commands if command.strip()]
@@ -30,6 +32,10 @@ class CommandPolicy:
         if not raw:
             raise CommandPolicyError("empty command")
         lowered = raw.lower()
+        safe_cd = self._safe_cd_inner(raw)
+        if safe_cd is not None:
+            parsed_inner = self.parse(safe_cd)
+            return ParsedCommand(raw=raw, argv=parsed_inner.argv)
         if any(meta in raw for meta in self.SHELL_META):
             raise CommandPolicyError("shell metacharacters are not allowed")
         for forbidden in self.forbidden_commands:
@@ -59,3 +65,13 @@ class CommandPolicy:
             if lowered == allowed_lower or lowered.startswith(allowed_lower + " "):
                 return True
         return False
+
+    def _safe_cd_inner(self, command: str) -> str | None:
+        match = self.SAFE_CD_RE.fullmatch(command)
+        if not match:
+            return None
+        path = match.group(1)
+        parts = path.replace("\\", "/").split("/")
+        if path.startswith("/") or any(part in {"", ".", ".."} for part in parts):
+            raise CommandPolicyError("unsafe cd path")
+        return match.group(2)
