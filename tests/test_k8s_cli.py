@@ -186,8 +186,58 @@ def test_k8s_help_alias_lists_key_commands() -> None:
     result = runner.invoke(app, ["k8s", "help"])
 
     assert result.exit_code == 0
-    for command in ("status", "mrs", "health", "logs", "run", "artifact", "upgrade", "config", "tui"):
+    for command in ("status", "mrs", "health", "logs", "run", "artifact", "upgrade", "config", "tui", "tui-check"):
         assert command in result.output
+
+
+def test_k8s_tui_check_reports_available(monkeypatch) -> None:
+    monkeypatch.setattr(k8s_cli.importlib.util, "find_spec", lambda name: object() if name == "questionary" else None)
+
+    result = runner.invoke(app, ["k8s", "tui-check"])
+
+    assert result.exit_code == 0
+    assert "Arrow-key TUI support: available" in result.output
+
+
+def test_k8s_tui_check_reports_missing_with_install_hint(monkeypatch) -> None:
+    monkeypatch.setattr(k8s_cli.importlib.util, "find_spec", lambda _name: None)
+
+    result = runner.invoke(app, ["k8s", "tui-check"])
+
+    assert result.exit_code == 0
+    assert "Arrow-key TUI support: missing" in result.output
+    assert "python -m pip install -e '.[tui]'" in result.output
+
+
+def test_k8s_tui_check_install_uses_current_interpreter(monkeypatch) -> None:
+    calls: list[tuple[list[str], bool]] = []
+
+    def fake_run(command: list[str], *, check: bool):
+        calls.append((command, check))
+        return type("Result", (), {"returncode": 0})()
+
+    monkeypatch.setattr(k8s_cli.importlib.util, "find_spec", lambda _name: None)
+    monkeypatch.setattr(k8s_cli.sys, "executable", "python-current")
+    monkeypatch.setattr(k8s_cli.subprocess, "run", fake_run)
+
+    result = runner.invoke(app, ["k8s", "tui-check", "--install"])
+
+    assert result.exit_code == 0
+    assert "Running: python-current -m pip install -e '.[tui]'" in result.output
+    assert calls == [(["python-current", "-m", "pip", "install", "-e", ".[tui]"], False)]
+
+
+def test_k8s_tui_check_install_failure_exits_clearly(monkeypatch) -> None:
+    def fake_run(command: list[str], *, check: bool):
+        return type("Result", (), {"returncode": 7})()
+
+    monkeypatch.setattr(k8s_cli.importlib.util, "find_spec", lambda _name: None)
+    monkeypatch.setattr(k8s_cli.subprocess, "run", fake_run)
+
+    result = runner.invoke(app, ["k8s", "tui-check", "--install"])
+
+    assert result.exit_code == 7
+    assert "questionary install failed with exit code 7" in result.output
 
 
 def test_k8s_command_invocation_still_works_with_completions(monkeypatch) -> None:
