@@ -56,9 +56,14 @@ class FakeRunner:
             raise K8sOperatorError(result.stderr or result.stdout or "kubectl failed")
         return result
 
-    def stream(self, args: list[str]) -> int:
+    def stream(self, args: list[str]) -> KubectlResult:
         self.stream_calls.append(args)
-        return 0
+        configured = self.responses.get(tuple(args), KubectlResult(args=args, returncode=0))
+        if isinstance(configured, list):
+            result = configured.pop(0) if configured else KubectlResult(args=args, returncode=0)
+        else:
+            result = configured
+        return result
 
     def interactive(self, args: list[str]) -> int:
         self.interactive_calls.append(args)
@@ -919,15 +924,15 @@ def test_container_creating_log_error_is_retried(tmp_path: Path) -> None:
     assert [call[0] for call in runner.calls].count(args) == 2
 
 
-def test_run_doctor_retries_container_creating_before_streaming(tmp_path: Path) -> None:
+def test_streaming_action_logs_retry_container_creating(tmp_path: Path) -> None:
     write_upgrade_manifests(tmp_path)
     runner = FakeRunner()
-    args = ["-n", "agentlab", "logs", "job/agentlab-doctor"]
+    args = ["-n", "agentlab", "logs", "job/agentlab-scheduler-action", "-f"]
     runner.respond_many(
         args,
         [
-            KubectlResult(args=args, stderr="pod is PodInitializing", returncode=1),
-            KubectlResult(args=args, stdout="AgentLab doctor: warning\n", returncode=0),
+            KubectlResult(args=args, stderr='container "agentlab" is waiting to start: ContainerCreating', returncode=1),
+            KubectlResult(args=args, stdout="action logs\n", returncode=0),
         ],
     )
 
@@ -935,10 +940,36 @@ def test_run_doctor_retries_container_creating_before_streaming(tmp_path: Path) 
         manifest_dir=tmp_path,
         runner=runner,
         log_retry_delay_seconds=0,
-    ).run_component("doctor", follow=True)
+    ).job_logs("agentlab-scheduler-action", follow=True)
 
-    assert [call[0] for call in runner.calls].count(args) == 2
-    assert runner.stream_calls == [["-n", "agentlab", "logs", "job/agentlab-doctor", "-f"]]
+    assert runner.stream_calls.count(args) == 2
+
+
+def test_run_component_action_retries_transient_stream_error(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path)
+    runner = FakeRunner()
+    args = ["-n", "agentlab", "logs", "job/agentlab-scheduler-action", "-f"]
+    runner.respond_many(
+        args,
+        [
+            KubectlResult(args=args, stderr="pod is PodInitializing", returncode=1),
+            KubectlResult(args=args, stdout="action logs\n", returncode=0),
+        ],
+    )
+
+    K8sOperator(
+        manifest_dir=tmp_path,
+        runner=runner,
+        log_retry_delay_seconds=0,
+    ).run_component("action", follow=True)
+
+    assert ["-n", "agentlab", "delete", "job", "agentlab-scheduler-action", "--ignore-not-found=true"] in [
+        call[0] for call in runner.calls
+    ]
+    assert ["-n", "agentlab", "apply", "-f", str(tmp_path / "job-scheduler-action.yaml")] in [
+        call[0] for call in runner.calls
+    ]
+    assert runner.stream_calls.count(args) == 2
 
 
 def test_format_upgrade_report_mentions_drift() -> None:
