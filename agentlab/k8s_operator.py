@@ -2025,7 +2025,7 @@ QUESTIONARY_TUI_STYLE_RULES = [
     ("question", "bold"),
     ("answer", "bold"),
     ("pointer", "bold"),
-    ("highlighted", ""),
+    ("highlighted", "bold fg:#ffffff bg:#444444"),
     ("selected", ""),
     ("instruction", ""),
     ("text", ""),
@@ -2114,10 +2114,7 @@ class QuestionaryTUIAdapter:
         normalized = [_tui_choice(choice) for choice in choices]
         labels = [choice.display for choice in normalized]
         values_by_label = {choice.display: choice.value for choice in normalized}
-        default_label = next((choice.display for choice in normalized if choice.value == default), None)
         kwargs: dict[str, Any] = {"choices": labels}
-        if default_label is not None:
-            kwargs["default"] = default_label
         if self.style is not None:
             kwargs["style"] = self.style
         answer = self._ask(self.questionary.select(label, **kwargs))
