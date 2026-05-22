@@ -377,6 +377,7 @@ class FileTool:
             "target_file_exists": target_path.exists(),
             "target_file_size": target_path.stat().st_size if target_path.exists() else 0,
             "candidate_contexts": _candidate_contexts(target_text, old_text or anchor or ""),
+            **structured_anchor_diagnostics(path=path, old_text=old_text or anchor or "", current_text=target_text),
         }
         return StructuredEditError(
             reason=reason,
@@ -474,6 +475,18 @@ def _repr_excerpt(value: str | None, limit: int = 500) -> str | None:
     return ascii(value[:limit])
 
 
+def structured_anchor_diagnostics(*, path: str, old_text: str | None, current_text: str) -> dict[str, object]:
+    old_text = old_text or ""
+    return {
+        "file_path": path,
+        "old_text_preview": _excerpt(old_text),
+        "old_text_repr_preview": _repr_excerpt(old_text),
+        "old_text_hash": _sha256(old_text),
+        "nearby_candidate_matches": _nearby_candidate_matches(current_text, old_text),
+        "current_relevant_headings": _current_relevant_headings(current_text, old_text),
+    }
+
+
 def _candidate_contexts(text: str, needle: str, *, limit: int = 500) -> list[str]:
     candidates: list[str] = []
     headings = [line.strip() for line in needle.splitlines() if line.lstrip().startswith("#")]
@@ -490,3 +503,125 @@ def _candidate_contexts(text: str, needle: str, *, limit: int = 500) -> list[str
         if len(candidates) >= 3:
             break
     return candidates
+
+
+def _nearby_candidate_matches(text: str, needle: str, *, limit: int = 3, excerpt_limit: int = 500) -> list[dict[str, object]]:
+    if not text or not needle:
+        return []
+    matches: list[dict[str, object]] = []
+    needle_norm = _normalize_text_for_match(needle)
+    needle_headings = {_normalize_heading_title(item["text"]) for item in _markdown_headings(needle)}
+    for section in _markdown_sections(text):
+        heading_norm = _normalize_heading_title(str(section["heading_text"]))
+        if needle_headings and heading_norm not in needle_headings:
+            continue
+        score = SequenceMatcher(None, needle_norm[:4000], _normalize_text_for_match(str(section["text"]))[:4000]).ratio()
+        matches.append(
+            {
+                "line": section["line"],
+                "heading": section["heading"],
+                "score": round(score, 3),
+                "excerpt": _excerpt(str(section["text"]).strip(), excerpt_limit),
+            }
+        )
+    if matches:
+        return sorted(matches, key=lambda item: float(item["score"]), reverse=True)[:limit]
+
+    for context in _candidate_contexts(text, needle, limit=excerpt_limit):
+        line = text[: max(0, text.find(context))].count("\n") + 1 if context in text else None
+        matches.append({"line": line, "heading": None, "score": None, "excerpt": context})
+        if len(matches) >= limit:
+            return matches
+
+    sections = _markdown_sections(text)
+    scored = []
+    for section in sections:
+        score = SequenceMatcher(None, needle_norm[:4000], _normalize_text_for_match(str(section["text"]))[:4000]).ratio()
+        scored.append((score, section))
+    for score, section in sorted(scored, key=lambda item: item[0], reverse=True)[:limit]:
+        if score <= 0:
+            continue
+        matches.append(
+            {
+                "line": section["line"],
+                "heading": section["heading"],
+                "score": round(score, 3),
+                "excerpt": _excerpt(str(section["text"]).strip(), excerpt_limit),
+            }
+        )
+    return matches
+
+
+def _current_relevant_headings(text: str, needle: str, *, limit: int = 20) -> list[dict[str, object]]:
+    headings = _markdown_headings(text)
+    if not headings:
+        return []
+    needle_headings = {_normalize_heading_title(item["text"]) for item in _markdown_headings(needle)}
+    relevant = [
+        {**heading, "relevance": "target_heading"}
+        for heading in headings
+        if needle_headings and _normalize_heading_title(str(heading["text"])) in needle_headings
+    ]
+    if not relevant:
+        relevant = [{**heading, "relevance": "current_heading"} for heading in headings[:limit]]
+    return [
+        {
+            "line": item["line"],
+            "level": item["level"],
+            "text": item["text"],
+            "markdown": item["markdown"],
+            "relevance": item["relevance"],
+        }
+        for item in relevant[:limit]
+    ]
+
+
+def _markdown_sections(text: str) -> list[dict[str, object]]:
+    lines = text.splitlines(keepends=True)
+    headings = _markdown_headings(text, include_index=True)
+    sections: list[dict[str, object]] = []
+    for index, heading in enumerate(headings):
+        start = int(heading["index"])
+        end = len(lines)
+        level = int(heading["level"])
+        for candidate in headings[index + 1 :]:
+            if int(candidate["level"]) <= level:
+                end = int(candidate["index"])
+                break
+        sections.append(
+            {
+                "line": heading["line"],
+                "level": level,
+                "heading": heading["markdown"],
+                "heading_text": heading["text"],
+                "text": "".join(lines[start:end]),
+            }
+        )
+    return sections
+
+
+def _markdown_headings(text: str, *, include_index: bool = False) -> list[dict[str, object]]:
+    headings: list[dict[str, object]] = []
+    for index, line in enumerate(text.splitlines(), start=0):
+        match = re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", line.strip())
+        if not match:
+            continue
+        title = match.group(2).strip().rstrip("#").strip()
+        item: dict[str, object] = {
+            "line": index + 1,
+            "level": len(match.group(1)),
+            "text": title,
+            "markdown": f"{match.group(1)} {title}",
+        }
+        if include_index:
+            item["index"] = index
+        headings.append(item)
+    return headings
+
+
+def _normalize_heading_title(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().strip("#").strip()).casefold()
+
+
+def _normalize_text_for_match(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip()).casefold()

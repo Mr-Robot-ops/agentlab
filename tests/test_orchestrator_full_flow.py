@@ -162,6 +162,224 @@ def test_full_flow_with_task_id_uses_matching_approved_task() -> None:
     assert isinstance(selected, dict)
     assert selected["selected_task_id"] == "tests-02-smoke-baseline"
     assert selected["selection_mode"] == "requested"
+    finished = [
+        event
+        for event in orchestrator.audit.events
+        if event.get("agent") == "orchestrator"
+        and event.get("action") == "full_flow"
+        and event.get("status") == "succeeded"
+    ][-1]
+    assert finished["metadata"]["selected_task_id"] == "tests-02-smoke-baseline"
+
+
+def test_full_flow_prefers_approved_task_type_in_priority_order() -> None:
+    config = AppConfig(
+        gitlab_url="https://gitlab.example.com",
+        project_id=1,
+        target_repo_path=Path("."),
+        workspace_root=Path(".runs"),
+        push_agent_branches_enabled=False,
+        auto_approve={"enabled": True},
+    )
+    orchestrator = DummyOrchestrator(config)
+    approved_plan = TaskPlan(
+        tasks=[
+            AgentTask(
+                id="docs-01-credentials",
+                title="Docs",
+                task_type=TaskType.DOCS,
+                risk_level=RiskLevel.LOW,
+                risk_score=1,
+                approved=True,
+            ),
+            AgentTask(
+                id="tests-02-smoke-baseline",
+                title="Tests",
+                task_type=TaskType.TESTS,
+                risk_level=RiskLevel.LOW,
+                risk_score=5,
+                approved=True,
+            ),
+        ]
+    )
+
+    result = orchestrator.full_flow(
+        approved_plan=approved_plan,
+        preferred_task_types=["tests", "docs"],
+    )
+
+    assert result["status"] == "passed"
+    assert result["selected_task_id"] == "tests-02-smoke-baseline"
+    assert result["task_selection_reason"] == "preferred_task_type:tests"
+    selected = orchestrator.artifacts.payloads["selected_task"]
+    assert isinstance(selected, dict)
+    assert selected["selection_mode"] == "preferred"
+    assert selected["selection_reason"] == "preferred_task_type:tests"
+    auto = orchestrator.artifacts.payloads["auto_approval_report"]
+    assert isinstance(auto, dict)
+    assert auto["selected_task_id"] == "tests-02-smoke-baseline"
+    assert auto["task_selection_reason"] == "preferred_task_type:tests"
+
+
+def test_full_flow_preferred_task_id_order_wins_before_type_preference() -> None:
+    config = AppConfig(
+        gitlab_url="https://gitlab.example.com",
+        project_id=1,
+        target_repo_path=Path("."),
+        workspace_root=Path(".runs"),
+        push_agent_branches_enabled=False,
+        auto_approve={"enabled": True},
+    )
+    orchestrator = DummyOrchestrator(config)
+    approved_plan = TaskPlan(
+        tasks=[
+            AgentTask(id="docs-01-credentials", title="Docs", task_type=TaskType.DOCS, approved=True),
+            AgentTask(id="tests-02-smoke-baseline", title="Tests", task_type=TaskType.TESTS, approved=True),
+            AgentTask(id="tests-03-slower", title="Tests slow", task_type=TaskType.TESTS, approved=True),
+        ]
+    )
+
+    result = orchestrator.full_flow(
+        approved_plan=approved_plan,
+        preferred_task_ids=["tests-03-slower", "tests-02-smoke-baseline"],
+        preferred_task_types=["docs"],
+    )
+
+    assert result["status"] == "passed"
+    assert result["selected_task_id"] == "tests-03-slower"
+    assert result["task_selection_reason"] == "preferred_task_id:tests-03-slower"
+
+
+def test_full_flow_does_not_select_unapproved_preferred_task() -> None:
+    config = AppConfig(
+        gitlab_url="https://gitlab.example.com",
+        project_id=1,
+        target_repo_path=Path("."),
+        workspace_root=Path(".runs"),
+        push_agent_branches_enabled=False,
+        auto_approve={"enabled": True},
+    )
+    orchestrator = DummyOrchestrator(config)
+    approved_plan = TaskPlan(
+        tasks=[
+            AgentTask(id="docs-01-credentials", title="Docs", task_type=TaskType.DOCS, approved=True),
+            AgentTask(id="tests-02-smoke-baseline", title="Tests", task_type=TaskType.TESTS, approved=False),
+        ]
+    )
+
+    result = orchestrator.full_flow(
+        approved_plan=approved_plan,
+        preferred_task_ids=["tests-02-smoke-baseline"],
+        preferred_task_types=["tests"],
+    )
+
+    assert result["status"] == "passed"
+    assert result["selected_task_id"] == "docs-01-credentials"
+    assert result["task_selection_reason"] == "auto_approval_default"
+
+
+def test_full_flow_lowers_priority_for_tasks_matching_closed_mr_feedback() -> None:
+    config = AppConfig(
+        gitlab_url="https://gitlab.example.com",
+        project_id=1,
+        target_repo_path=Path("."),
+        workspace_root=Path(".runs"),
+        push_agent_branches_enabled=False,
+        auto_approve={"enabled": True},
+    )
+    orchestrator = DummyOrchestrator(config)
+    approved_plan = TaskPlan(
+        tasks=[
+            AgentTask(
+                id="docs-01-credentials",
+                title="Document credentials",
+                task_type=TaskType.DOCS,
+                risk_level=RiskLevel.LOW,
+                risk_score=1,
+                affected_files=["README.md"],
+                approved=True,
+            ),
+            AgentTask(
+                id="tests-02-smoke-baseline",
+                title="Add smoke baseline",
+                task_type=TaskType.TESTS,
+                risk_level=RiskLevel.LOW,
+                risk_score=5,
+                affected_files=["tests/smoke.py"],
+                approved=True,
+            ),
+        ]
+    )
+
+    result = orchestrator.full_flow(
+        approved_plan=approved_plan,
+        closed_agent_mr_feedback=[
+            {
+                "iid": 18,
+                "title": "Document credentials",
+                "source_branch": "agent/docs-01-credentials-run",
+                "changed_files": ["README.md"],
+                "reason": "not useful",
+            }
+        ],
+    )
+
+    assert result["status"] == "passed"
+    assert result["selected_task_id"] == "tests-02-smoke-baseline"
+    assert result["task_selection_reason"] == "auto_approval_default;closed_mr_feedback_avoidance"
+    selected = orchestrator.artifacts.payloads["selected_task"]
+    assert isinstance(selected, dict)
+    assert selected["feedback_matches"] == []
+
+
+def test_full_flow_reports_when_selected_task_matches_closed_feedback() -> None:
+    config = AppConfig(
+        gitlab_url="https://gitlab.example.com",
+        project_id=1,
+        target_repo_path=Path("."),
+        workspace_root=Path(".runs"),
+        push_agent_branches_enabled=False,
+        auto_approve={"enabled": True},
+    )
+    orchestrator = DummyOrchestrator(config)
+    approved_plan = TaskPlan(
+        tasks=[
+            AgentTask(
+                id="tests-02-smoke-baseline",
+                title="Add smoke baseline",
+                task_type=TaskType.TESTS,
+                risk_level=RiskLevel.LOW,
+                risk_score=1,
+                affected_files=["tests/smoke.py"],
+                approved=True,
+            ),
+        ]
+    )
+
+    result = orchestrator.full_flow(
+        approved_plan=approved_plan,
+        closed_agent_mr_feedback=[
+            {
+                "iid": 18,
+                "title": "Add smoke baseline",
+                "source_branch": "agent/tests-02-smoke-baseline-run",
+                "changed_files": ["tests/smoke.py"],
+                "reason": "flaky",
+            }
+        ],
+    )
+
+    assert result["status"] == "passed"
+    assert result["selected_task_id"] == "tests-02-smoke-baseline"
+    assert result["task_selection_reason"] == "auto_approval_default;closed_mr_feedback_match"
+    assert result["task_selection_feedback_matches"] == [
+        {
+            "iid": 18,
+            "title": "Add smoke baseline",
+            "source_branch": "agent/tests-02-smoke-baseline-run",
+            "reason": "flaky",
+        }
+    ]
 
 
 def test_full_flow_with_unknown_task_id_does_not_fall_back() -> None:

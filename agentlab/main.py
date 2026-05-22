@@ -106,9 +106,18 @@ def scheduler_plan(config: Path = typer.Option(..., "--config", exists=True, rea
 def scheduler_action(
     config: Path = typer.Option(..., "--config", exists=True, readable=True),
     task_id: str | None = typer.Option(None, "--task-id", help="Run a specific approved scheduler task by ID."),
+    prefer_task_type: list[str] | None = typer.Option(None, "--prefer-task-type", help="Prefer approved tasks of this type. Repeat to set priority order."),
+    prefer_task_id: list[str] | None = typer.Option(None, "--prefer-task-id", help="Prefer this approved task ID. Repeat to set priority order."),
 ) -> None:
     cfg = load_config(config)
-    _json_echo(Scheduler(cfg).action(task_id=task_id))
+    result = Scheduler(cfg).action(
+        task_id=task_id,
+        prefer_task_types=prefer_task_type,
+        prefer_task_ids=prefer_task_id,
+    )
+    _json_echo(result)
+    if task_id is not None and result.get("status") == "failed":
+        raise typer.Exit(code=1)
 
 
 @app.command("scheduler-review-comments")
