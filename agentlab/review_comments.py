@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-ALLOWED_REVIEW_COMMANDS = {"revise", "fix", "propose", "dry-run", "status", "explain", "stop", "resume"}
+ALLOWED_REVIEW_COMMANDS = {"revise", "fix", "propose", "apply", "dry-run", "status", "explain", "stop", "resume"}
 DENIED_REVIEW_COMMANDS = {
     "run",
     "shell",
@@ -174,6 +174,9 @@ def normalize_mr(mr: Any) -> dict[str, Any]:
         "labels": list(labels),
         "state": get_value(mr, "state", "opened"),
         "description": get_value(mr, "description", ""),
+        "updated_at": get_value(mr, "updated_at"),
+        "closed_at": get_value(mr, "closed_at"),
+        "merged_at": get_value(mr, "merged_at"),
     }
 
 

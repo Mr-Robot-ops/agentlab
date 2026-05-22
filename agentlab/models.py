@@ -356,6 +356,7 @@ class MergeRequestInfo(StrictModel):
     source_branch: str
     target_branch: str
     labels: list[str] = Field(default_factory=list)
+    updated_at: str | None = None
 
 
 class MRFinalizationResult(StrictModel):
