@@ -195,5 +195,6 @@ class AuditLogger:
             "status": event.status,
             "timestamp": event.timestamp.isoformat(),
             "error": event.error,
+            "metadata": event.metadata,
         }
         print(json.dumps(payload, ensure_ascii=True), file=sys.stderr, flush=True)

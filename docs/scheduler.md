@@ -87,6 +87,10 @@ schedule:
   action:
     enabled: false
     cron: "30 2 * * *"
+    preferred_task_types:
+      - tests
+      - docs
+    preferred_task_ids: []
   review_comments:
     enabled: false
     cron: "*/10 * * * *"
@@ -97,6 +101,7 @@ schedule:
       - revise
       - fix
       - propose
+      - apply
       - dry-run
       - status
       - explain
@@ -128,6 +133,7 @@ Supported commands:
 /agent revise
 /agent fix
 /agent propose
+/agent apply
 /agent dry-run
 /agent revise --dry-run
 /agent status
@@ -138,6 +144,7 @@ Supported commands:
 @agentlab revise
 @agentlab fix
 @agentlab propose
+@agentlab apply
 @agentlab dry-run
 @agentlab status
 @agentlab explain
@@ -148,6 +155,8 @@ Supported commands:
 `/agent revise` and `/agent fix` may update code or docs on the existing MR source branch, subject to AutoApproval, allowed paths, protected paths, risk checks, tests, and Gatekeeper. They do not create a new MR and they do not enable auto-merge or direct-main push.
 
 `/agent propose`, `/agent dry-run`, and `/agent revise --dry-run` generate a proposed revision only. They must report `Commit: none` and `Push: skipped`, write proposal artifacts such as `proposed.diff`, and must not present proposal validation as an applied MR gate.
+
+`/agent apply` applies the latest proposal artifact for the same MR/source branch without asking the model again. It uses `structured_proposal.json` when present, otherwise `proposed.diff`, rejects stale proposals when the source branch has moved or the artifact no longer applies cleanly, reruns policy and gate checks before commit/push, and records the proposal `run_id` in the apply report and commit message.
 
 `/agent status`, `/agent explain`, `/agent stop`, and `/agent resume` are read-only with respect to repository files. `stop` writes only the scheduler state marker for that MR; future `revise` and `fix` commands are skipped until an authorized user posts `/agent resume`.
 
@@ -202,6 +211,15 @@ Stage 2:
 - Run `job-scheduler-action.yaml` manually.
 - Keep `max_open_agent_mrs` low.
 - Keep `max_new_mrs_per_day: 1`.
+- To run one approved task instead of the automatic selection, pass `--task-id`, for example
+  `agentlab scheduler-action --config /etc/agentlab/config.yaml --task-id tests-02-smoke-baseline`
+  or `agentlab k8s run action --task-id tests-02-smoke-baseline`.
+- Unknown or unapproved task IDs fail and do not fall back to another task.
+- To prefer a task type without requiring a specific ID, configure `schedule.action.preferred_task_types`
+  or pass `agentlab scheduler-action --config /etc/agentlab/config.yaml --prefer-task-type tests`.
+  Repeating `--prefer-task-type` or `--prefer-task-id` sets priority order. AgentLab only selects approved
+  tasks; if no preferred approved task exists, it uses the normal automatic selection. Reports include
+  `task_selection_reason`.
 
 Stage 3:
 - Generate CronJobs with `--schedule-enabled`.
@@ -216,6 +234,10 @@ Each scheduler run writes `scheduler_report.json` in the run artifacts directory
 - `plan.json`
 - `approved_plan.json`
 - `auto_approval_report.json`
+
+The watch report includes `open_agent_mrs_count` and an `open_agent_mrs` detail list with MR IID, title, source branch, URL, labels, and `updated_at`. It also records lightweight feedback for closed, unmerged `agent/generated` MRs in scheduler state under `closed_agent_mr_feedback`, including MR IID, title, branch, changed files, labels, `closed_at`, and a reason when a comment contains `/agent stop reason: ...`. If listing open or closed MRs fails, watch keeps the last known state and includes a warning.
+
+Scheduler action uses `closed_agent_mr_feedback` only as local deterministic state. It does not train a model. Approved tasks that look similar to closed feedback are lowered in priority during automatic selection; explicit `--task-id` still has to name an approved task and never falls back silently. Selection reports include `task_selection_reason` and any `task_selection_feedback_matches`.
 
 AutoApproval rejection details include concrete files. For example, `path_not_allowed` shows:
 

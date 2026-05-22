@@ -316,6 +316,9 @@ schedule:
   action:
     enabled: true
     cron: "30 2 * * *"
+    preferred_task_types:
+      - tests
+      - docs
 
   limits:
     max_open_agent_mrs: 2
@@ -331,6 +334,14 @@ State liegt unter `<workspace_root>/scheduler/state.json`; pro Lauf wird `schedu
 Skips wie `open_agent_mr_limit_reached`, `daily_mr_limit_reached`, `action_cooldown_active` oder
 `no_auto_approved_task` sind keine Fehler. Kubernetes-CronJobs werden nur erzeugt, wenn der Bootstrap mit
 `--schedule-enabled` ausgefuehrt wird. Scheduler-Action erzwingt nie Direct-Main-Push oder Auto-Merge.
+Manuelle Action-Laeufe koennen mit `agentlab scheduler-action --config config.yaml --task-id tests-02-smoke-baseline`
+oder `agentlab k8s run action --task-id tests-02-smoke-baseline` auf einen bestimmten genehmigten Task begrenzt
+werden. Unbekannte oder nicht genehmigte Task-IDs schlagen fehl und fallen nicht auf einen anderen Task zurueck.
+Wenn mehrere Tasks genehmigt sind, kann `schedule.action.preferred_task_types` oder ein manueller Lauf mit
+`agentlab scheduler-action --config config.yaml --prefer-task-type tests` Test-Tasks priorisieren; AgentLab waehlt
+dabei weiterhin nur genehmigte Tasks aus und schreibt den Auswahlgrund in den Scheduler-Report.
+Der Watch-Lauf merkt sich ausserdem lokal geschlossene, nicht gemergte `agent/generated` MRs samt Dateien und
+optionalem `/agent stop reason: ...`; aehnliche neue Tasks werden bei der automatischen Auswahl niedriger priorisiert.
 
 Eine ausfuehrliche Kubernetes-Test- und Betriebsanleitung steht in [docs/scheduler.md](docs/scheduler.md). Sie
 beschreibt manuelle `job-scheduler-*` Jobs, numerische GitLab `project_id` Werte, `scheduler-reset-state`,
@@ -566,14 +577,18 @@ Relevante Artefakte:
 - `structured_edit_error.json`: Fehlergrund, fehlgeschlagener Edit-Index, Pfad, Operation, Hashes, escaped/repr
   Excerpts und bis zu drei `candidate_contexts` aus der Ziel-Datei. Damit werden z. B. Unterschiede zwischen einem
   echten Unicode-Gedankenstrich und literal `\u2014` sichtbar.
+- `structured_edit_anchor_error.json`: bei `old_text_not_found` zusaetzliche Anchor-Diagnose mit Dateipfad,
+  `old_text`-Preview/Hash, nahegelegenen Kandidaten, aktuellen README-Headings und, wenn eindeutig erkennbar,
+  dem aufgefrischten README-Zielabschnitt. Diese Diagnose schreibt keine Zieldateien.
 - Bei Reparaturversuchen: `structured_edit_repair_raw_response.json`, `structured_edit_repair_proposal.json`,
   `structured_edit_repair_apply_report.json` oder `structured_edit_repair_error.json`.
 
 Bei Fehlern zuerst `implementation_report.json` pruefen, insbesondere `implementation_mode`, `failure_stage`,
 `failure_reason`, `retry_attempted`, `retry_succeeded`, `fallback_attempted`, `no_changes_committed` und
 `no_branch_pushed`. Bei `old_text_not_found`, `old_text_not_unique`, `anchor_not_found` oder `anchor_not_unique`
-versucht AgentLab genau eine sichere Structured-Edit-Reparatur fuer dieselben `affected_files`; Commit und Push
-passieren nur, wenn die reparierte Anwendung erfolgreich ist.
+versucht AgentLab genau eine sichere Structured-Edit-Reparatur fuer dieselben `affected_files`; fuer stale
+README-Abschnitte wird der Zielabschnitt per Heading neu gelesen und dem Reparaturversuch als Kontext gegeben.
+Commit und Push passieren nur, wenn die reparierte Anwendung erfolgreich ist.
 
 Lokale Tests:
 

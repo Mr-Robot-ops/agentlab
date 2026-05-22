@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import uuid
@@ -11,7 +12,13 @@ from agentlab.config import AppConfig
 from agentlab.models import AgentTask, DiffStats, ImplementationReport, PatchProposal, ReportStatus, StructuredEditProposal, TaskType
 from agentlab.policies.risk import assess_risk
 from agentlab.tools.common import ToolError
-from agentlab.tools.file_tool import FileTool, PatchApplyError, StructuredEditError, UnifiedDiffValidationError
+from agentlab.tools.file_tool import (
+    FileTool,
+    PatchApplyError,
+    StructuredEditError,
+    UnifiedDiffValidationError,
+    structured_anchor_diagnostics,
+)
 from agentlab.tools.git_tool import GitTool
 from agentlab.tools.ollama_client import OllamaClient, OllamaSchemaValidationError
 
@@ -132,11 +139,14 @@ class ImplementationAgent:
                     patch_artifacts.extend(evidence_artifacts)
                 except Exception as structured_exc:
                     patch_artifacts.extend(self._project_structure_artifacts_from_error(structured_exc))
+                    patch_artifacts.extend(self._persist_structured_anchor_error(structured, structured_exc))
                     patch_artifacts.extend(self._persist_structured_error(structured_exc))
                     if self._is_structured_repair_candidate(structured_exc):
                         retry_attempted = True
+                        repair_proposal = structured
                         try:
                             repaired, repaired_raw = self._repair_structured_proposal(task, structured, structured_exc)
+                            repair_proposal = repaired
                             patch_artifacts.extend(self._persist_structured_inputs(repaired_raw, repaired, repair=True))
                             diff_stats, evidence_artifacts = self._validate_and_apply_structured_with_evidence(
                                 task,
@@ -146,13 +156,20 @@ class ImplementationAgent:
                             patch_artifacts.extend(evidence_artifacts)
                         except Exception as repair_exc:
                             patch_artifacts.extend(self._project_structure_artifacts_from_error(repair_exc))
+                            patch_artifacts.extend(self._persist_structured_anchor_error(repair_proposal, repair_exc, repair=True))
                             patch_artifacts.extend(self._persist_structured_error(repair_exc, repair=True))
-                            raise StructuredEditApplyError(self._structured_failure_reason(repair_exc), str(repair_exc)) from repair_exc
+                            raise StructuredEditApplyError(
+                                self._structured_failure_reason(repair_exc),
+                                self._structured_retry_failure_message(structured_exc, repair_exc),
+                            ) from repair_exc
                         patch_artifacts.extend(self._persist_structured_apply_report(repaired, diff_stats, repair=True))
                         structured = repaired
                         retry_succeeded = True
                     else:
-                        raise StructuredEditApplyError(self._structured_failure_reason(structured_exc), str(structured_exc)) from structured_exc
+                        raise StructuredEditApplyError(
+                            self._structured_failure_reason(structured_exc),
+                            self._structured_apply_failure_message(structured_exc),
+                        ) from structured_exc
                 patch_artifacts.extend(self._persist_structured_apply_report(structured, diff_stats))
                 summary = structured.summary
                 expected_tests = structured.expected_tests
@@ -183,8 +200,12 @@ class ImplementationAgent:
                             patch_artifacts.extend(evidence_artifacts)
                         except Exception as structured_exc:
                             patch_artifacts.extend(self._project_structure_artifacts_from_error(structured_exc))
+                            patch_artifacts.extend(self._persist_structured_anchor_error(structured, structured_exc))
                             patch_artifacts.extend(self._persist_structured_error(structured_exc, fallback_reason=fallback_reason))
-                            raise StructuredEditApplyError(self._structured_failure_reason(structured_exc), str(structured_exc)) from structured_exc
+                            raise StructuredEditApplyError(
+                                self._structured_failure_reason(structured_exc),
+                                self._structured_apply_failure_message(structured_exc),
+                            ) from structured_exc
                         patch_artifacts.extend(
                             self._persist_structured_apply_report(
                                 structured,
@@ -432,8 +453,9 @@ class ImplementationAgent:
                     patch_artifacts.extend(evidence_artifacts)
                 except Exception as exc:
                     patch_artifacts.extend(self._project_structure_artifacts_from_error(exc))
+                    patch_artifacts.extend(self._persist_structured_anchor_error(structured, exc))
                     patch_artifacts.extend(self._persist_structured_error(exc))
-                    raise StructuredEditApplyError(self._structured_failure_reason(exc), str(exc)) from exc
+                    raise StructuredEditApplyError(self._structured_failure_reason(exc), self._structured_apply_failure_message(exc)) from exc
                 patch_artifacts.extend(self._persist_structured_apply_report(structured, diff_stats))
                 summary = structured.summary
                 expected_tests = structured.expected_tests
@@ -623,8 +645,9 @@ class ImplementationAgent:
                     diff_stats, proposed_diff, _ = self.file_tool.preview_structured_edits(structured)
                 except Exception as exc:
                     patch_artifacts.extend(self._project_structure_artifacts_from_error(exc))
+                    patch_artifacts.extend(self._persist_structured_anchor_error(structured, exc))
                     patch_artifacts.extend(self._persist_structured_error(exc))
-                    raise StructuredEditApplyError(self._structured_failure_reason(exc), str(exc)) from exc
+                    raise StructuredEditApplyError(self._structured_failure_reason(exc), self._structured_apply_failure_message(exc)) from exc
                 summary = structured.summary
                 expected_tests = structured.expected_tests
                 risk_input = structured.model_dump_json()
@@ -822,16 +845,22 @@ class ImplementationAgent:
         proposal: StructuredEditProposal,
         exc: Exception,
     ) -> tuple[StructuredEditProposal, str]:
+        anchor_diagnostic = self._structured_anchor_error_payload(proposal, exc)
         payload = {
             "task": task.model_dump(mode="json"),
             "original_structured_edit_proposal": proposal.model_dump(mode="json"),
             "structured_edit_error": self._structured_error_payload(exc),
+            "structured_edit_anchor_diagnostic": anchor_diagnostic,
             "rules": {
                 "output": "Return only one StructuredEditProposal JSON object.",
                 "scope": "only repair anchors or old_text/new_text for the same affected files.",
                 "same_affected_files": task.affected_files,
                 "do_not_broaden_scope": True,
                 "prefer_insert_operations": "For new Markdown sections, prefer insert_before or insert_after over replacing large blocks.",
+                "readme_stale_section_retry": (
+                    "If structured_edit_anchor_diagnostic.refreshed_section_context is present, repair the failing README "
+                    "replace_text by using the exact current section as old_text and applying only the requested change."
+                ),
                 "no_markdown_fences": "Do not wrap JSON in Markdown fences.",
                 "no_explanations": "Do not include explanations outside JSON.",
             },
@@ -1046,6 +1075,79 @@ class ImplementationAgent:
             payload,
         )
         return [record.name]
+
+    def _persist_structured_anchor_error(
+        self,
+        proposal: StructuredEditProposal,
+        exc: Exception,
+        *,
+        repair: bool = False,
+    ) -> list[str]:
+        if self.artifacts is None:
+            return []
+        payload = self._structured_anchor_error_payload(proposal, exc)
+        if payload is None:
+            return []
+        payload.update(
+            {
+                "status": "failed",
+                "diagnostic_only": True,
+                "repo_write_performed": False,
+                "no_changes_committed": True,
+                "no_branch_pushed": True,
+            }
+        )
+        record = self.artifacts.write_json(
+            "structured_edit_repair_anchor_error" if repair else "structured_edit_anchor_error",
+            payload,
+        )
+        return [record.name]
+
+    def _structured_anchor_error_payload(
+        self,
+        proposal: StructuredEditProposal,
+        exc: Exception,
+    ) -> dict[str, object] | None:
+        if not isinstance(exc, StructuredEditError) or exc.reason != "old_text_not_found":
+            return None
+        if exc.edit_index < 0 or exc.edit_index >= len(proposal.edits):
+            return None
+
+        edit = proposal.edits[exc.edit_index]
+        old_text = edit.old_text or ""
+        read_error: str | None = None
+        current_text = ""
+        try:
+            current_text = self.file_tool.read_file(edit.path)
+        except Exception as read_exc:
+            read_error = str(read_exc)
+
+        payload = self._structured_error_payload(exc)
+        if current_text:
+            payload.update(structured_anchor_diagnostics(path=edit.path, old_text=old_text, current_text=current_text))
+        else:
+            payload.update(
+                {
+                    "file_path": edit.path,
+                    "old_text_preview": old_text[:500],
+                    "old_text_repr_preview": ascii(old_text[:500]),
+                    "old_text_hash": hashlib.sha256(old_text.encode("utf-8")).hexdigest(),
+                    "nearby_candidate_matches": [],
+                    "current_relevant_headings": [],
+                }
+            )
+        payload.update(
+            {
+                "read_error": read_error,
+                "retry_guidance": (
+                    "Refresh the README replace_text old_text from the current target section, "
+                    "or prefer insert_before/insert_after with a unique heading anchor."
+                ),
+            }
+        )
+        if current_text and self._is_readme_path(edit.path):
+            payload["refreshed_section_context"] = self._readme_refreshed_section_context(current_text, old_text)
+        return payload
 
     def _persist_structured_schema_error(
         self,
@@ -1324,6 +1426,76 @@ class ImplementationAgent:
                 entries.add(entry[2:] if entry.startswith("./") else entry)
         return entries
 
+    @classmethod
+    def _readme_refreshed_section_context(cls, current_text: str, old_text: str) -> dict[str, object]:
+        target = cls._first_markdown_heading(old_text)
+        if target is None:
+            return {"status": "no_heading_in_old_text", "target_heading": None}
+
+        headings = cls._markdown_heading_entries(current_text)
+        matches = [heading for heading in headings if heading["normalized"] == target["normalized"]]
+        if len(matches) != 1:
+            return {
+                "status": "heading_not_found" if not matches else "heading_not_unique",
+                "target_heading": cls._public_heading(target),
+                "matching_headings": [cls._public_heading(match) for match in matches],
+            }
+
+        match = matches[0]
+        lines = current_text.splitlines(keepends=True)
+        start = int(match["index"])
+        end = len(lines)
+        for candidate in headings:
+            if int(candidate["index"]) <= start:
+                continue
+            if int(candidate["level"]) <= int(match["level"]):
+                end = int(candidate["index"])
+                break
+        section = "".join(lines[start:end])
+        return {
+            "status": "matched",
+            "target_heading": cls._public_heading(target),
+            "current_heading": cls._public_heading(match),
+            "start_line": start + 1,
+            "end_line": end,
+            "text": compact_text(section, 6000),
+            "text_sha256": hashlib.sha256(section.encode("utf-8")).hexdigest(),
+        }
+
+    @classmethod
+    def _first_markdown_heading(cls, text: str) -> dict[str, object] | None:
+        headings = cls._markdown_heading_entries(text)
+        return headings[0] if headings else None
+
+    @staticmethod
+    def _markdown_heading_entries(text: str) -> list[dict[str, object]]:
+        headings: list[dict[str, object]] = []
+        for index, line in enumerate(text.splitlines()):
+            match = re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", line.strip())
+            if not match:
+                continue
+            title = match.group(2).strip().rstrip("#").strip()
+            headings.append(
+                {
+                    "line": index + 1,
+                    "index": index,
+                    "level": len(match.group(1)),
+                    "text": title,
+                    "markdown": f"{match.group(1)} {title}",
+                    "normalized": re.sub(r"\s+", " ", title).casefold(),
+                }
+            )
+        return headings
+
+    @staticmethod
+    def _public_heading(heading: dict[str, object]) -> dict[str, object]:
+        return {
+            "line": heading.get("line"),
+            "level": heading.get("level"),
+            "text": heading.get("text"),
+            "markdown": heading.get("markdown"),
+        }
+
     @staticmethod
     def _block_declares_compact_summary(block: str) -> bool:
         text = block.lower()
@@ -1454,6 +1626,28 @@ class ImplementationAgent:
             "reason": ImplementationAgent._structured_failure_reason(exc),
             "error": str(exc),
         }
+
+    @classmethod
+    def _structured_apply_failure_message(cls, exc: Exception) -> str:
+        if isinstance(exc, StructuredEditError) and exc.reason == "old_text_not_found":
+            return (
+                f"Structured edit old_text was not found in {exc.path}. "
+                "AgentLab wrote structured_edit_anchor_error.json with the old_text hash, nearby candidate matches, "
+                "and current README headings. Refresh the old_text from the current section or use insert_before/insert_after."
+            )
+        return str(exc)
+
+    @classmethod
+    def _structured_retry_failure_message(cls, original_exc: Exception, repair_exc: Exception) -> str:
+        if isinstance(original_exc, StructuredEditError) and original_exc.reason == "old_text_not_found":
+            repair_artifact = " and structured_edit_repair_error.json" if isinstance(repair_exc, StructuredEditError) else ""
+            return (
+                f"Structured edit repair failed after refreshing anchor context for {original_exc.path}. "
+                f"Inspect structured_edit_anchor_error.json{repair_artifact}; refresh the replace_text old_text "
+                "from the current README section or switch to insert_before/insert_after. "
+                f"Last error: {cls._short_error(str(repair_exc))}"
+            )
+        return cls._structured_apply_failure_message(repair_exc)
 
     @staticmethod
     def _is_structured_repair_candidate(exc: Exception) -> bool:

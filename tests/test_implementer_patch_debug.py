@@ -762,8 +762,84 @@ def test_structured_edit_error_artifact_includes_context_hashes_and_repr(tmp_pat
     assert error["target_file_size"] > 0
     assert error["candidate_contexts"]
     assert "—" in error["candidate_contexts"][0]
+    assert "structured_edit_anchor_error.json" in report.patch_artifacts
+    anchor_error = json.loads(read_artifact(store, "structured_edit_anchor_error.json"))
+    assert anchor_error["path"] == "README.md"
+    assert anchor_error["old_text_preview"] == literal_backslash
+    assert anchor_error["old_text_hash"]
+    assert "nearby_candidate_matches" in anchor_error
+    assert "current_relevant_headings" in anchor_error
+    assert anchor_error["diagnostic_only"] is True
+    assert anchor_error["repo_write_performed"] is False
     assert error["no_changes_committed"] is True
     assert error["no_branch_pushed"] is True
+
+
+def test_stale_readme_section_retries_with_refreshed_heading_context(tmp_path: Path) -> None:
+    current = "# AgentLab\n\n## Usage\nRun `agentlab start`.\n\n## Troubleshooting\nCheck logs.\n"
+    repo = init_repo(tmp_path, content=current)
+    store = ArtifactStore(tmp_path / "run", "run")
+    git = FakeGitTool()
+    stale_old = "## Usage\nRun it.\n"
+    stale_new = "## Usage\nRun it.\nUse `agentlab status` to verify startup.\n"
+    refreshed_old = "## Usage\nRun `agentlab start`.\n\n"
+    refreshed_new = "## Usage\nRun `agentlab start`.\nUse `agentlab status` to verify startup.\n\n"
+    bad = structured_proposal(old_text=stale_old, new_text=stale_new)
+    repaired = structured_proposal(old_text=refreshed_old, new_text=refreshed_new)
+    ollama = FakeOllama([bad, repaired])
+
+    report = ImplementationAgent(config(repo), git, FileTool(repo, config(repo)), ollama, artifacts=store).implement(docs_task())
+
+    assert report.status == ReportStatus.PASSED
+    assert report.retry_attempted is True
+    assert report.retry_succeeded is True
+    assert "structured_edit_anchor_error.json" in report.patch_artifacts
+    anchor_error = json.loads(read_artifact(store, "structured_edit_anchor_error.json"))
+    assert anchor_error["path"] == "README.md"
+    assert anchor_error["old_text_preview"] == stale_old
+    assert anchor_error["old_text_hash"]
+    assert anchor_error["nearby_candidate_matches"][0]["heading"] == "## Usage"
+    assert anchor_error["current_relevant_headings"][0]["text"] == "Usage"
+    assert anchor_error["refreshed_section_context"]["status"] == "matched"
+    assert "Run `agentlab start`." in anchor_error["refreshed_section_context"]["text"]
+    assert anchor_error["diagnostic_only"] is True
+    assert anchor_error["repo_write_performed"] is False
+    assert "structured_edit_anchor_diagnostic" in ollama.prompts[1]
+    assert "Run `agentlab start`." in ollama.prompts[1]
+    final = (repo / "README.md").read_text(encoding="utf-8")
+    assert "Run `agentlab start`." in final
+    assert "Use `agentlab status` to verify startup." in final
+
+
+def test_stale_readme_section_retry_failure_is_actionable(tmp_path: Path) -> None:
+    current = "# AgentLab\n\n## Usage\nRun `agentlab start`.\n\n## Troubleshooting\nCheck logs.\n"
+    repo = init_repo(tmp_path, content=current)
+    store = ArtifactStore(tmp_path / "run", "run")
+    git = FakeGitTool()
+    stale_old = "## Usage\nRun it.\n"
+    stale_new = "## Usage\nRun it.\nUse `agentlab status`.\n"
+    still_bad = structured_proposal(old_text="## Usage\nStill stale.\n", new_text="## Usage\nStill stale.\nMore.\n")
+
+    report = ImplementationAgent(
+        config(repo),
+        git,
+        FileTool(repo, config(repo)),
+        FakeOllama([structured_proposal(old_text=stale_old, new_text=stale_new), still_bad]),
+        artifacts=store,
+    ).implement(docs_task())
+
+    assert report.status == ReportStatus.FAILED
+    assert report.retry_attempted is True
+    assert report.retry_succeeded is False
+    assert report.failure_stage == "structured_edit_apply"
+    assert report.failure_reason == "old_text_not_found"
+    assert "structured_edit_anchor_error.json" in report.patch_artifacts
+    assert "structured_edit_repair_error.json" in report.patch_artifacts
+    assert "structured_edit_anchor_error.json" in report.errors[0]
+    assert "refresh the replace_text old_text" in report.errors[0]
+    assert git.committed is False
+    assert git.pushed is False
+    assert (repo / "README.md").read_text(encoding="utf-8") == current
 
 
 def test_structured_repair_succeeds_after_anchor_correction(tmp_path: Path) -> None:
