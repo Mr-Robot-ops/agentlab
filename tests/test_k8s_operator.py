@@ -15,6 +15,8 @@ from agentlab.k8s_operator import (
     K8sOperatorError,
     K8sTUI,
     KubectlResult,
+    FallbackTUIAdapter,
+    QuestionaryTUIAdapter,
     TuiChoice,
     TuiUnavailableError,
     artifact_path,
@@ -94,9 +96,12 @@ class FakeOperator:
         self.calls.append(("status", None))
         return "status"
 
-    def runs(self):
+    def runs(self, *, limit: int = 20):
         self.calls.append(("runs", None))
-        return []
+        return [
+            SimpleNamespace(run_id="e474a44a82dc4bf8b6b8ce2732194ffc"),
+            SimpleNamespace(run_id="8ad7b96953d944f4afb0e9a8648df908"),
+        ]
 
     def logs(self, component: str, *, follow: bool = True, tail: int | None = None):
         self.calls.append(("logs", (component, follow, tail)))
@@ -117,6 +122,17 @@ class FakeOperator:
     def artifact(self, run_id: str, artifact: str):
         self.calls.append(("artifact", (run_id, artifact)))
         return type("Artifact", (), {"path": "/path", "content": "content"})()
+
+    def ensure_artifact_shell(self) -> None:
+        self.calls.append(("ensure_artifact_shell", None))
+
+    def latest_run_id(self) -> str:
+        self.calls.append(("latest_run_id", None))
+        return "e474a44a82dc4bf8b6b8ce2732194ffc"
+
+    def available_artifacts(self, run_id: str):
+        self.calls.append(("available_artifacts", run_id))
+        return ["manifest.json", "gate_decision.json", "raw_patch.diff"]
 
     def set_cronjob_suspend(self, component: str, suspend: bool):
         self.calls.append(("set_cronjob_suspend", (component, suspend)))
@@ -1714,6 +1730,80 @@ def test_tui_selector_invalid_input_lists_valid_choices() -> None:
     assert "Valid choices: 1-5 or watch, plan, action, review-comments, doctor" in str(excinfo.value)
 
 
+def test_fallback_confirm_defaults_match_prompt() -> None:
+    yes_prompts: list[str] = []
+    yes_adapter = FallbackTUIAdapter(input_func=lambda prompt: yes_prompts.append(prompt) or "", output_func=lambda _text: None)
+
+    assert yes_adapter.confirm("Create artifact-shell pod if missing?", default=True) is True
+    assert yes_prompts == ["Create artifact-shell pod if missing? [Y/n] "]
+
+    no_prompts: list[str] = []
+    no_adapter = FallbackTUIAdapter(input_func=lambda prompt: no_prompts.append(prompt) or "", output_func=lambda _text: None)
+
+    assert no_adapter.confirm("Apply generated manifests to the cluster?", default=False) is False
+    assert no_prompts == ["Apply generated manifests to the cluster? [y/N] "]
+
+
+def test_questionary_adapter_select_confirm_and_text() -> None:
+    class FakePrompt:
+        def __init__(self, answer):
+            self.answer = answer
+
+        def ask(self):
+            return self.answer
+
+    class FakeQuestionary:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object]] = []
+
+        def select(self, message, **kwargs):
+            self.calls.append(("select", (message, kwargs)))
+            return FakePrompt("Doctor")
+
+        def confirm(self, message, *, default=False):
+            self.calls.append(("confirm", (message, default)))
+            return FakePrompt(None)
+
+        def text(self, message, *, default=""):
+            self.calls.append(("text", (message, default)))
+            return FakePrompt("")
+
+    questionary = FakeQuestionary()
+    adapter = QuestionaryTUIAdapter(questionary)
+
+    assert adapter.select("Component", [TuiChoice("doctor", "Doctor")]) == "doctor"
+    assert adapter.confirm("Run doctor after apply?", default=True) is True
+    assert adapter.text("Run ID", default="latest") == "latest"
+
+
+def test_tui_artifact_shell_prompt_defaults_to_yes() -> None:
+    operator = FakeOperator()
+    answers = iter(["", "", "1"])
+    tui = K8sTUI(
+        operator,  # type: ignore[arg-type]
+        input_func=lambda _prompt: next(answers),
+        output_func=lambda _text: None,
+    )
+
+    tui.run_once("artifact")
+
+    assert ("artifact", ("e474a44a82dc4bf8b6b8ce2732194ffc", "manifest.json")) in operator.calls
+
+
+def test_tui_delete_failed_resources_defaults_to_no() -> None:
+    operator = FakeOperator()
+    answers = iter([""])
+    tui = K8sTUI(
+        operator,  # type: ignore[arg-type]
+        input_func=lambda _prompt: next(answers),
+        output_func=lambda _text: None,
+    )
+
+    tui.run_once("cleanup")
+
+    assert operator.calls == [("failed_resources", None)]
+
+
 def test_tui_logs_accepts_doctor_text_selection() -> None:
     operator = FakeOperator()
     answers = iter(["doctor"])
@@ -1731,6 +1821,32 @@ def test_tui_logs_accepts_doctor_text_selection() -> None:
         ("job_logs", ("agentlab-doctor", False, None)),
     ]
     assert "Selected Job: agentlab-doctor" in output
+
+
+def test_tui_logs_uses_arrow_key_adapter_selection() -> None:
+    class SelectDoctorAdapter:
+        def select(self, label: str, choices: list[str | TuiChoice], *, default: str | None = None) -> str:
+            return "doctor"
+
+        def confirm(self, message: str, *, default: bool = False) -> bool:
+            return default
+
+        def text(self, label: str, *, default: str | None = None) -> str:
+            return default or ""
+
+    operator = FakeOperator()
+    tui = K8sTUI(
+        operator,  # type: ignore[arg-type]
+        output_func=lambda _text: None,
+        adapter=SelectDoctorAdapter(),
+    )
+
+    tui.run_once("logs")
+
+    assert operator.calls == [
+        ("latest_job_name", "doctor"),
+        ("job_logs", ("agentlab-doctor", False, None)),
+    ]
 
 
 def test_tui_logs_accepts_doctor_numeric_selection() -> None:
@@ -1753,6 +1869,30 @@ def test_tui_logs_accepts_doctor_numeric_selection() -> None:
 def test_tui_artifact_empty_run_id_defaults_to_latest() -> None:
     operator = FakeOperator()
     answers = iter(["", "gate_decision.json"])
+    output: list[str] = []
+    tui = K8sTUI(
+        operator,  # type: ignore[arg-type]
+        input_func=lambda _prompt: next(answers),
+        output_func=output.append,
+        confirm_func=lambda _message: True,
+    )
+
+    tui.run_once("artifact")
+
+    assert operator.calls == [
+        ("ensure_artifact_shell", None),
+        ("runs", None),
+        ("latest_run_id", None),
+        ("available_artifacts", "e474a44a82dc4bf8b6b8ce2732194ffc"),
+        ("artifact", ("e474a44a82dc4bf8b6b8ce2732194ffc", "gate_decision.json")),
+    ]
+    assert "Run ID: e474a44a82dc4bf8b6b8ce2732194ffc" in output
+    assert "Available artifacts:" in output
+
+
+def test_tui_artifact_numeric_selection_reads_selected_artifact() -> None:
+    operator = FakeOperator()
+    answers = iter(["latest", "2"])
     tui = K8sTUI(
         operator,  # type: ignore[arg-type]
         input_func=lambda _prompt: next(answers),
@@ -1762,11 +1902,54 @@ def test_tui_artifact_empty_run_id_defaults_to_latest() -> None:
 
     tui.run_once("artifact")
 
-    assert operator.calls == [("artifact", ("latest", "gate_decision.json"))]
+    assert ("artifact", ("e474a44a82dc4bf8b6b8ce2732194ffc", "gate_decision.json")) in operator.calls
+
+
+def test_tui_artifact_empty_artifact_name_does_not_call_operator_artifact() -> None:
+    operator = FakeOperator()
+    answers = iter(["latest", ""])
+    output: list[str] = []
+    tui = K8sTUI(
+        operator,  # type: ignore[arg-type]
+        input_func=lambda _prompt: next(answers),
+        output_func=output.append,
+        confirm_func=lambda _message: True,
+    )
+
+    tui.run_once("artifact")
+
+    assert not any(call[0] == "artifact" for call in operator.calls)
+    assert "Artifact name is required." in output
+
+
+def test_tui_artifact_no_available_artifacts_returns_to_menu() -> None:
+    class EmptyArtifactOperator(FakeOperator):
+        def available_artifacts(self, run_id: str):
+            self.calls.append(("available_artifacts", run_id))
+            return []
+
+    operator = EmptyArtifactOperator()
+    answers = iter(["latest"])
+    output: list[str] = []
+    tui = K8sTUI(
+        operator,  # type: ignore[arg-type]
+        input_func=lambda _prompt: next(answers),
+        output_func=output.append,
+        confirm_func=lambda _message: True,
+    )
+
+    tui.run_once("artifact")
+
+    assert not any(call[0] == "artifact" for call in operator.calls)
+    assert "No artifacts found for run e474a44a82dc4bf8b6b8ce2732194ffc" in output
 
 
 def test_tui_artifact_missing_prints_available_artifacts_and_returns_to_menu() -> None:
     class MissingArtifactOperator(FakeOperator):
+        def available_artifacts(self, run_id: str):
+            self.calls.append(("available_artifacts", run_id))
+            return ["missing.json", "gate_decision.json"]
+
         def artifact(self, run_id: str, artifact: str):
             self.calls.append(("artifact", (run_id, artifact)))
             raise ArtifactNotFoundError("/runs/latest/artifacts/missing.json", ["gate_decision.json", "proposed.diff"])
@@ -1783,7 +1966,13 @@ def test_tui_artifact_missing_prints_available_artifacts_and_returns_to_menu() -
 
     assert tui.run_once("5") is True
 
-    assert operator.calls == [("artifact", ("latest", "missing.json"))]
+    assert operator.calls == [
+        ("ensure_artifact_shell", None),
+        ("runs", None),
+        ("latest_run_id", None),
+        ("available_artifacts", "e474a44a82dc4bf8b6b8ce2732194ffc"),
+        ("artifact", ("e474a44a82dc4bf8b6b8ce2732194ffc", "missing.json")),
+    ]
     assert any("artifact not found" in line for line in output)
     assert "- gate_decision.json" in output
     assert "- proposed.diff" in output
@@ -1870,12 +2059,11 @@ def test_tui_upgrade_empty_image_does_not_call_operator(image: str) -> None:
 def test_tui_upgrade_valid_image_without_apply_calls_operator() -> None:
     operator = FakeOperator()
     answers = iter(["registry/agentlab:new", "cluster config"])
-    confirmations = iter([False, False, False])
     tui = K8sTUI(
         operator,  # type: ignore[arg-type]
         input_func=lambda _prompt: next(answers),
         output_func=lambda _text: None,
-        confirm_func=lambda _message: next(confirmations),
+        confirm_func=lambda _message: False,
     )
 
     tui.run_once("upgrade")
@@ -1890,6 +2078,58 @@ def test_tui_upgrade_valid_image_without_apply_calls_operator() -> None:
                 "preserve_cluster_config": True,
                 "run_doctor": False,
                 "cleanup_failed": False,
+            },
+        )
+    ]
+
+
+def test_tui_upgrade_apply_defaults_to_no_and_skips_apply_followups() -> None:
+    operator = FakeOperator()
+    answers = iter(["registry/agentlab:new", "1", ""])
+    tui = K8sTUI(
+        operator,  # type: ignore[arg-type]
+        input_func=lambda _prompt: next(answers),
+        output_func=lambda _text: None,
+    )
+
+    tui.run_once("upgrade")
+
+    assert operator.calls == [
+        (
+            "upgrade",
+            {
+                "image": "registry/agentlab:new",
+                "apply": False,
+                "preserve_local_config": False,
+                "preserve_cluster_config": False,
+                "run_doctor": False,
+                "cleanup_failed": False,
+            },
+        )
+    ]
+
+
+def test_tui_upgrade_confirmed_apply_uses_default_yes_for_doctor_and_cleanup() -> None:
+    operator = FakeOperator()
+    answers = iter(["registry/agentlab:new", "1", "y", "", "", "y"])
+    tui = K8sTUI(
+        operator,  # type: ignore[arg-type]
+        input_func=lambda _prompt: next(answers),
+        output_func=lambda _text: None,
+    )
+
+    tui.run_once("upgrade")
+
+    assert operator.calls == [
+        (
+            "upgrade",
+            {
+                "image": "registry/agentlab:new",
+                "apply": True,
+                "preserve_local_config": False,
+                "preserve_cluster_config": False,
+                "run_doctor": True,
+                "cleanup_failed": True,
             },
         )
     ]
