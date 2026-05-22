@@ -1792,7 +1792,7 @@ def test_questionary_adapter_select_confirm_and_text() -> None:
     assert questionary.calls[2][1][1]["style"] is adapter.style
 
 
-def test_questionary_tui_style_uses_pointer_without_background() -> None:
+def test_questionary_tui_style_highlights_current_row_without_selected_default() -> None:
     class FakeStyle:
         def __init__(self, rules):
             self.rules = dict(rules)
@@ -1817,11 +1817,46 @@ def test_questionary_tui_style_uses_pointer_without_background() -> None:
     }
 
     assert style.rules["pointer"] == "bold"
-    assert style.rules["highlighted"] == ""
+    assert style.rules["highlighted"] == "bold fg:#ffffff bg:#444444"
     assert style.rules["selected"] == ""
     assert required_keys.issubset(style.rules)
-    assert all("bg:" not in rule.lower() for rule in style.rules.values())
     assert all("reverse" not in rule.lower() for rule in style.rules.values())
+
+
+def test_questionary_select_does_not_pass_default_to_avoid_stale_highlight() -> None:
+    class FakeStyle:
+        def __init__(self, rules):
+            self.rules = dict(rules)
+
+    class FakePrompt:
+        def ask(self):
+            return "Artifact ansehen"
+
+    class FakeQuestionary:
+        Style = FakeStyle
+
+        def __init__(self) -> None:
+            self.select_kwargs: dict[str, object] | None = None
+
+        def select(self, message, **kwargs):
+            self.select_kwargs = kwargs
+            return FakePrompt()
+
+    questionary = FakeQuestionary()
+    adapter = QuestionaryTUIAdapter(questionary)
+
+    selected = adapter.select(
+        "Auswahl",
+        [
+            TuiChoice("status", "Status anzeigen"),
+            TuiChoice("artifact", "Artifact ansehen"),
+        ],
+        default="status",
+    )
+
+    assert selected == "artifact"
+    assert questionary.select_kwargs is not None
+    assert "default" not in questionary.select_kwargs
 
 
 def test_create_tui_adapter_missing_questionary_prints_install_hint_once(monkeypatch) -> None:
