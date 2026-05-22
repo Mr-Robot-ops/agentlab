@@ -54,6 +54,8 @@ ARTIFACT_COMPLETIONS = (
     "quality_review.json",
     "security_architecture_review.json",
     "mr_finalization_result.json",
+    "functional_test_report.json",
+    "raw_patch.diff",
 )
 
 
@@ -115,6 +117,13 @@ def format_config_set_report(report: ConfigSetReport) -> str:
             f"Changed: {'yes' if report.changed else 'no'}",
         ]
     )
+
+
+@k8s_app.command("help")
+def help_command(ctx: typer.Context) -> None:
+    """Show help for AgentLab Kubernetes commands."""
+    parent = ctx.parent
+    typer.echo(parent.get_help() if parent is not None else ctx.get_help())
 
 
 @k8s_app.command()

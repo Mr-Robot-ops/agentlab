@@ -16,6 +16,13 @@ agentlab k8s tui
 
 All commands default to the `agentlab` namespace. Use `--namespace` to override it.
 
+Help is available through either form:
+
+```bash
+agentlab k8s --help
+agentlab k8s help
+```
+
 ## Status
 
 Show current AgentLab Kubernetes status:
@@ -244,6 +251,30 @@ Open the interactive menu:
 agentlab k8s tui
 ```
 
+When `questionary` is installed, the TUI uses arrow-key selection and Enter for menus. Install the optional TUI dependency when packaging AgentLab for interactive operators:
+
+```bash
+python -m pip install 'agentlab[tui]'
+```
+
+Without `questionary`, AgentLab uses the numbered fallback prompt. The fallback accepts either the displayed number or a short command name:
+
+```text
+status
+runs
+logs
+run
+artifact
+reset-state
+suspend
+resume
+shell
+upgrade
+cleanup
+quit
+exit
+```
+
 The TUI provides:
 
 1. Status anzeigen
@@ -259,4 +290,30 @@ The TUI provides:
 11. Cleanup failed resources
 12. Beenden
 
-Mutating actions require confirmation. If no interactive TTY is available, the TUI fails clearly and suggests equivalent non-interactive commands.
+Component prompts accept either the arrow-key selection, number, or exact component name. For logs, valid names are `watch`, `plan`, `action`, `review-comments`, and `doctor`. For job runs, `reset-state` is also valid.
+
+Artifact lookup offers `latest` plus recent run IDs. In fallback mode, the run ID defaults to `latest` when the prompt is left empty. After resolving `latest`, the TUI lists available artifacts so operators do not need to guess file names:
+
+```text
+artifact
+Run ID: latest
+Run ID: e474a44a82dc4bf8b6b8ce2732194ffc
+Available artifacts:
+1. manifest.json
+2. gate_decision.json
+3. raw_patch.diff
+Artifact name: gate_decision.json
+```
+
+Upgrade requires a non-empty image before any generated manifest can be changed:
+
+```text
+upgrade
+Image (example: 10.159.21.58:5000/agentlab:0.1.17): 10.159.21.58:5000/agentlab:0.1.17
+Preserve config: cluster config
+Apply generated manifests to the cluster? [y/N] y
+```
+
+When apply is selected, the TUI asks whether to run doctor and clean up failed resources, then prints a summary and asks for final confirmation before calling upgrade. Confirmation prompts make the default explicit: `[Y/n]` means Enter selects yes, and `[y/N]` means Enter selects no. Convenience prompts such as creating the artifact-shell pod default to yes; risky or mutating prompts such as apply, action jobs, reset-state, CronJob suspend/resume, shell, and failed-resource deletion default to no. Run doctor and cleanup-after-apply prompts default to yes after an apply is requested.
+
+If no interactive TTY is available, the TUI fails clearly and suggests equivalent non-interactive commands.
