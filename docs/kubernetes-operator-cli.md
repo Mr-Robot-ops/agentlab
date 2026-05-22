@@ -30,7 +30,50 @@ Diagnose image drift between the live ConfigMap, CronJobs, and generated manifes
 agentlab k8s status --manifest-dir deploy/kubernetes/generated
 ```
 
-The status command is read-only. It shows the ConfigMap image annotation, AgentLab CronJobs, recent scheduler jobs, failed jobs/pods, and image drift warnings.
+The status command is read-only. It shows the ConfigMap image annotation, open Agent merge requests, AgentLab CronJobs, recent scheduler jobs, failed jobs/pods, and image drift warnings. If GitLab is unavailable, cluster status still renders and includes a warning for the open-MR section.
+
+## Health
+
+Show one compact health summary for runtime, scheduler, GitLab, models, doctor, and open Agent merge requests:
+
+```bash
+agentlab k8s health
+agentlab k8s health --json
+```
+
+The health command combines live status, generated-manifest image drift, failed AgentLab jobs/pods, open Agent MRs, scheduler state age, last watch/plan/action/review runs, doctor status, model configuration, review-comment authorization settings, and whether scheduler action is enabled. It reads the scheduler state from the `agentlab-runs` PVC through the controlled `artifact-shell` pod, creating that pod if needed. It does not print GitLab tokens.
+
+## Merge Requests
+
+List AgentLab-generated GitLab merge requests:
+
+```bash
+agentlab k8s mrs
+agentlab k8s mrs --state opened
+agentlab k8s mrs --label agent/generated
+agentlab k8s mrs --json
+```
+
+The command reads `gitlab_url`, `project_id`, and the token environment key from the live `agentlab-config` ConfigMap, then reads the GitLab token from the `agentlab-secrets` Kubernetes Secret by default. It only lists merge requests on AgentLab source branches with the requested label, and it never prints the token.
+
+## ConfigMap Settings
+
+Read selected AgentLab `config.yaml` values from the live `agentlab-config` ConfigMap:
+
+```bash
+agentlab k8s config get schedule.action.enabled
+agentlab k8s config get schedule.review_comments.enabled
+```
+
+Update selected scheduler settings without editing YAML by hand:
+
+```bash
+agentlab k8s config set schedule.action.enabled true
+agentlab k8s config set schedule.action.enabled false
+agentlab k8s config set schedule.review_comments.cooldown_minutes 0
+```
+
+The command validates paths against an allowlist, supports bool, int, and string values, prints before/after values, and patches only `data.config.yaml`. It does not read or modify Secrets, and it leaves ConfigMap metadata and annotations such as `agentlab.io/image` untouched.
 
 ## Logs
 

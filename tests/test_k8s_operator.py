@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -17,6 +19,9 @@ from agentlab.k8s_operator import (
     artifact_path,
     cronjob_for_component,
     detect_manifest_image_drift,
+    format_health,
+    format_mrs,
+    format_status,
     format_upgrade_report,
     job_prefix_for_component,
     kubectl_args,
@@ -293,6 +298,83 @@ def cronjob_names_json(*, configmap_image: str, cronjob_images: dict[str, str]) 
         }
     )
     return configmap, cronjobs
+
+
+def configmap_with_app_config(extra_config: dict[str, object] | None = None) -> str:
+    config: dict[str, object] = {
+        "gitlab_url": "https://gitlab.example.com",
+        "project_id": 1,
+        "target_repo_path": "/workspace/repo",
+        "workspace_root": "/var/lib/agentlab/runs",
+    }
+    if extra_config:
+        config.update(extra_config)
+    return json.dumps(
+        {
+            "metadata": {"annotations": {"agentlab.io/image": "registry/agentlab:new"}},
+            "data": {"config.yaml": yaml.safe_dump(config, sort_keys=False)},
+        }
+    )
+
+
+class FakeGitLabForStatus:
+    def __init__(self, _config) -> None:
+        pass
+
+    def list_open_agent_mrs(self) -> list[object]:
+        return [
+            SimpleNamespace(
+                id=18,
+                mr_id=18,
+                iid=18,
+                title="Add smoke baseline",
+                source_branch="agent/tests-02-smoke-baseline",
+                target_branch="main",
+                web_url="https://gitlab.example.com/group/project/-/merge_requests/18",
+                labels=["agent/generated"],
+                updated_at="2026-05-22T12:00:00Z",
+            )
+        ]
+
+
+class FakeGitLabForMrs:
+    seen_token: str | None = None
+    seen_project_id: object = None
+    seen_args: tuple[str, str] | None = None
+
+    def __init__(self, config, *, token: str | None = None) -> None:
+        type(self).seen_token = token
+        type(self).seen_project_id = config.project_id
+
+    def list_agent_merge_requests(self, *, state: str, label: str) -> list[object]:
+        type(self).seen_args = (state, label)
+        return [
+            SimpleNamespace(
+                iid=18,
+                title="Add smoke baseline",
+                state=state,
+                source_branch="agent/tests-02-smoke-baseline",
+                target_branch="main",
+                web_url="https://gitlab.example.com/group/project/-/merge_requests/18",
+                labels=[label],
+                updated_at="2026-05-22T12:00:00Z",
+            ),
+            SimpleNamespace(
+                iid=19,
+                title="Manual branch",
+                state=state,
+                source_branch="feature/manual",
+                target_branch="main",
+                web_url="https://gitlab.example.com/group/project/-/merge_requests/19",
+                labels=[label],
+                updated_at="2026-05-22T12:01:00Z",
+            ),
+        ]
+
+
+def gitlab_secret(token: str = "super-secret") -> str:
+    encoded = base64.b64encode(token.encode("utf-8")).decode("ascii")
+    return json.dumps({"data": {"GITLAB_TOKEN": encoded}})
 
 
 def test_component_mappings() -> None:
@@ -610,6 +692,143 @@ def test_upgrade_preserves_cluster_config_and_rejects_conflicting_preserve_sourc
         )
 
 
+def test_config_get_reads_allowed_configmap_value() -> None:
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"],
+        json.dumps(
+            {
+                "data": {
+                    "config.yaml": yaml.safe_dump(
+                        {"schedule": {"action": {"enabled": False}}},
+                        sort_keys=False,
+                    )
+                }
+            }
+        ),
+    )
+
+    report = K8sOperator(runner=runner).config_get("schedule.action.enabled")
+
+    assert report.path == "schedule.action.enabled"
+    assert report.value is False
+    assert report.exists is True
+    assert runner.calls == [
+        (["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"], None)
+    ]
+
+
+def test_config_set_patches_only_config_yaml_and_preserves_annotations() -> None:
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"],
+        json.dumps(
+            {
+                "metadata": {
+                    "annotations": {
+                        "agentlab.io/image": "registry/agentlab:current",
+                        "operator.note": "keep-me",
+                    }
+                },
+                "data": {
+                    "config.yaml": yaml.safe_dump(
+                        {
+                            "auto_approve": {"enabled": True},
+                            "schedule": {
+                                "action": {"enabled": False, "cron": "30 2 * * *"},
+                                "review_comments": {"enabled": False},
+                            },
+                        },
+                        sort_keys=False,
+                    )
+                },
+            }
+        ),
+    )
+
+    report = K8sOperator(runner=runner).config_set("schedule.action.enabled", "true")
+
+    assert report.before is False
+    assert report.after is True
+    assert report.changed is True
+    patch_calls = [call for call in runner.calls if call[0][2:5] == ["patch", "configmap", "agentlab-config"]]
+    assert len(patch_calls) == 1
+    payload = json.loads(patch_calls[0][0][-1])
+    assert set(payload) == {"data"}
+    assert "metadata" not in payload
+    assert "annotations" not in payload
+    updated = yaml.safe_load(payload["data"]["config.yaml"])
+    assert updated["auto_approve"]["enabled"] is True
+    assert updated["schedule"]["action"] == {"enabled": True, "cron": "30 2 * * *"}
+    assert not any("secret" in " ".join(call[0]).lower() for call in runner.calls)
+
+
+def test_config_set_supports_int_and_string_values() -> None:
+    cooldown_runner = FakeRunner()
+    cooldown_runner.respond(
+        ["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"],
+        json.dumps(
+            {
+                "data": {
+                    "config.yaml": yaml.safe_dump(
+                        {"schedule": {"review_comments": {"cooldown_minutes": 10}}},
+                        sort_keys=False,
+                    )
+                }
+            }
+        ),
+    )
+
+    cooldown = K8sOperator(runner=cooldown_runner).config_set("schedule.review_comments.cooldown_minutes", "0")
+
+    assert cooldown.before == 10
+    assert cooldown.after == 0
+    cooldown_payload = json.loads(cooldown_runner.calls[-1][0][-1])
+    cooldown_config = yaml.safe_load(cooldown_payload["data"]["config.yaml"])
+    assert cooldown_config["schedule"]["review_comments"]["cooldown_minutes"] == 0
+
+    cron_runner = FakeRunner()
+    cron_runner.respond(
+        ["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"],
+        json.dumps(
+            {
+                "data": {
+                    "config.yaml": yaml.safe_dump(
+                        {"schedule": {"action": {"cron": "30 2 * * *"}}},
+                        sort_keys=False,
+                    )
+                }
+            }
+        ),
+    )
+
+    cron = K8sOperator(runner=cron_runner).config_set("schedule.action.cron", "15 3 * * *")
+
+    assert cron.before == "30 2 * * *"
+    assert cron.after == "15 3 * * *"
+    cron_payload = json.loads(cron_runner.calls[-1][0][-1])
+    cron_config = yaml.safe_load(cron_payload["data"]["config.yaml"])
+    assert cron_config["schedule"]["action"]["cron"] == "15 3 * * *"
+
+
+def test_config_set_rejects_unknown_path_before_cluster_access() -> None:
+    runner = FakeRunner()
+
+    with pytest.raises(K8sOperatorError, match="unsupported config path"):
+        K8sOperator(runner=runner).config_set("gitlab_token_env", "GITLAB_TOKEN")
+
+    assert runner.calls == []
+
+
+def test_config_set_rejects_wrong_value_type_before_cluster_access() -> None:
+    runner = FakeRunner()
+
+    with pytest.raises(K8sOperatorError, match="expects a boolean"):
+        K8sOperator(runner=runner).config_set("schedule.action.enabled", "maybe")
+
+    assert runner.calls == []
+
+
 def test_upgrade_preserved_review_comments_creates_cronjob_manifest_and_kustomization(tmp_path: Path) -> None:
     write_upgrade_manifests(tmp_path, include_review_comments_cronjob=False)
     runner = FakeRunner()
@@ -785,6 +1004,259 @@ def test_status_detects_review_comments_image_drift() -> None:
 
     assert status.cronjobs[0].name == "agentlab-scheduler-review-comments"
     assert status.cronjobs[0].image_drift is True
+
+
+def test_status_includes_open_agent_mr_details() -> None:
+    runner = FakeRunner()
+    runner.respond(["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"], configmap_with_app_config())
+    runner.respond(["-n", "agentlab", "get", "cronjobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(["-n", "agentlab", "get", "jobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(["-n", "agentlab", "get", "pods", "-o", "json"], json.dumps({"items": []}))
+
+    status = K8sOperator(runner=runner, gitlab_tool_factory=FakeGitLabForStatus).status()
+    rendered = format_status(status)
+
+    assert status.open_agent_mrs == [
+        {
+            "iid": 18,
+            "title": "Add smoke baseline",
+            "state": "opened",
+            "source_branch": "agent/tests-02-smoke-baseline",
+            "web_url": "https://gitlab.example.com/group/project/-/merge_requests/18",
+            "labels": ["agent/generated"],
+            "updated_at": "2026-05-22T12:00:00Z",
+        }
+    ]
+    assert "Open Agent MRs:" in rendered
+    assert "- !18 [agent] Add smoke baseline | branch=agent/tests-02-smoke-baseline | https://gitlab.example.com/group/project/-/merge_requests/18" in rendered
+
+
+def test_status_keeps_cluster_status_when_open_mr_api_fails_and_redacts_warning() -> None:
+    class FailingGitLab:
+        def __init__(self, _config) -> None:
+            pass
+
+        def list_open_agent_mrs(self) -> list[object]:
+            raise RuntimeError("token=super-secret failed")
+
+    runner = FakeRunner()
+    runner.respond(["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"], configmap_with_app_config())
+    runner.respond(["-n", "agentlab", "get", "cronjobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(["-n", "agentlab", "get", "jobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(["-n", "agentlab", "get", "pods", "-o", "json"], json.dumps({"items": []}))
+
+    status = K8sOperator(runner=runner, gitlab_tool_factory=FailingGitLab).status()
+    rendered = format_status(status)
+
+    assert status.open_agent_mrs == []
+    assert "could not read open Agent MRs" in (status.open_agent_mrs_warning or "")
+    assert "super-secret" not in rendered
+    assert "Warnings:" in rendered
+
+
+def test_health_summarizes_runtime_scheduler_gitlab_models_and_doctor() -> None:
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"],
+        configmap_with_app_config(
+            {
+                "ollama": {
+                    "base_url": "http://ollama.local:11434",
+                    "models": {"default": "qwen-health", "planner": "qwen-plan"},
+                },
+                "schedule": {
+                    "enabled": True,
+                    "action": {"enabled": True, "cron": "30 2 * * *"},
+                    "review_comments": {
+                        "enabled": True,
+                        "cron": "*/10 * * * *",
+                        "allowed_authors": ["alice"],
+                        "require_author_role": ["owner", "maintainer"],
+                        "cooldown_minutes": 0,
+                        "max_comments_per_run": 2,
+                    },
+                },
+            }
+        ),
+    )
+    runner.respond(
+        ["-n", "agentlab", "get", "cronjobs", "-o", "json"],
+        json.dumps(
+            {
+                "items": [
+                    {
+                        "metadata": {"name": "agentlab-scheduler-action"},
+                        "spec": {
+                            "schedule": "30 2 * * *",
+                            "jobTemplate": {
+                                "spec": {
+                                    "template": {
+                                        "spec": {
+                                            "containers": [{"image": "registry/agentlab:old"}],
+                                        }
+                                    }
+                                }
+                            },
+                        },
+                        "status": {"lastScheduleTime": "2026-05-22T01:00:00Z"},
+                    }
+                ]
+            }
+        ),
+    )
+    runner.respond(
+        ["-n", "agentlab", "get", "jobs", "-o", "json"],
+        json.dumps(
+            {
+                "items": [
+                    {
+                        "metadata": {"name": "agentlab-scheduler-action-failed", "creationTimestamp": "2026-05-22T12:01:00Z"},
+                        "status": {"failed": 1},
+                    },
+                    {
+                        "metadata": {"name": "agentlab-doctor", "creationTimestamp": "2026-05-22T12:00:00Z"},
+                        "status": {"succeeded": 1},
+                    },
+                ]
+            }
+        ),
+    )
+    runner.respond(
+        ["-n", "agentlab", "get", "pods", "-o", "json"],
+        json.dumps(
+            {
+                "items": [
+                    {
+                        "metadata": {"name": "agentlab-action-pod"},
+                        "status": {"phase": "Failed", "reason": "Error"},
+                    }
+                ]
+            }
+        ),
+    )
+    runner.respond(
+        ["-n", "agentlab", "get", "pod", "artifact-shell", "-o", "json"],
+        json.dumps({"metadata": {"name": "artifact-shell"}, "status": {"phase": "Running"}}),
+    )
+    runner.respond(["-n", "agentlab", "wait", "--for=condition=Ready", "pod/artifact-shell", "--timeout=60s"])
+    state_path = "/var/lib/agentlab/runs/scheduler/state.json"
+    runner.respond(["-n", "agentlab", "exec", "artifact-shell", "--", "sh", "-c", f"test -f '{state_path}'"])
+    runner.respond(["-n", "agentlab", "exec", "artifact-shell", "--", "sh", "-c", f"stat -c %Y '{state_path}'"], "1")
+    runner.respond(
+        ["-n", "agentlab", "exec", "artifact-shell", "--", "sh", "-c", f"cat '{state_path}'"],
+        json.dumps(
+            {
+                "last_watch_run": "2026-05-22T09:00:00Z",
+                "last_plan_run": "2026-05-22T10:00:00Z",
+                "last_action_run": "2026-05-22T11:00:00Z",
+                "last_review_comment_run": "2026-05-22T12:00:00Z",
+                "open_agent_mrs": 1,
+                "last_selected_task_id": "tests-02-smoke-baseline",
+                "processed_review_comments": {"1:18:41": {"status": "passed"}},
+                "closed_agent_mr_feedback": [{"iid": 17}],
+            }
+        ),
+    )
+    runner.respond(
+        ["-n", "agentlab", "logs", "job/agentlab-doctor", "--tail=200"],
+        "AgentLab doctor: warning\nWARN: Ollama model is not listed: qwen-health\n",
+    )
+
+    report = K8sOperator(runner=runner, gitlab_tool_factory=FakeGitLabForStatus).health(manifest_dir=None)
+    rendered = format_health(report)
+
+    assert report.status == "failed"
+    assert report.images["drift"] == [
+        "CronJob agentlab-scheduler-action: registry/agentlab:old != registry/agentlab:new"
+    ]
+    assert report.failed_resources["jobs"][0]["name"] == "agentlab-scheduler-action-failed"
+    assert report.failed_resources["pods"][0]["name"] == "agentlab-action-pod"
+    assert report.open_agent_mrs[0]["iid"] == 18
+    assert report.gitlab["open_agent_mrs_count"] == 1
+    assert report.scheduler["action_enabled"] is True
+    assert report.scheduler["review_comments"]["allowed_authors"] == ["alice"]
+    assert report.scheduler["last_review_run"] == "2026-05-22T12:00:00Z"
+    assert report.scheduler["state_age_seconds"] is not None
+    assert report.models["default"] == "qwen-health"
+    assert report.doctor["status"] == "warning"
+    assert "AgentLab health: failed" in rendered
+    assert "Open Agent MRs: 1" in rendered
+    assert "- !18 Add smoke baseline | agent/tests-02-smoke-baseline | https://gitlab.example.com/group/project/-/merge_requests/18" in rendered
+    assert "review-comments: enabled (authors=alice, roles=owner, maintainer)" in rendered
+    assert "super-secret" not in rendered
+
+
+def test_mrs_reads_configmap_and_secret_then_formats_agent_mrs() -> None:
+    FakeGitLabForMrs.seen_token = None
+    FakeGitLabForMrs.seen_project_id = None
+    FakeGitLabForMrs.seen_args = None
+    runner = FakeRunner()
+    runner.respond(["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"], configmap_with_app_config())
+    runner.respond(["-n", "agentlab", "get", "secret", "agentlab-secrets", "-o", "json"], gitlab_secret())
+
+    report = K8sOperator(runner=runner, gitlab_tool_factory=FakeGitLabForMrs).mrs(
+        state="opened",
+        label="agent/generated",
+    )
+    rendered = format_mrs(report)
+
+    assert FakeGitLabForMrs.seen_token == "super-secret"
+    assert FakeGitLabForMrs.seen_project_id == 1
+    assert FakeGitLabForMrs.seen_args == ("opened", "agent/generated")
+    assert report.merge_requests == [
+        {
+            "iid": 18,
+            "title": "Add smoke baseline",
+            "state": "opened",
+            "source_branch": "agent/tests-02-smoke-baseline",
+            "web_url": "https://gitlab.example.com/group/project/-/merge_requests/18",
+            "labels": ["agent/generated"],
+            "updated_at": "2026-05-22T12:00:00Z",
+        }
+    ]
+    assert (
+        "!18 | Add smoke baseline | opened | agent/tests-02-smoke-baseline | "
+        "https://gitlab.example.com/group/project/-/merge_requests/18 | agent/generated"
+    ) in rendered
+    assert "super-secret" not in rendered
+    assert [call[0] for call in runner.calls] == [
+        ["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"],
+        ["-n", "agentlab", "get", "secret", "agentlab-secrets", "-o", "json"],
+    ]
+
+
+def test_mrs_supports_string_data_secret() -> None:
+    runner = FakeRunner()
+    runner.respond(["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"], configmap_with_app_config())
+    runner.respond(
+        ["-n", "agentlab", "get", "secret", "agentlab-secrets", "-o", "json"],
+        json.dumps({"stringData": {"GITLAB_TOKEN": "plain-secret"}}),
+    )
+
+    K8sOperator(runner=runner, gitlab_tool_factory=FakeGitLabForMrs).mrs()
+
+    assert FakeGitLabForMrs.seen_token == "plain-secret"
+
+
+def test_mrs_redacts_secret_from_gitlab_errors() -> None:
+    class FailingGitLabForMrs:
+        def __init__(self, _config, *, token: str | None = None) -> None:
+            self.token = token
+
+        def list_agent_merge_requests(self, *, state: str, label: str) -> list[object]:
+            raise RuntimeError(f"token={self.token} failed")
+
+    runner = FakeRunner()
+    runner.respond(["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"], configmap_with_app_config())
+    runner.respond(["-n", "agentlab", "get", "secret", "agentlab-secrets", "-o", "json"], gitlab_secret())
+
+    with pytest.raises(K8sOperatorError) as excinfo:
+        K8sOperator(runner=runner, gitlab_tool_factory=FailingGitLabForMrs).mrs()
+
+    message = str(excinfo.value)
+    assert "could not list GitLab merge requests" in message
+    assert "super-secret" not in message
+    assert "REDACTED" in message
 
 
 def test_upgrade_run_doctor_and_cleanup_after_successful_apply(tmp_path: Path) -> None:

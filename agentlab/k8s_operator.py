@@ -1,16 +1,23 @@
 from __future__ import annotations
 
+import base64
 import json
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Iterable
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol, TextIO
 
 import yaml
+
+from agentlab.audit import redact_secrets
+from agentlab.config import AppConfig
+from agentlab.review_comments import normalize_mr
+from agentlab.tools.gitlab_tool import GitLabTool
 
 
 DEFAULT_NAMESPACE = "agentlab"
@@ -64,6 +71,18 @@ CRONJOB_DEFAULT_CRONS = {
     "plan": "0 7,19 * * *",
     "watch": "*/30 * * * *",
 }
+
+CONFIG_SETTING_SPECS: dict[str, tuple[type[bool] | type[int] | type[str], int | None]] = {
+    "schedule.action.enabled": (bool, None),
+    "schedule.action.cron": (str, None),
+    "schedule.review_comments.enabled": (bool, None),
+    "schedule.review_comments.cron": (str, None),
+    "schedule.review_comments.cooldown_minutes": (int, 0),
+    "schedule.review_comments.max_comments_per_run": (int, 1),
+    "schedule.plan.enabled": (bool, None),
+    "schedule.watch.enabled": (bool, None),
+}
+CONFIG_SETTING_PATHS = tuple(CONFIG_SETTING_SPECS)
 
 
 class K8sOperatorError(RuntimeError):
@@ -228,6 +247,9 @@ class ManifestImageDrift:
 class ClusterStatus:
     namespace: str
     configmap_image: str | None
+    open_agent_mrs: list[dict[str, Any]] = field(default_factory=list)
+    open_agent_mrs_count: int | None = None
+    open_agent_mrs_warning: str | None = None
     cronjobs: list[CronJobStatus] = field(default_factory=list)
     recent_jobs: list[JobStatus] = field(default_factory=list)
     failed_jobs: list[JobStatus] = field(default_factory=list)
@@ -288,6 +310,44 @@ class UpgradeReport:
     image_drift: list[str] = field(default_factory=list)
 
 
+@dataclass
+class ConfigValueReport:
+    path: str
+    value: Any = None
+    exists: bool = True
+
+
+@dataclass
+class ConfigSetReport:
+    path: str
+    before: Any = None
+    after: Any = None
+    before_exists: bool = True
+    changed: bool = False
+
+
+@dataclass
+class MergeRequestListReport:
+    namespace: str
+    state: str
+    label: str
+    merge_requests: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass
+class HealthReport:
+    namespace: str
+    status: str
+    images: dict[str, Any]
+    failed_resources: dict[str, Any]
+    open_agent_mrs: list[dict[str, Any]]
+    gitlab: dict[str, Any]
+    scheduler: dict[str, Any]
+    models: dict[str, Any]
+    doctor: dict[str, Any]
+    warnings: list[str] = field(default_factory=list)
+
+
 class K8sOperator:
     def __init__(
         self,
@@ -295,18 +355,21 @@ class K8sOperator:
         namespace: str = DEFAULT_NAMESPACE,
         manifest_dir: str | Path = DEFAULT_MANIFEST_DIR,
         runner: KubectlRunner | None = None,
+        gitlab_tool_factory: Callable[[AppConfig], Any] | None = None,
         log_retry_attempts: int = 5,
         log_retry_delay_seconds: float = 1.0,
     ) -> None:
         self.namespace = namespace
         self.manifest_dir = Path(manifest_dir)
         self.runner = runner or SubprocessKubectlRunner()
+        self.gitlab_tool_factory = gitlab_tool_factory or GitLabTool
         self.log_retry_attempts = log_retry_attempts
         self.log_retry_delay_seconds = log_retry_delay_seconds
 
     def status(self, *, manifest_dir: str | Path | None = None) -> ClusterStatus:
         configmap = self._run_json(["get", "configmap", "agentlab-config", "-o", "json"], check=False)
         configmap_image = _configmap_image(configmap)
+        open_agent_mrs, open_agent_mrs_warning = self._open_agent_mrs_from_configmap(configmap)
         cronjobs = [_cronjob_status(item, configmap_image) for item in self._items("cronjobs")]
         cronjobs = [item for item in cronjobs if item.name.startswith("agentlab-scheduler-")]
 
@@ -321,6 +384,9 @@ class K8sOperator:
         status = ClusterStatus(
             namespace=self.namespace,
             configmap_image=configmap_image,
+            open_agent_mrs=open_agent_mrs,
+            open_agent_mrs_count=len(open_agent_mrs),
+            open_agent_mrs_warning=open_agent_mrs_warning,
             cronjobs=cronjobs,
             recent_jobs=agentlab_jobs[:10],
             failed_jobs=failed_jobs,
@@ -433,6 +499,106 @@ class K8sOperator:
         self._run(["patch", "cronjob", cronjob, "--type", "merge", "-p", payload])
         item = self._run_json(["get", "cronjob", cronjob, "-o", "json"])
         return _cronjob_status(item, None)
+
+    def config_get(self, path: str) -> ConfigValueReport:
+        _validate_config_setting_path(path)
+        config = self._cluster_config()
+        value, exists = _get_config_setting(config, path)
+        return ConfigValueReport(path=path, value=value, exists=exists)
+
+    def config_set(self, path: str, raw_value: str) -> ConfigSetReport:
+        _validate_config_setting_path(path)
+        value = _parse_config_setting_value(path, raw_value)
+        configmap = self._run_json(["get", "configmap", "agentlab-config", "-o", "json"])
+        config = _config_from_configmap_document(configmap)
+        before, before_exists = _get_config_setting(config, path)
+        _set_config_setting(config, path, value)
+        patch = {"data": {"config.yaml": yaml.safe_dump(config, sort_keys=False)}}
+        self._run(["patch", "configmap", "agentlab-config", "--type", "merge", "-p", json.dumps(patch)])
+        after, _ = _get_config_setting(config, path)
+        return ConfigSetReport(
+            path=path,
+            before=before,
+            after=after,
+            before_exists=before_exists,
+            changed=not before_exists or before != after,
+        )
+
+    def mrs(
+        self,
+        *,
+        state: str = "opened",
+        label: str = "agent/generated",
+        secret_name: str = "agentlab-secrets",
+    ) -> MergeRequestListReport:
+        configmap = self._run_json(["get", "configmap", "agentlab-config", "-o", "json"])
+        config = AppConfig.model_validate(_config_from_configmap_document(configmap))
+        secret = self._run_json(["get", "secret", secret_name, "-o", "json"])
+        token = _secret_value(secret, config.gitlab_token_env)
+        try:
+            tool = self._new_gitlab_tool(config, token)
+            if hasattr(tool, "list_agent_merge_requests"):
+                raw_mrs = tool.list_agent_merge_requests(state=state, label=label)
+            else:
+                raw_mrs = tool.list_open_agent_mrs()
+        except Exception as exc:
+            message = _safe_error(exc)
+            if token:
+                message = message.replace(token, "REDACTED")
+            raise K8sOperatorError(f"could not list GitLab merge requests: {message}") from exc
+        mrs = _agent_mr_details(raw_mrs, state=state, label=label, default_branch=config.default_branch)
+        return MergeRequestListReport(namespace=self.namespace, state=state, label=label, merge_requests=mrs)
+
+    def health(
+        self,
+        *,
+        manifest_dir: str | Path | None = DEFAULT_MANIFEST_DIR,
+        pvc: str = "agentlab-runs",
+        shell_pod: str = "artifact-shell",
+    ) -> HealthReport:
+        status = self.status(manifest_dir=manifest_dir)
+        config = self._cluster_config()
+        scheduler_state, scheduler_state_meta = self._scheduler_state(pvc=pvc, shell_pod=shell_pod)
+        doctor = self._doctor_health(status)
+        images = _health_images(status)
+        failed_resources = {
+            "jobs": [job.__dict__ for job in status.failed_jobs],
+            "pods": [pod.__dict__ for pod in status.failed_pods],
+        }
+        scheduler = _health_scheduler(config, scheduler_state, scheduler_state_meta)
+        models = _health_models(config, doctor)
+        open_mr_count = len(status.open_agent_mrs)
+        if status.open_agent_mrs_warning and scheduler.get("open_agent_mrs_count") is not None:
+            open_mr_count = scheduler["open_agent_mrs_count"]
+        gitlab = {
+            "url": config.get("gitlab_url"),
+            "project_id": config.get("project_id"),
+            "open_agent_mrs_count": open_mr_count,
+            "status": "warning" if status.open_agent_mrs_warning else "ok",
+            "warning": status.open_agent_mrs_warning,
+        }
+        warnings = _health_warnings(status, scheduler_state_meta, doctor, images, failed_resources)
+        return HealthReport(
+            namespace=self.namespace,
+            status=_health_overall_status(warnings, failed_resources, doctor),
+            images=images,
+            failed_resources=failed_resources,
+            open_agent_mrs=status.open_agent_mrs,
+            gitlab=gitlab,
+            scheduler=scheduler,
+            models=models,
+            doctor=doctor,
+            warnings=warnings,
+        )
+
+    def _new_gitlab_tool(self, config: AppConfig, token: str) -> Any:
+        try:
+            return self.gitlab_tool_factory(config, token=token)
+        except TypeError as exc:
+            try:
+                return self.gitlab_tool_factory(config)
+            except TypeError:
+                raise exc
 
     def failed_resources(self) -> FailedResources:
         jobs: list[str] = []
@@ -571,6 +737,79 @@ class K8sOperator:
         if not isinstance(loaded, dict):
             return {}
         return loaded
+
+    def _open_agent_mrs_from_configmap(self, configmap: dict[str, Any]) -> tuple[list[dict[str, Any]], str | None]:
+        if not configmap:
+            return [], "could not read open Agent MRs: agentlab-config ConfigMap is unavailable"
+        if not ((configmap.get("data") or {}).get("config.yaml")):
+            return [], "could not read open Agent MRs: config.yaml is unavailable in agentlab-config"
+        try:
+            config = AppConfig.model_validate(_config_from_configmap_document(configmap))
+            mrs = self.gitlab_tool_factory(config).list_open_agent_mrs()
+            return _open_agent_mr_details(mrs), None
+        except Exception as exc:
+            return [], f"could not read open Agent MRs: {_safe_error(exc)}"
+
+    def _scheduler_state(self, *, pvc: str, shell_pod: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        path = f"{RUNS_ROOT}/scheduler/state.json"
+        meta: dict[str, Any] = {"path": path, "exists": False, "warning": None}
+        try:
+            self.ensure_artifact_shell(pvc=pvc, shell_pod=shell_pod)
+            exists = self._exec(shell_pod, f"test -f {_sh_quote(path)}", check=False)
+            if exists.returncode != 0:
+                meta["warning"] = "scheduler state file not found"
+                return {}, meta
+            raw_mtime = self._exec(shell_pod, f"stat -c %Y {_sh_quote(path)}", check=False)
+            if raw_mtime.returncode == 0:
+                try:
+                    mtime_epoch = float(raw_mtime.stdout.strip())
+                    meta["mtime_epoch"] = mtime_epoch
+                    meta["age_seconds"] = int(max(0, time.time() - mtime_epoch))
+                except ValueError:
+                    meta["warning"] = "scheduler state mtime is not parseable"
+            raw_state = self._exec(shell_pod, f"cat {_sh_quote(path)}", check=False)
+            if raw_state.returncode != 0:
+                meta["warning"] = _safe_message(raw_state.stderr or raw_state.stdout or "could not read scheduler state")
+                return {}, meta
+            loaded = json.loads(raw_state.stdout or "{}")
+            if not isinstance(loaded, dict):
+                meta["warning"] = "scheduler state is not a JSON object"
+                return {}, meta
+            meta["exists"] = True
+            return loaded, meta
+        except Exception as exc:
+            meta["warning"] = _safe_error(exc)
+            return {}, meta
+
+    def _doctor_health(self, status: ClusterStatus) -> dict[str, Any]:
+        doctor_jobs = [job for job in status.recent_jobs if job.name.startswith(JOB_PREFIXES["doctor"])]
+        if not doctor_jobs:
+            return {"status": "unknown", "job": None, "job_status": "missing", "warning": "no doctor job found"}
+        job = doctor_jobs[0]
+        result = self.runner.run(self._ns(["logs", f"job/{job.name}", "--tail=200"]), check=False)
+        if result.returncode != 0:
+            return {
+                "status": "unknown",
+                "job": job.name,
+                "job_status": job.status,
+                "warning": _safe_message(result.stderr or result.stdout or "could not read doctor logs"),
+            }
+        logs = result.stdout or ""
+        if "AgentLab doctor: failed" in logs:
+            doctor_status = "failed"
+        elif "AgentLab doctor: warning" in logs:
+            doctor_status = "warning"
+        elif "AgentLab doctor: passed" in logs:
+            doctor_status = "passed"
+        else:
+            doctor_status = "unknown"
+        return {
+            "status": doctor_status,
+            "job": job.name,
+            "job_status": job.status,
+            "models": _doctor_model_signals(logs),
+            "warning": None if doctor_status != "unknown" else "doctor logs did not contain a status line",
+        }
 
     def _run_artifact_status(self, run_id: str, *, shell_pod: str) -> tuple[str, str]:
         for artifact in (
@@ -822,6 +1061,18 @@ def format_status(status: ClusterStatus) -> str:
     else:
         lines.append("- none")
 
+    lines.extend(["", "Open Agent MRs:"])
+    if status.open_agent_mrs:
+        for mr in status.open_agent_mrs:
+            iid = mr.get("iid")
+            title = str(mr.get("title") or "<untitled>")
+            branch = str(mr.get("source_branch") or "unknown")
+            url = str(mr.get("web_url") or "no-url")
+            prefix = f"!{iid}" if iid is not None else "!?"
+            lines.append(f"- {prefix} [agent] {title} | branch={branch} | {url}")
+    else:
+        lines.append("- none")
+
     lines.extend(["", "Recent jobs:"])
     lines.extend(f"- {job.name}: {job.status} ({job.created_at or 'unknown'})" for job in status.recent_jobs[:10] or [])
     if not status.recent_jobs:
@@ -842,11 +1093,102 @@ def format_status(status: ClusterStatus) -> str:
         f"Manifest {drift.path} image {drift.image} differs from generated ConfigMap annotation {drift.expected_image}"
         for drift in status.manifest_image_drifts
     )
+    if status.open_agent_mrs_warning:
+        warnings.append(status.open_agent_mrs_warning)
     if status.manifest_configmap_image:
         lines.extend(["", f"Generated manifest ConfigMap image: {status.manifest_configmap_image}"])
     if warnings:
         lines.extend(["", "Warnings:"])
         lines.extend(f"- {warning}" for warning in warnings)
+    return "\n".join(lines)
+
+
+def format_mrs(report: MergeRequestListReport) -> str:
+    if not report.merge_requests:
+        return "No AgentLab merge requests found."
+    lines = []
+    for mr in report.merge_requests:
+        iid = mr.get("iid")
+        prefix = f"!{iid}" if iid is not None else "!?"
+        labels = ", ".join(str(label) for label in mr.get("labels", []))
+        lines.append(
+            " | ".join(
+                [
+                    prefix,
+                    str(mr.get("title") or ""),
+                    str(mr.get("state") or ""),
+                    str(mr.get("source_branch") or ""),
+                    str(mr.get("web_url") or ""),
+                    labels,
+                ]
+            )
+        )
+    return "\n".join(lines)
+
+
+def format_health(report: HealthReport) -> str:
+    review = report.scheduler.get("review_comments") or {}
+    failed_jobs = report.failed_resources.get("jobs") or []
+    failed_pods = report.failed_resources.get("pods") or []
+    drift = report.images.get("drift") or []
+    model_names = report.models.get("models") or {}
+    author_config = (
+        f"authors={_display_list(review.get('allowed_authors'))}, "
+        f"roles={_display_list(review.get('require_author_role'))}"
+    )
+    lines = [
+        f"AgentLab health: {report.status}",
+        f"Namespace: {report.namespace}",
+        "",
+        "Runtime:",
+        f"- ConfigMap image: {_display_value(report.images.get('configmap_image'))}",
+        f"- Generated manifest image: {_display_value(report.images.get('generated_configmap_image'))}",
+        f"- Image drift: {'none' if not drift else str(len(drift))}",
+        f"- Failed jobs: {len(failed_jobs)}",
+        f"- Failed pods: {len(failed_pods)}",
+        "",
+        "Scheduler:",
+        f"- action: {_enabled_label(report.scheduler.get('action_enabled'))}",
+        f"- review-comments: {_enabled_label(review.get('enabled'))} ({author_config})",
+        f"- scheduler state age: {_format_age(report.scheduler.get('state_age_seconds'))}",
+        f"- last watch: {_display_value(report.scheduler.get('last_watch_run'))}",
+        f"- last plan: {_display_value(report.scheduler.get('last_plan_run'))}",
+        f"- last action: {_display_value(report.scheduler.get('last_action_run'))}",
+        f"- last review: {_display_value(report.scheduler.get('last_review_run'))}",
+        "",
+        "GitLab:",
+        f"- project: {_display_value(report.gitlab.get('url'))} / {_display_value(report.gitlab.get('project_id'))}",
+        f"- Open Agent MRs: {_display_value(report.gitlab.get('open_agent_mrs_count'))}",
+    ]
+    if report.open_agent_mrs:
+        for mr in report.open_agent_mrs:
+            iid = mr.get("iid")
+            prefix = f"!{iid}" if iid is not None else "!?"
+            title = str(mr.get("title") or "<untitled>")
+            branch = str(mr.get("source_branch") or "unknown")
+            url = str(mr.get("web_url") or "no-url")
+            lines.append(f"- {prefix} {title} | {branch} | {url}")
+
+    lines.extend(
+        [
+            "",
+            "Models:",
+            f"- base URL: {_display_value(report.models.get('base_url'))}",
+            f"- default: {_display_value(report.models.get('default'))}",
+            f"- configured: {_display_list(model_names.keys() if isinstance(model_names, dict) else [])}",
+            "",
+            "Doctor:",
+            f"- status: {_display_value(report.doctor.get('status'))}",
+            f"- job: {_display_value(report.doctor.get('job'))}",
+        ]
+    )
+
+    if drift:
+        lines.extend(["", "Image Drift:"])
+        lines.extend(f"- {_display_value(item)}" for item in drift)
+    if report.warnings:
+        lines.extend(["", "Warnings:"])
+        lines.extend(f"- {_display_value(warning)}" for warning in report.warnings)
     return "\n".join(lines)
 
 
@@ -933,11 +1275,279 @@ def format_upgrade_report(report: UpgradeReport) -> str:
     return "\n".join(lines)
 
 
+def _health_images(status: ClusterStatus) -> dict[str, Any]:
+    drift = [
+        f"CronJob {item.name}: {item.image} != {status.configmap_image}"
+        for item in status.cronjobs
+        if item.image_drift
+    ]
+    drift.extend(
+        f"Manifest {item.path}: {item.image} != {item.expected_image}"
+        for item in status.manifest_image_drifts
+    )
+    return {
+        "configmap_image": status.configmap_image,
+        "generated_configmap_image": status.manifest_configmap_image,
+        "cronjobs": [
+            {
+                "name": item.name,
+                "schedule": item.schedule,
+                "suspend": item.suspend,
+                "active": item.active,
+                "last_schedule": item.last_schedule,
+                "image": item.image,
+                "image_drift": item.image_drift,
+            }
+            for item in status.cronjobs
+        ],
+        "drift": drift,
+    }
+
+
+def _health_scheduler(
+    config: dict[str, Any],
+    state: dict[str, Any],
+    state_meta: dict[str, Any],
+) -> dict[str, Any]:
+    schedule = _as_mapping(config.get("schedule"))
+    action = _as_mapping(schedule.get("action"))
+    review = _as_mapping(schedule.get("review_comments"))
+    return {
+        "state_path": state_meta.get("path"),
+        "state_exists": bool(state_meta.get("exists")),
+        "state_age_seconds": state_meta.get("age_seconds"),
+        "state_warning": state_meta.get("warning"),
+        "schedule_enabled": _optional_bool(schedule.get("enabled")),
+        "last_watch_run": state.get("last_watch_run"),
+        "last_plan_run": state.get("last_plan_run"),
+        "last_action_run": state.get("last_action_run"),
+        "last_review_run": state.get("last_review_comment_run"),
+        "open_agent_mrs_count": state.get("open_agent_mrs"),
+        "last_selected_task_id": state.get("last_selected_task_id"),
+        "closed_agent_mr_feedback_count": _collection_size(state.get("closed_agent_mr_feedback")),
+        "processed_review_comments_count": _collection_size(state.get("processed_review_comments")),
+        "action_enabled": _optional_bool(action.get("enabled")),
+        "action_cron": action.get("cron"),
+        "review_comments": {
+            "enabled": _optional_bool(review.get("enabled")),
+            "cron": review.get("cron"),
+            "allowed_authors": _string_list(review.get("allowed_authors")),
+            "require_author_role": _string_list(review.get("require_author_role")),
+            "process_history": _optional_bool(review.get("process_history")),
+            "cooldown_minutes": review.get("cooldown_minutes"),
+            "max_comments_per_run": review.get("max_comments_per_run"),
+        },
+    }
+
+
+def _health_models(config: dict[str, Any], doctor: dict[str, Any]) -> dict[str, Any]:
+    ollama = _as_mapping(config.get("ollama"))
+    models = _as_mapping(ollama.get("models"))
+    return {
+        "base_url": ollama.get("base_url") or "http://localhost:11434",
+        "default": models.get("default") or "qwen3.6:35b",
+        "models": models,
+        "doctor_status": doctor.get("status"),
+        "doctor_signals": doctor.get("models") or [],
+    }
+
+
+def _health_warnings(
+    status: ClusterStatus,
+    state_meta: dict[str, Any],
+    doctor: dict[str, Any],
+    images: dict[str, Any],
+    failed_resources: dict[str, Any],
+) -> list[str]:
+    warnings: list[str] = []
+    if status.open_agent_mrs_warning:
+        warnings.append(status.open_agent_mrs_warning)
+    if state_meta.get("warning"):
+        warnings.append(f"scheduler state: {state_meta['warning']}")
+    warnings.extend(f"image drift: {item}" for item in images.get("drift") or [])
+    failed_jobs = failed_resources.get("jobs") or []
+    failed_pods = failed_resources.get("pods") or []
+    if failed_jobs:
+        warnings.append(f"{len(failed_jobs)} failed AgentLab job(s)")
+    if failed_pods:
+        warnings.append(f"{len(failed_pods)} failed AgentLab pod(s)")
+    if doctor.get("status") in {"failed", "warning"}:
+        warnings.append(f"doctor status: {doctor.get('status')}")
+    if doctor.get("warning"):
+        warnings.append(f"doctor: {doctor['warning']}")
+    return _dedupe_strings(_safe_message(warning) for warning in warnings)
+
+
+def _health_overall_status(
+    warnings: list[str],
+    failed_resources: dict[str, Any],
+    doctor: dict[str, Any],
+) -> str:
+    if failed_resources.get("jobs") or failed_resources.get("pods") or doctor.get("status") == "failed":
+        return "failed"
+    if warnings:
+        return "warning"
+    return "passed"
+
+
 def _configmap_image(configmap: dict[str, Any]) -> str | None:
     metadata = configmap.get("metadata") or {}
     annotations = metadata.get("annotations") or {}
     image = annotations.get("agentlab.io/image")
     return str(image) if image else None
+
+
+def _open_agent_mr_details(mrs: list[Any]) -> list[dict[str, Any]]:
+    details: list[dict[str, Any]] = []
+    for mr in mrs:
+        normalized = normalize_mr(mr)
+        details.append(
+            {
+                "iid": normalized.get("iid"),
+                "title": str(normalized.get("title") or ""),
+                "state": normalized.get("state"),
+                "source_branch": str(normalized.get("source_branch") or ""),
+                "web_url": normalized.get("web_url"),
+                "labels": [str(label) for label in normalized.get("labels", [])],
+                "updated_at": normalized.get("updated_at"),
+            }
+        )
+    return details
+
+
+def _agent_mr_details(
+    mrs: list[Any],
+    *,
+    state: str,
+    label: str,
+    default_branch: str,
+) -> list[dict[str, Any]]:
+    details: list[dict[str, Any]] = []
+    for mr in mrs:
+        normalized = normalize_mr(mr)
+        labels = [str(item) for item in normalized.get("labels", [])]
+        source_branch = str(normalized.get("source_branch") or "")
+        target_branch = str(normalized.get("target_branch") or default_branch)
+        if not source_branch.startswith("agent/"):
+            continue
+        if target_branch != default_branch:
+            continue
+        if label and label not in labels:
+            continue
+        details.append(
+            {
+                "iid": normalized.get("iid"),
+                "title": str(normalized.get("title") or ""),
+                "state": str(normalized.get("state") or state),
+                "source_branch": source_branch,
+                "web_url": normalized.get("web_url"),
+                "labels": labels,
+                "updated_at": normalized.get("updated_at"),
+            }
+        )
+    return details
+
+
+def _secret_value(secret: dict[str, Any], key: str) -> str:
+    string_data = secret.get("stringData") or {}
+    if isinstance(string_data, dict) and string_data.get(key):
+        return str(string_data[key])
+    data = secret.get("data") or {}
+    raw = data.get(key) if isinstance(data, dict) else None
+    if not raw:
+        raise K8sOperatorError(f"GitLab token key is missing from Kubernetes Secret: {key}")
+    try:
+        return base64.b64decode(str(raw)).decode("utf-8").strip()
+    except Exception as exc:
+        raise K8sOperatorError(f"could not decode GitLab token from Kubernetes Secret key: {key}") from exc
+
+
+def _safe_error(exc: Exception) -> str:
+    return str(redact_secrets(str(exc)))
+
+
+def _safe_message(message: object) -> str:
+    return str(redact_secrets(str(message))).strip()
+
+
+def _as_mapping(value: object) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _optional_bool(value: object) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _string_list(value: object) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(item) for item in value]
+
+
+def _collection_size(value: object) -> int:
+    if isinstance(value, (list, dict, set, tuple)):
+        return len(value)
+    return 0
+
+
+def _dedupe_strings(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def _display_value(value: object) -> str:
+    if value is None or value == "":
+        return "unknown"
+    return _safe_message(value)
+
+
+def _display_list(values: object) -> str:
+    if isinstance(values, dict):
+        values = list(values)
+    if not isinstance(values, Iterable) or isinstance(values, (str, bytes)):
+        return "none"
+    rendered = [_display_value(value) for value in values]
+    return ", ".join(rendered) if rendered else "none"
+
+
+def _enabled_label(value: object) -> str:
+    if value is True:
+        return "enabled"
+    if value is False:
+        return "disabled"
+    return "unknown"
+
+
+def _format_age(value: object) -> str:
+    if not isinstance(value, int | float):
+        return "unknown"
+    seconds = max(0, int(value))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes = seconds // 60
+    if minutes < 60:
+        return f"{minutes}m"
+    hours = minutes // 60
+    if hours < 48:
+        return f"{hours}h"
+    return f"{hours // 24}d"
+
+
+def _doctor_model_signals(logs: str) -> list[str]:
+    signals: list[str] = []
+    for line in logs.splitlines():
+        if "ollama" not in line.lower() and "model" not in line.lower():
+            continue
+        stripped = _safe_message(line)
+        if stripped:
+            signals.append(stripped)
+    return signals[:5]
 
 
 def _load_yaml_file(path: Path) -> dict[str, Any]:
@@ -963,6 +1573,59 @@ def _config_from_configmap_document(configmap: dict[str, Any]) -> dict[str, Any]
     if not isinstance(config, dict):
         return {}
     return config
+
+
+def _validate_config_setting_path(path: str) -> None:
+    if path not in CONFIG_SETTING_SPECS:
+        allowed = ", ".join(CONFIG_SETTING_PATHS)
+        raise K8sOperatorError(f"unsupported config path: {path}. Allowed paths: {allowed}")
+
+
+def _parse_config_setting_value(path: str, raw_value: str) -> bool | int | str:
+    value_type, min_value = CONFIG_SETTING_SPECS[path]
+    value = raw_value.strip()
+    if value_type is bool:
+        lowered = value.lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+        raise K8sOperatorError(f"{path} expects a boolean value: true or false")
+    if value_type is int:
+        try:
+            parsed = int(value)
+        except ValueError as exc:
+            raise K8sOperatorError(f"{path} expects an integer value") from exc
+        if min_value is not None and parsed < min_value:
+            raise K8sOperatorError(f"{path} must be >= {min_value}")
+        return parsed
+    if not value:
+        raise K8sOperatorError(f"{path} expects a non-empty string value")
+    return value
+
+
+def _get_config_setting(config: dict[str, Any], path: str) -> tuple[Any, bool]:
+    current: Any = config
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None, False
+        current = current[part]
+    return current, True
+
+
+def _set_config_setting(config: dict[str, Any], path: str, value: Any) -> None:
+    current: dict[str, Any] = config
+    parts = path.split(".")
+    for index, part in enumerate(parts[:-1]):
+        next_value = current.get(part)
+        if next_value is None:
+            next_value = {}
+            current[part] = next_value
+        if not isinstance(next_value, dict):
+            prefix = ".".join(parts[: index + 1])
+            raise K8sOperatorError(f"cannot set {path}: {prefix} is not a mapping")
+        current = next_value
+    current[parts[-1]] = value
 
 
 def _merge_preserved_config_sections(target: dict[str, Any], source: dict[str, Any]) -> list[str]:
