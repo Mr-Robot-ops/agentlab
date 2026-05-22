@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import uuid
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from agentlab.audit import redact_secrets
 from agentlab.artifacts import ArtifactStore
 from agentlab.config import AppConfig
 from agentlab.orchestrator import Orchestrator
@@ -23,7 +25,7 @@ from agentlab.review_comments import (
     parse_review_command,
     review_comment_key,
 )
-from agentlab.models import TaskPlan
+from agentlab.models import AgentTask, TaskPlan
 from agentlab.tools.gitlab_tool import GitLabTool
 
 
@@ -36,6 +38,8 @@ STATE_DEFAULTS: dict[str, Any] = {
     "new_mrs_today": 0,
     "new_mrs_date": None,
     "open_agent_mrs": 0,
+    "open_agent_mrs_details": [],
+    "closed_agent_mr_feedback": [],
     "cooldown_until": None,
     "last_selected_task_id": None,
     "last_review_comment_run": None,
@@ -44,6 +48,12 @@ STATE_DEFAULTS: dict[str, Any] = {
     "stopped_mrs": {},
     "review_comment_cooldowns": {},
 }
+
+STOP_REASON_RE = re.compile(r"^\s*reason\s*:\s*(?P<reason>.+)", re.IGNORECASE | re.DOTALL)
+STOP_REASON_INLINE_RE = re.compile(
+    r"(?:^|\s)(?:/agent|@agentlab)\s+stop\s+reason\s*:\s*(?P<reason>.+)",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 class SchedulerStateStore:
@@ -87,19 +97,62 @@ class Scheduler:
         try:
             gitlab = self._gitlab()
             head = gitlab.get_default_branch_head()
-            open_mrs = len(gitlab.list_open_agent_mrs())
         except Exception as exc:
-            return self._write_report(self._report("failed", "gitlab_unavailable", error=str(exc), state_warning=warning))
+            stale_count = int(state.get("open_agent_mrs") or 0)
+            return self._write_report(
+                self._report(
+                    "failed",
+                    "gitlab_unavailable",
+                    error=_safe_error(exc),
+                    state_warning=warning,
+                    open_agent_mrs_count=stale_count,
+                    open_agent_mrs=[],
+                    open_agent_mrs_warning="using last known open_agent_mrs count because GitLab API failed",
+                )
+            )
+        open_mr_details: list[dict[str, Any]] = []
+        open_mrs_warning = None
+        try:
+            open_mr_details = _open_agent_mr_details(gitlab.list_open_agent_mrs())
+            open_mrs = len(open_mr_details)
+        except Exception as exc:
+            open_mrs = int(state.get("open_agent_mrs") or 0)
+            open_mr_details = list(state.get("open_agent_mrs_details") or [])
+            open_mrs_warning = f"using last known open_agent_mrs count because GitLab API failed: {_safe_error(exc)}"
+        closed_mr_feedback = list(state.get("closed_agent_mr_feedback") or [])
+        closed_mrs_warning = None
+        try:
+            closed_mr_feedback = _merge_closed_agent_mr_feedback(
+                closed_mr_feedback,
+                _closed_agent_mr_feedback(gitlab),
+            )
+        except Exception as exc:
+            closed_mrs_warning = f"could not read closed Agent MR feedback: {_safe_error(exc)}"
         now = _now()
         state.update(
             {
                 "last_watch_run": now,
                 "last_default_branch_head": head,
                 "open_agent_mrs": open_mrs,
+                "open_agent_mrs_details": open_mr_details,
+                "closed_agent_mr_feedback": closed_mr_feedback,
             }
         )
         self.state_store.write(state)
-        return self._write_report(self._report("passed", "watch_completed", state_warning=warning, default_branch_head=head, open_agent_mrs=open_mrs))
+        return self._write_report(
+            self._report(
+                "passed",
+                "watch_completed",
+                state_warning=warning,
+                default_branch_head=head,
+                open_agent_mrs_count=open_mrs,
+                open_agent_mrs=open_mr_details,
+                open_agent_mrs_warning=open_mrs_warning,
+                closed_agent_mr_feedback=closed_mr_feedback,
+                closed_agent_mr_feedback_count=len(closed_mr_feedback),
+                closed_agent_mr_feedback_warning=closed_mrs_warning,
+            )
+        )
 
     def plan(self) -> dict[str, Any]:
         if not self.config.schedule.enabled:
@@ -135,7 +188,13 @@ class Scheduler:
         self.state_store.write(state)
         return self._write_report(self._report("passed", "plan_completed", state_warning=warning, selected_task_id=selected_task_id))
 
-    def action(self, task_id: str | None = None) -> dict[str, Any]:
+    def action(
+        self,
+        task_id: str | None = None,
+        *,
+        prefer_task_types: list[str] | None = None,
+        prefer_task_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
         if not self.config.schedule.enabled:
             return self._write_report(self._report("skipped", "schedule_disabled"))
         if not self.config.schedule.action.enabled:
@@ -172,6 +231,16 @@ class Scheduler:
         if cooldown_until and datetime.now(UTC) < cooldown_until:
             return self._write_report(self._report("skipped", "action_cooldown_active", cooldown_until=state.get("cooldown_until")))
 
+        preferred_task_types = (
+            _normalize_preferred_types(prefer_task_types)
+            if prefer_task_types is not None
+            else list(self.config.schedule.action.preferred_task_types)
+        )
+        preferred_task_ids = (
+            _normalize_preferred_ids(prefer_task_ids)
+            if prefer_task_ids is not None
+            else list(self.config.schedule.action.preferred_task_ids)
+        )
         approved_plan = None
         approved_plan_source = None
         if task_id is not None:
@@ -183,12 +252,19 @@ class Scheduler:
                         "failed",
                         "approved_plan_unavailable",
                         selected_task_id=task_id,
+                        task_selection_reason="requested_task_id",
                         error=str(exc),
                         state_warning=warning,
                     )
                 )
 
-        result = self.orchestrator.full_flow(task_id=task_id, approved_plan=approved_plan)
+        result = self.orchestrator.full_flow(
+            task_id=task_id,
+            approved_plan=approved_plan,
+            preferred_task_ids=[] if task_id is not None else preferred_task_ids,
+            preferred_task_types=[] if task_id is not None else preferred_task_types,
+            closed_agent_mr_feedback=list(state.get("closed_agent_mr_feedback") or []),
+        )
         if result.get("status") == "blocked" and result.get("reason") == "no approved task available for implementation":
             return self._write_report(self._report("skipped", "no_auto_approved_task", full_flow=result))
         if task_id is not None and result.get("status") == "blocked" and result.get("reason") in {
@@ -200,6 +276,7 @@ class Scheduler:
                     "failed",
                     str(result.get("reason")),
                     selected_task_id=task_id,
+                    task_selection_reason=result.get("task_selection_reason") or "requested_task_id",
                     approved_plan_source=approved_plan_source,
                     full_flow=result,
                     state_warning=warning,
@@ -219,6 +296,8 @@ class Scheduler:
                 "action_completed",
                 state_warning=warning,
                 selected_task_id=result.get("selected_task_id") or task_id,
+                task_selection_reason=result.get("task_selection_reason"),
+                task_selection_feedback_matches=result.get("task_selection_feedback_matches"),
                 approved_plan_source=approved_plan_source,
                 full_flow=result,
                 new_mrs_today=state["new_mrs_today"],
@@ -752,9 +831,17 @@ class Scheduler:
         if revision.get("propose_only") or revision.get("reason") == "proposal_generated":
             return _proposal_response(command, revision, self.run_id)
         if revision.get("status") != "passed":
+            details = []
+            if revision.get("proposal_run_id"):
+                details.append(f"Proposal run: `{revision.get('proposal_run_id')}`")
+            if revision.get("stale_reason"):
+                details.append(f"Stale check: {revision.get('stale_reason')}")
+            if revision.get("error"):
+                details.append(f"Error: {revision.get('error')}")
             return (
                 "AgentLab could not apply this request.\n\n"
                 f"Reason: {revision.get('reason') or 'revision_failed'}"
+                + (("\n" + "\n".join(details)) if details else "")
             )
 
         gate = revision.get("gate") if isinstance(revision.get("gate"), dict) else {}
@@ -764,6 +851,7 @@ class Scheduler:
         return (
             f"AgentLab processed `/agent {command}`.\n\n"
             f"Run: {revision.get('run_id') or self.run_id}\n"
+            f"Proposal run: {revision.get('proposal_run_id') or '<none>'}\n"
             f"Commit: {revision.get('commit_sha') or '<none>'}\n"
             "Changed files:\n"
             f"{_bullet_list(changed)}\n\n"
@@ -807,6 +895,139 @@ def _load_approved_plan(path: Path) -> TaskPlan:
     return TaskPlan.model_validate_json(path.read_text(encoding="utf-8"))
 
 
+def _open_agent_mr_details(mrs: list[Any]) -> list[dict[str, Any]]:
+    details: list[dict[str, Any]] = []
+    for mr in mrs:
+        normalized = normalize_mr(mr)
+        details.append(
+            {
+                "iid": normalized.get("iid"),
+                "title": str(normalized.get("title") or ""),
+                "source_branch": str(normalized.get("source_branch") or ""),
+                "web_url": normalized.get("web_url"),
+                "labels": [str(label) for label in normalized.get("labels", [])],
+                "updated_at": normalized.get("updated_at"),
+            }
+        )
+    return details
+
+
+def _closed_agent_mr_feedback(gitlab: Any) -> list[dict[str, Any]]:
+    if hasattr(gitlab, "list_closed_agent_merge_requests"):
+        mrs = gitlab.list_closed_agent_merge_requests()
+    elif hasattr(gitlab, "list_agent_merge_requests"):
+        mrs = gitlab.list_agent_merge_requests(state="closed", label="agent/generated")
+    else:
+        return []
+    feedback: list[dict[str, Any]] = []
+    for mr in mrs:
+        normalized = normalize_mr(mr)
+        if not _is_unmerged_closed_agent_mr(normalized):
+            continue
+        iid = normalized.get("iid")
+        try:
+            mr_iid = int(iid)
+        except (TypeError, ValueError):
+            continue
+        changed_files = _safe_mr_changed_files(gitlab, mr_iid)
+        comments = _safe_mr_comments(gitlab, mr_iid)
+        feedback.append(
+            {
+                "iid": mr_iid,
+                "title": str(normalized.get("title") or ""),
+                "source_branch": str(normalized.get("source_branch") or ""),
+                "changed_files": changed_files,
+                "labels": [str(label) for label in normalized.get("labels", [])],
+                "closed_at": normalized.get("closed_at") or normalized.get("updated_at"),
+                "reason": _stop_reason_from_comments(comments),
+            }
+        )
+    return feedback
+
+
+def _is_unmerged_closed_agent_mr(mr: dict[str, Any]) -> bool:
+    labels = {str(label) for label in mr.get("labels", [])}
+    return (
+        str(mr.get("state") or "").lower() == "closed"
+        and str(mr.get("source_branch") or "").startswith("agent/")
+        and "agent/generated" in labels
+        and not mr.get("merged_at")
+    )
+
+
+def _safe_mr_changed_files(gitlab: Any, mr_iid: int) -> list[str]:
+    if not hasattr(gitlab, "get_merge_request_changes"):
+        return []
+    try:
+        return [str(path) for path in (gitlab.get_merge_request_changes(mr_iid) or [])]
+    except Exception:
+        return []
+
+
+def _safe_mr_comments(gitlab: Any, mr_iid: int) -> list[dict[str, Any]]:
+    try:
+        return flatten_merge_request_comments(
+            gitlab.list_merge_request_notes(mr_iid) if hasattr(gitlab, "list_merge_request_notes") else [],
+            gitlab.list_merge_request_discussions(mr_iid) if hasattr(gitlab, "list_merge_request_discussions") else [],
+        )
+    except Exception:
+        return []
+
+
+def _stop_reason_from_comments(comments: list[dict[str, Any]]) -> str | None:
+    for comment in reversed(comments):
+        body = str(comment.get("body") or "")
+        inline_match = STOP_REASON_INLINE_RE.search(body)
+        if inline_match:
+            reason = inline_match.group("reason").strip()
+            return reason or None
+        parsed = parse_review_command(body)
+        if parsed is None or parsed.command != "stop" or not parsed.allowed:
+            continue
+        match = STOP_REASON_RE.match(parsed.feedback)
+        if match:
+            reason = match.group("reason").strip()
+            return reason or None
+    return None
+
+
+def _merge_closed_agent_mr_feedback(existing: list[Any], incoming: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_iid: dict[int, dict[str, Any]] = {}
+    for item in existing:
+        if not isinstance(item, dict):
+            continue
+        try:
+            iid = int(item.get("iid"))
+        except (TypeError, ValueError):
+            continue
+        by_iid[iid] = dict(item)
+    for item in incoming:
+        by_iid[int(item["iid"])] = item
+    return sorted(by_iid.values(), key=lambda item: str(item.get("closed_at") or ""), reverse=True)[:50]
+
+
+def _safe_error(exc: Exception) -> str:
+    return str(redact_secrets(str(exc)))
+
+
+def _normalize_preferred_ids(values: list[str] | None) -> list[str]:
+    normalized: list[str] = []
+    for value in values or []:
+        stripped = str(value).strip()
+        if stripped and stripped not in normalized:
+            normalized.append(stripped)
+    return normalized
+
+
+def _normalize_preferred_types(values: list[str] | None) -> list[str]:
+    normalized: list[str] = []
+    for value in values or []:
+        stripped = str(value).strip().lower()
+        if stripped and stripped not in normalized:
+            normalized.append(stripped)
+    return normalized
+
+
 def _latest_approved_plan_path(workspace_root: Path) -> Path | None:
     candidates = [path for path in workspace_root.glob("*/artifacts/approved_plan.json") if path.is_file()]
     if not candidates:
@@ -820,7 +1041,7 @@ def _mr_created(result: dict[str, Any]) -> bool:
 
 
 def _is_revision_command(command: str, propose_only: bool = False) -> bool:
-    return propose_only or command in {"revise", "fix"}
+    return propose_only or command in {"revise", "fix", "apply"}
 
 
 def _gate_status(gate: Any) -> str:
@@ -1032,6 +1253,7 @@ def scheduler_status(config: AppConfig) -> dict[str, Any]:
         "last_action_run": state.get("last_action_run"),
         "last_review_comment_run": state.get("last_review_comment_run"),
         "open_agent_mrs": state.get("open_agent_mrs"),
+        "closed_agent_mr_feedback": len(state.get("closed_agent_mr_feedback") or []),
         "new_mrs_today": state.get("new_mrs_today"),
         "processed_review_comments": len(state.get("processed_review_comments") or {}),
         "stopped_mrs": len(state.get("stopped_mrs") or {}),

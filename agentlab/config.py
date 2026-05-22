@@ -100,6 +100,31 @@ class ScheduleEntryConfig(BaseModel):
     cron: str
 
 
+class ScheduleActionConfig(ScheduleEntryConfig):
+    preferred_task_types: list[str] = Field(default_factory=list)
+    preferred_task_ids: list[str] = Field(default_factory=list)
+
+    @field_validator("preferred_task_types")
+    @classmethod
+    def normalize_task_types(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            stripped = value.strip().lower()
+            if stripped and stripped not in normalized:
+                normalized.append(stripped)
+        return normalized
+
+    @field_validator("preferred_task_ids")
+    @classmethod
+    def normalize_task_ids(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            stripped = value.strip()
+            if stripped and stripped not in normalized:
+                normalized.append(stripped)
+        return normalized
+
+
 class ScheduleLimitsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -147,7 +172,7 @@ class ScheduleConfig(BaseModel):
     timezone: str = "Europe/Berlin"
     watch: ScheduleEntryConfig = Field(default_factory=lambda: ScheduleEntryConfig(cron="*/30 * * * *"))
     plan: ScheduleEntryConfig = Field(default_factory=lambda: ScheduleEntryConfig(cron="0 7,19 * * *"))
-    action: ScheduleEntryConfig = Field(default_factory=lambda: ScheduleEntryConfig(cron="30 2 * * *"))
+    action: ScheduleActionConfig = Field(default_factory=lambda: ScheduleActionConfig(cron="30 2 * * *"))
     limits: ScheduleLimitsConfig = Field(default_factory=ScheduleLimitsConfig)
     behavior: ScheduleBehaviorConfig = Field(default_factory=ScheduleBehaviorConfig)
     review_comments: ScheduleReviewCommentsConfig = Field(default_factory=ScheduleReviewCommentsConfig)
@@ -160,14 +185,19 @@ class ScheduleConfig(BaseModel):
         defaults = {
             "watch": {"enabled": True, "cron": "*/30 * * * *"},
             "plan": {"enabled": True, "cron": "0 7,19 * * *"},
-            "action": {"enabled": True, "cron": "30 2 * * *"},
+            "action": {
+                "enabled": True,
+                "cron": "30 2 * * *",
+                "preferred_task_types": [],
+                "preferred_task_ids": [],
+            },
             "review_comments": {
                 "enabled": False,
                 "cron": "*/10 * * * *",
                 "process_history": False,
                 "max_comments_per_run": 1,
                 "cooldown_minutes": 10,
-                "allowed_commands": ["revise", "fix", "propose", "dry-run", "status", "explain", "stop", "resume"],
+                "allowed_commands": ["revise", "fix", "propose", "apply", "dry-run", "status", "explain", "stop", "resume"],
                 "allowed_authors": [],
                 "require_author_role": ["owner", "maintainer"],
             },

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from agentlab.config import AppConfig
-from agentlab.models import AgentTask, CommandResult, GateDecision, ImplementationReport, ReportStatus
+from agentlab.models import AgentTask, CommandResult, FileEdit, GateDecision, ImplementationReport, ReportStatus, StructuredEditProposal
 from agentlab.orchestrator import Orchestrator
 
 
@@ -66,6 +66,58 @@ def make_revision_repo(tmp_path: Path) -> Path:
     subprocess.run(["git", "clone", remote, repo], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     run_git(repo, "checkout", "main")
     return repo
+
+
+def configure_user(repo: Path) -> None:
+    run_git(repo, "config", "user.email", "agentlab@example.com")
+    run_git(repo, "config", "user.name", "AgentLab")
+
+
+def write_structured_proposal_artifacts(
+    cfg: AppConfig,
+    *,
+    run_id: str,
+    source_branch: str,
+    source_head_sha: str,
+    old_text: str = "# Demo\n\n",
+    new_text: str = "# Demo\n\nApplied proposal.\n\n",
+    mr_iid: int = 15,
+) -> None:
+    artifacts = cfg.workspace_root / run_id / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    proposal = StructuredEditProposal(
+        task_id=f"mr-{mr_iid}-propose-2",
+        summary="Apply saved proposal",
+        edits=[FileEdit(path="README.md", operation="replace_text", old_text=old_text, new_text=new_text)],
+        rollback="Revert README.md.",
+    )
+    (artifacts / "structured_proposal.json").write_text(proposal.model_dump_json(indent=2), encoding="utf-8")
+    (artifacts / "structured_proposal_report.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "source_branch": source_branch,
+                "source_head_sha": source_head_sha,
+                "changed_files": ["README.md"],
+                "added_lines": 1,
+                "deleted_lines": 0,
+                "touched_protected_paths": [],
+                "sensitive_content_detected": False,
+                "proposal_artifacts": ["structured_proposal.json", "structured_proposal_report.json"],
+                "status": "proposal_validation_passed",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    (artifacts / "revision_context.json").write_text(
+        json.dumps({"run_id": run_id, "mr_iid": mr_iid, "source_branch": source_branch}, indent=2),
+        encoding="utf-8",
+    )
+    (artifacts / "revision_task.json").write_text(
+        json.dumps({"metadata": {"mr_iid": mr_iid, "source_branch": source_branch, "changed_files": ["README.md"]}}, indent=2),
+        encoding="utf-8",
+    )
 
 
 class CapturingImplementationAgent:
@@ -220,6 +272,105 @@ def test_agent_propose_only_uses_revision_context_without_gate_claim(monkeypatch
     assert "gate" not in result
     assert CapturingProposalImplementationAgent.captured["branch"] == "agent/docs"
     assert CapturingProposalImplementationAgent.captured["task"].metadata["revision_context"]
+
+
+def test_agent_apply_latest_structured_proposal_without_regenerating(monkeypatch, tmp_path: Path) -> None:
+    repo = make_revision_repo(tmp_path)
+    configure_user(repo)
+    cfg = config(tmp_path, repo)
+    run_git(repo, "fetch", "origin", "agent/docs")
+    source_head = run_git(repo, "rev-parse", "origin/agent/docs")
+    write_structured_proposal_artifacts(cfg, run_id="proposal-run", source_branch="agent/docs", source_head_sha=source_head)
+    gate_seen: dict[str, str] = {}
+
+    class ForbiddenImplementationAgent:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            raise AssertionError("apply must not regenerate a proposal")
+
+    def gate_before_commit(self: Orchestrator, task: AgentTask, direct_main_push: bool = False) -> GateDecision:
+        gate_seen["status"] = run_git(repo, "status", "--short")
+        gate_seen["head"] = run_git(repo, "rev-parse", "HEAD")
+        return GateDecision(allowed=True, mode="merge_request", verdict="allowed", risk_score=1)
+
+    monkeypatch.setattr("agentlab.orchestrator.ImplementationAgent", ForbiddenImplementationAgent)
+    monkeypatch.setattr(Orchestrator, "review_and_gate", gate_before_commit)
+
+    result = Orchestrator(cfg, run_id="apply-run").revise_existing_mr(
+        mr_iid=15,
+        source_branch="agent/docs",
+        command="apply",
+        feedback="",
+        note_id=3,
+        changed_files=["README.md"],
+    )
+
+    assert result["status"] == "passed"
+    assert result["reason"] == "proposal_applied"
+    assert result["proposal_run_id"] == "proposal-run"
+    assert result["commit_sha"]
+    assert "M README.md" in gate_seen["status"]
+    assert gate_seen["head"] == source_head
+    assert "Applied proposal." in (repo / "README.md").read_text(encoding="utf-8")
+    assert "apply proposal from proposal-run" in run_git(repo, "log", "-1", "--pretty=%s")
+    implementation = json.loads((cfg.workspace_root / "apply-run" / "artifacts" / "implementation_report.json").read_text(encoding="utf-8"))
+    assert implementation["patch_summary"] == "Applied proposal from run proposal-run."
+
+
+def test_agent_apply_stale_proposal_fails_before_policy_or_commit(monkeypatch, tmp_path: Path) -> None:
+    repo = make_revision_repo(tmp_path)
+    configure_user(repo)
+    cfg = config(tmp_path, repo)
+    write_structured_proposal_artifacts(cfg, run_id="proposal-run", source_branch="agent/docs", source_head_sha="old-head")
+
+    monkeypatch.setattr(
+        Orchestrator,
+        "review_and_gate",
+        lambda self, task, direct_main_push=False: (_ for _ in ()).throw(AssertionError("stale proposal must not reach gate")),
+    )
+
+    result = Orchestrator(cfg, run_id="apply-stale").revise_existing_mr(
+        mr_iid=15,
+        source_branch="agent/docs",
+        command="apply",
+        feedback="",
+        note_id=4,
+        changed_files=["README.md"],
+    )
+
+    assert result["status"] == "failed"
+    assert result["reason"] == "proposal_stale"
+    assert result["proposal_run_id"] == "proposal-run"
+    assert result["stale_reason"] == "source branch HEAD changed since proposal generation"
+    assert "Applied proposal." not in (repo / "README.md").read_text(encoding="utf-8")
+    assert "agent: simplify README structure" in run_git(repo, "log", "-1", "--pretty=%s")
+
+
+def test_agent_apply_missing_proposal_fails_without_policy_or_model(monkeypatch, tmp_path: Path) -> None:
+    repo = make_revision_repo(tmp_path)
+    cfg = config(tmp_path, repo)
+
+    monkeypatch.setattr(
+        Orchestrator,
+        "review_and_gate",
+        lambda self, task, direct_main_push=False: (_ for _ in ()).throw(AssertionError("missing proposal must not reach gate")),
+    )
+    monkeypatch.setattr(
+        "agentlab.orchestrator.ImplementationAgent",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("missing proposal must not regenerate")),
+    )
+
+    result = Orchestrator(cfg, run_id="apply-missing").revise_existing_mr(
+        mr_iid=15,
+        source_branch="agent/docs",
+        command="apply",
+        feedback="",
+        note_id=5,
+        changed_files=["README.md"],
+    )
+
+    assert result["status"] == "failed"
+    assert result["reason"] == "missing_proposal"
+    assert result["proposal_run_id"] is None
 
 
 class DirtyAfterRestoreGit:

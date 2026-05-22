@@ -146,7 +146,7 @@ class ReviewScheduler(Scheduler):
         return self.fake_gitlab
 
 
-@pytest.mark.parametrize("command", ["revise", "fix", "propose", "dry-run", "status", "explain", "stop", "resume"])
+@pytest.mark.parametrize("command", ["revise", "fix", "propose", "apply", "dry-run", "status", "explain", "stop", "resume"])
 def test_parser_recognizes_agent_commands(command: str) -> None:
     parsed = parse_review_command(f"/agent {command}")
 
@@ -334,6 +334,35 @@ def test_propose_command_generates_proposal_response_and_consumes_cooldown(tmp_p
     state, _ = scheduler.state_store.read()
     assert "1:15:1" in state["processed_review_comments"]
     assert "1:15" in state["review_comment_cooldowns"]
+
+
+def test_apply_command_routes_to_revision_and_reports_proposal_run(tmp_path: Path) -> None:
+    cfg = config(tmp_path, process_history=True)
+    result = {
+        "run_id": "run-1",
+        "status": "passed",
+        "reason": "proposal_applied",
+        "source_branch": "agent/docs",
+        "command": "apply",
+        "proposal_run_id": "proposal-run",
+        "commit_sha": "abc123",
+        "changed_files": ["README.md"],
+        "auto_approval": {"approved_tasks": ["mr-15-apply-1"], "evaluated_tasks": [{"details": {"risk_score": 1}}]},
+        "gate": {"allowed": True, "verdict": "passed", "blockers": []},
+    }
+    orchestrator = FakeOrchestrator(cfg, result=result)
+    gitlab = FakeGitLab(notes=[note(1, "/agent apply")])
+    scheduler = ReviewScheduler(cfg, gitlab=gitlab, orchestrator=orchestrator)
+
+    report = scheduler.review_comments()
+
+    assert report["status"] == "passed"
+    assert report["reason"] == "proposal_applied"
+    assert orchestrator.calls[0]["command"] == "apply"
+    assert orchestrator.calls[0]["propose_only"] is False
+    response = gitlab.posted[0][1]
+    assert "AgentLab processed `/agent apply`" in response
+    assert "Proposal run: proposal-run" in response
 
 
 def test_revise_dry_run_routes_to_propose_only_without_gate_claim(tmp_path: Path) -> None:

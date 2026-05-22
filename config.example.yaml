@@ -107,6 +107,8 @@ schedule:
   action:
     enabled: true
     cron: "30 2 * * *"
+    preferred_task_types: []
+    preferred_task_ids: []
   review_comments:
     enabled: false
     cron: "*/10 * * * *"
@@ -117,6 +119,7 @@ schedule:
       - revise
       - fix
       - propose
+      - apply
       - dry-run
       - status
       - explain

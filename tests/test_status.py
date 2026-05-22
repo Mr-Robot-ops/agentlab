@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 
 from agentlab.audit import AuditLogger
@@ -42,6 +43,21 @@ def test_blocked_status_is_distinct_from_failed(tmp_path: Path) -> None:
     snapshot = audit.read_status()
     assert snapshot.state == "blocked"
     assert snapshot.agents["gatekeeper"].state == "blocked"
+
+
+def test_audit_logger_mirrors_metadata_to_live_logs(tmp_path: Path, capsys, monkeypatch) -> None:
+    monkeypatch.setenv("AGENTLAB_LIVE_EVENTS", "1")
+    audit = AuditLogger(tmp_path / "runs" / "run-logs" / "audit.jsonl", "run-logs")
+
+    audit.emit(
+        agent="orchestrator",
+        action="full_flow",
+        status="started",
+        metadata={"selected_task_id": "tests-02-smoke-baseline"},
+    )
+
+    payload = json.loads(capsys.readouterr().err.strip())
+    assert payload["metadata"]["selected_task_id"] == "tests-02-smoke-baseline"
 
 
 def test_status_reader_lists_runs(tmp_path: Path) -> None:
