@@ -16,6 +16,8 @@ from agentlab.models import (
     SbomDocument,
     SupplyChainReport,
     TaskType,
+    TestQualityFinding as QualityFinding,
+    TestQualityReport as QualityReport,
     Verdict,
 )
 from agentlab.models import TestReport as AgentTestReport
@@ -64,6 +66,32 @@ def test_auto_merge_disabled_by_default_blocks() -> None:
 def test_all_checks_pass_when_auto_merge_enabled() -> None:
     decision = PolicyEngine(config(auto_merge_enabled=True)).evaluate(**inputs())  # type: ignore[arg-type]
     assert decision.allowed is True
+
+
+def test_placeholder_test_quality_blocks_gate_even_when_other_checks_pass() -> None:
+    report = QualityReport(
+        status=ReportStatus.FAILED,
+        passed=False,
+        reason="placeholder_test_detected",
+        findings=[
+            QualityFinding(
+                path="rust-backend/tests/smoke.rs",
+                line=3,
+                reason="assert_true",
+                description="placeholder",
+            )
+        ],
+    )
+
+    decision = PolicyEngine(config(auto_merge_enabled=True)).evaluate(
+        **inputs(test_quality=report)
+    )  # type: ignore[arg-type]
+
+    assert decision.allowed is False
+    assert decision.check_statuses["test_quality"] == "failed"
+    assert decision.policy_checks["test_quality_passed"] is False
+    assert "placeholder test detected" in decision.blockers
+    assert "placeholder_test_detected" in decision.reasons
 
 
 def test_direct_main_push_disabled_by_default_blocks() -> None:
