@@ -20,13 +20,13 @@ GITLAB_ACCESS_ROLES = {
 
 
 class GitLabTool:
-    def __init__(self, config: AppConfig) -> None:
+    def __init__(self, config: AppConfig, *, token: str | None = None) -> None:
         try:
             import gitlab  # type: ignore
         except ImportError as exc:
             raise RuntimeError("python-gitlab is required for GitLab operations") from exc
 
-        token = os.environ.get(config.gitlab_token_env)
+        token = token or os.environ.get(config.gitlab_token_env)
         if not token:
             raise RuntimeError(f"GitLab token env var is not set: {config.gitlab_token_env}")
         self.config = config
@@ -269,6 +269,42 @@ class GitLabTool:
                 result.append(info)
         return result
 
+    def list_agent_merge_requests(self, *, state: str = "opened", label: str = "agent/generated") -> list[dict[str, Any]]:
+        kwargs: dict[str, Any] = {
+            "state": state,
+            "target_branch": self.config.default_branch,
+            "all": True,
+        }
+        if label:
+            kwargs["labels"] = label
+        mrs = self.project.mergerequests.list(**kwargs)
+        result: list[dict[str, Any]] = []
+        for mr in mrs:
+            info = self._mr_info(mr)
+            if not info.source_branch.startswith("agent/"):
+                continue
+            if info.target_branch != self.config.default_branch:
+                continue
+            if label and label not in info.labels:
+                continue
+            result.append(
+                {
+                    "iid": info.iid,
+                    "title": info.title,
+                    "state": str(getattr(mr, "state", state)),
+                    "source_branch": info.source_branch,
+                    "web_url": info.web_url,
+                    "labels": info.labels,
+                    "updated_at": info.updated_at,
+                    "closed_at": getattr(mr, "closed_at", None),
+                    "merged_at": getattr(mr, "merged_at", None),
+                }
+            )
+        return result
+
+    def list_closed_agent_merge_requests(self, *, label: str = "agent/generated") -> list[dict[str, Any]]:
+        return self.list_agent_merge_requests(state="closed", label=label)
+
     def get_merge_request(self, mr_iid: int) -> MergeRequestInfo:
         return self._mr_info(self.project.mergerequests.get(mr_iid))
 
@@ -343,6 +379,7 @@ class GitLabTool:
             source_branch=mr.source_branch,
             target_branch=mr.target_branch,
             labels=list(labels),
+            updated_at=getattr(mr, "updated_at", None),
         )
 
 
