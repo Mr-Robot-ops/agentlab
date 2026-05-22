@@ -34,15 +34,16 @@ class PlanningAgent:
         context = self._repo_context()
         if self.ollama is not None:
             try:
-                return self.ollama.chat_json(
+                plan = self.ollama.chat_json(
                     model=self.config.agent_model("planner"),
                     system_prompt=load_prompt("planner.md"),
                     user_prompt=json.dumps(context, indent=2),
                     response_model=TaskPlan,
                 )
+                return self._normalize_plan(plan, context)
             except Exception:
                 pass
-        return self._heuristic_plan(context)
+        return self._normalize_plan(self._heuristic_plan(context), context)
 
     def _repo_context(self) -> dict[str, object]:
         files = [file.path for file in self.repo_index.files] if self.repo_index is not None else self.file_tool.list_files()
@@ -111,6 +112,7 @@ class PlanningAgent:
             tasks.append(task.model_copy(update={"risk_score": risk.score, "risk_level": risk.level}))
 
         if manifests and not tests:
+            affected_files = _rust_test_baseline_files(context)
             task = AgentTask(
                 id="add-test-baseline",
                 title="Add a minimal automated test baseline",
@@ -118,8 +120,11 @@ class PlanningAgent:
                 risk_level=RiskLevel.LOW,
                 description=f"Create the smallest useful test baseline for the detected project type. Architecture context: {architecture}",
                 acceptance_criteria=["A test command can run locally.", "At least one meaningful smoke test exists."],
-                affected_files=[],
-                forbidden_actions=["Do not change production behavior."],
+                affected_files=affected_files,
+                forbidden_actions=[
+                    "Do not change production behavior.",
+                    "Do not edit production source files for a smoke-test baseline unless explicitly asked for inline unit tests or production hooks.",
+                ],
                 test_requirements=["Run the new test command."],
             )
             tasks.append(task.model_copy(update={"risk_score": 3, "risk_level": RiskLevel.LOW}))
@@ -154,3 +159,152 @@ class PlanningAgent:
             tasks.append(task.model_copy(update={"risk_score": 1}))
 
         return TaskPlan(summary="Heuristic local plan generated without Ollama.", tasks=tasks, source_signals=["files", "readme", "todos", "tests"])
+
+    def _normalize_plan(self, plan: TaskPlan, context: dict[str, object]) -> TaskPlan:
+        tasks = [_normalize_rust_smoke_test_task(task, context) for task in plan.tasks]
+        return plan.model_copy(update={"tasks": tasks})
+
+
+def _normalize_rust_smoke_test_task(task: AgentTask, context: dict[str, object]) -> AgentTask:
+    if task.task_type != TaskType.TESTS or not _rust_roots(context, task):
+        return task
+
+    production_files = [path for path in task.affected_files if _is_rust_production_source(path)]
+    if production_files and _explicitly_allows_rust_production_test_touch(task):
+        metadata = {
+            **task.metadata,
+            "production_test_change": True,
+            "propose_only_recommended": True,
+            "planning_note": "Production Rust source files were retained because the task explicitly asks for inline unit tests or production test hooks.",
+        }
+        forbidden_actions = _dedupe_strings(
+            [
+                *task.forbidden_actions,
+                "Keep production-code test hooks minimal and justify them in the MR.",
+            ]
+        )
+        return task.model_copy(
+            update={
+                "risk_level": RiskLevel.MEDIUM,
+                "risk_score": max(task.risk_score, 10),
+                "metadata": metadata,
+                "forbidden_actions": forbidden_actions,
+            }
+        )
+
+    if not _is_rust_smoke_test_task(task, context):
+        return task
+
+    preferred_files = _rust_test_baseline_files(context, task=task)
+    if not preferred_files:
+        return task
+
+    forbidden_actions = _dedupe_strings(
+        [
+            *task.forbidden_actions,
+            "Do not edit rust-backend/src/*.rs for a smoke-test baseline unless explicitly asked for inline unit tests or production-code hooks.",
+        ]
+    )
+    metadata = {
+        **task.metadata,
+        "planning_note": "Rust smoke/integration test baseline affected_files were constrained to test-only files.",
+        "removed_production_files": production_files,
+    }
+    return task.model_copy(
+        update={
+            "affected_files": preferred_files,
+            "risk_level": RiskLevel.LOW,
+            "risk_score": min(task.risk_score or 3, 3),
+            "forbidden_actions": forbidden_actions,
+            "metadata": metadata,
+        }
+    )
+
+
+def _is_rust_smoke_test_task(task: AgentTask, context: dict[str, object]) -> bool:
+    text = _task_text(task)
+    if not any(term in text for term in ("smoke", "integration", "test baseline", "minimal automated test baseline", "minimal rust", "baseline")):
+        return False
+    return bool(_rust_roots(context, task))
+
+
+def _rust_test_baseline_files(context: dict[str, object], *, task: AgentTask | None = None) -> list[str]:
+    roots = _rust_roots(context, task)
+    if not roots:
+        return []
+    root = roots[0]
+    base = f"{root}/" if root != "." else ""
+    files = [f"{base}tests/smoke.rs"]
+    if task is not None and _requires_rust_dev_dependency(task):
+        cargo = f"{base}Cargo.toml"
+        if cargo not in files:
+            files.append(cargo)
+    return files
+
+
+def _rust_roots(context: dict[str, object], task: AgentTask | None = None) -> list[str]:
+    candidates: list[str] = []
+    for key in ("manifests", "files"):
+        values = context.get(key)
+        if isinstance(values, list):
+            candidates.extend(str(value).replace("\\", "/") for value in values)
+    if task is not None:
+        candidates.extend(path.replace("\\", "/") for path in task.affected_files)
+    roots: list[str] = []
+    for path in candidates:
+        if path.endswith("Cargo.toml"):
+            root = path.removesuffix("/Cargo.toml") if "/" in path else "."
+        elif path.startswith("rust-backend/"):
+            root = "rust-backend"
+        else:
+            continue
+        if root not in roots:
+            roots.append(root)
+    return roots
+
+
+def _is_rust_production_source(path: str) -> bool:
+    normalized = path.replace("\\", "/")
+    return normalized.startswith("rust-backend/src/") and normalized.endswith(".rs")
+
+
+def _explicitly_allows_rust_production_test_touch(task: AgentTask) -> bool:
+    text = _task_text(task)
+    return any(
+        term in text
+        for term in (
+            "inline unit test",
+            "inline unit tests",
+            "unit tests inside",
+            "production hook",
+            "production-code hook",
+            "test hook",
+        )
+    )
+
+
+def _requires_rust_dev_dependency(task: AgentTask) -> bool:
+    text = _task_text(task)
+    return any(term in text for term in ("dev-dependency", "dev-dependencies", "dev dependency", "test dependency", "add dependency"))
+
+
+def _task_text(task: AgentTask) -> str:
+    return " ".join(
+        [
+            task.id,
+            task.title,
+            task.description,
+            " ".join(task.acceptance_criteria),
+            " ".join(task.affected_files),
+            " ".join(task.test_requirements),
+            json.dumps(task.metadata, ensure_ascii=False, default=str),
+        ]
+    ).lower()
+
+
+def _dedupe_strings(values: list[str]) -> list[str]:
+    result: list[str] = []
+    for value in values:
+        if value and value not in result:
+            result.append(value)
+    return result
