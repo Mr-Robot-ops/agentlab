@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import threading
 import time
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -104,7 +105,7 @@ class KubectlRunner(Protocol):
     ) -> KubectlResult:
         ...
 
-    def stream(self, args: list[str]) -> int:
+    def stream(self, args: list[str]) -> KubectlResult:
         ...
 
     def interactive(self, args: list[str]) -> int:
@@ -138,11 +139,57 @@ class SubprocessKubectlRunner:
             raise K8sOperatorError(result.stderr.strip() or result.stdout.strip() or f"kubectl failed: {' '.join(args)}")
         return result
 
-    def stream(self, args: list[str]) -> int:
-        return subprocess.run(["kubectl", *args], check=False).returncode
+    def stream(self, args: list[str]) -> KubectlResult:
+        process = subprocess.Popen(
+            ["kubectl", *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        stdout_chunks: list[str] = []
+        stderr_chunks: list[str] = []
+        threads: list[threading.Thread] = []
+        if process.stdout is not None:
+            threads.append(
+                threading.Thread(
+                    target=_tee_stream,
+                    args=(process.stdout, sys.stdout, stdout_chunks),
+                    daemon=True,
+                )
+            )
+        if process.stderr is not None:
+            threads.append(
+                threading.Thread(
+                    target=_tee_stream,
+                    args=(process.stderr, sys.stderr, stderr_chunks),
+                    daemon=True,
+                )
+            )
+        for thread in threads:
+            thread.start()
+        returncode = process.wait()
+        for thread in threads:
+            thread.join()
+        return KubectlResult(
+            args=args,
+            stdout="".join(stdout_chunks),
+            stderr="".join(stderr_chunks),
+            returncode=returncode,
+        )
 
     def interactive(self, args: list[str]) -> int:
         return subprocess.run(["kubectl", *args], check=False).returncode
+
+
+def _tee_stream(source: TextIO, target: TextIO, chunks: list[str]) -> None:
+    try:
+        for line in iter(source.readline, ""):
+            chunks.append(line)
+            target.write(line)
+            target.flush()
+    finally:
+        source.close()
 
 
 @dataclass
@@ -301,12 +348,7 @@ class K8sOperator:
         if tail is not None:
             args.append(f"--tail={tail}")
         if follow:
-            self._logs_with_retry(args)
-            args.append("-f")
-            code = self._stream(args)
-            if code:
-                raise K8sOperatorError(f"kubectl logs failed with exit code {code}")
-            return ""
+            return self._stream_with_retry(args)
         return self._logs_with_retry(args)
 
     def run_component(self, component: str, *, follow: bool = True) -> str:
@@ -576,6 +618,28 @@ class K8sOperator:
             message = (last_result.stderr or last_result.stdout).strip()
         raise K8sOperatorError(message or f"kubectl logs failed: {' '.join(args)}")
 
+    def _stream_with_retry(self, args: list[str]) -> str:
+        attempts = max(1, self.log_retry_attempts)
+        stream_args = [*args, "-f"]
+        last_result: KubectlResult | None = None
+        for attempt in range(attempts):
+            result = self._stream(stream_args)
+            if result.returncode == 0:
+                return ""
+            last_result = result
+            message = f"{result.stderr}\n{result.stdout}"
+            if not _is_transient_log_error(message) or attempt == attempts - 1:
+                break
+            if self.log_retry_delay_seconds > 0:
+                time.sleep(self.log_retry_delay_seconds)
+        message = ""
+        if last_result is not None:
+            message = (last_result.stderr or last_result.stdout).strip()
+        if message:
+            raise K8sOperatorError(message)
+        code = last_result.returncode if last_result is not None else "unknown"
+        raise K8sOperatorError(f"kubectl logs failed with exit code {code}")
+
     def _doctor_logs_with_status_retry(self, job_name: str) -> str:
         attempts = max(1, self.log_retry_attempts)
         last_logs = ""
@@ -593,8 +657,12 @@ class K8sOperator:
             )
         raise K8sOperatorError("Doctor logs were empty after retries.")
 
-    def _stream(self, args: list[str]) -> int:
-        return self.runner.stream(self._ns(args))
+    def _stream(self, args: list[str]) -> KubectlResult:
+        namespaced_args = self._ns(args)
+        result = self.runner.stream(namespaced_args)
+        if isinstance(result, int):
+            return KubectlResult(args=namespaced_args, returncode=result)
+        return result
 
     def _exec(self, shell_pod: str, command: str, *, check: bool = True) -> KubectlResult:
         return self.runner.run(self._ns(["exec", shell_pod, "--", "sh", "-c", command]), check=check)
