@@ -9,6 +9,7 @@ from agentlab.models import (
     ReviewReport,
     RiskAssessment,
     SupplyChainReport,
+    TestQualityReport,
     TestReport,
 )
 from agentlab.policies.policy_engine import PolicyEngine
@@ -31,6 +32,7 @@ class Gatekeeper:
         quality_review: ReviewReport,
         security_review: ReviewReport,
         rollback_plan: str | None,
+        test_quality: TestQualityReport | None = None,
         supply_chain: SupplyChainReport | None = None,
         docs_check: DocsCheckReport | None = None,
         direct_main_push: bool = False,
@@ -43,6 +45,7 @@ class Gatekeeper:
             build_security=build_security,
             quality_review=quality_review,
             security_review=security_review,
+            test_quality=test_quality,
             supply_chain=supply_chain,
             docs_check=docs_check,
             rollback_plan=rollback_plan,

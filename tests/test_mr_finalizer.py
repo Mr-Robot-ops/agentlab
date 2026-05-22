@@ -281,6 +281,29 @@ def test_finalizer_comment_omits_passing_policy_checks_and_shows_failed_checks()
     assert "passing_check" not in comment
 
 
+def test_finalizer_comment_includes_test_quality_failure() -> None:
+    fake = FakeGitLabTool()
+    gate = GateDecision(
+        allowed=False,
+        mode="merge_request",
+        verdict="blocked",
+        risk_score=10,
+        blockers=["placeholder test detected"],
+        policy_checks={
+            "test_quality_passed": False,
+            "functional_tests_passed": True,
+        },
+        check_statuses={"test_quality": "failed"},
+    )
+
+    MRFinalizer(config(auto_merge_enabled=True), fake).finalize(**inputs(gate))  # type: ignore[arg-type]
+
+    comment = fake.comments[-1][1]
+    assert "- Test quality: failed" in comment
+    assert "- Placeholder test detected" in comment
+    assert "`test_quality_passed`" in comment
+
+
 def test_finalizer_comment_mentions_when_no_policy_checks_failed() -> None:
     fake = FakeGitLabTool()
     gate = GateDecision(

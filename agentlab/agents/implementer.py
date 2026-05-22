@@ -23,6 +23,7 @@ from agentlab.tools.git_tool import GitTool
 from agentlab.tools.ollama_client import OllamaClient, OllamaSchemaValidationError
 
 from .base import compact_text, load_prompt
+from .test_quality import TestQualityAgent, TestQualityError
 
 
 PROJECT_STRUCTURE_HEADING_RE = re.compile(
@@ -245,6 +246,7 @@ class ImplementationAgent:
             risk = assess_risk(task, diff_stats.changed_files, risk_input)
             if risk.blocked:
                 raise ToolError("risk assessment blocked patch: " + ", ".join(risk.reasons))
+            self._run_test_quality_check(diff_stats, patch_artifacts)
             commit_sha = self.git_tool.commit(f"agent: {task.title}")
             commit_created = commit_sha is not None
             if self.config.push_agent_branches_enabled and not self.dry_run:
@@ -376,6 +378,28 @@ class ImplementationAgent:
                 fallback_succeeded=fallback_succeeded,
                 fallback_reason=fallback_reason,
             )
+        except TestQualityError as exc:
+            errors.append(str(exc))
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                applied=not self.dry_run,
+                pushed=False,
+                commit_sha=commit_sha,
+                errors=errors,
+                failure_stage="test_quality",
+                failure_reason=exc.reason,
+                patch_artifacts=patch_artifacts,
+                retry_attempted=retry_attempted,
+                retry_succeeded=retry_succeeded,
+                no_changes_committed=not commit_created,
+                no_branch_pushed=not branch_pushed,
+                implementation_mode=implementation_mode,  # type: ignore[arg-type]
+                fallback_attempted=fallback_attempted,
+                fallback_succeeded=fallback_succeeded,
+                fallback_reason=fallback_reason,
+            )
         except Exception as exc:
             errors.append(str(exc))
             failure_stage = None
@@ -402,6 +426,14 @@ class ImplementationAgent:
                 fallback_succeeded=fallback_succeeded,
                 fallback_reason=fallback_reason,
             )
+
+    def _run_test_quality_check(self, diff_stats: DiffStats, patch_artifacts: list[str]) -> None:
+        report = TestQualityAgent(self.file_tool).run(diff_stats.changed_files)
+        if report.status != ReportStatus.SKIPPED and self.artifacts is not None:
+            record = self.artifacts.write_json("test_quality_report", report)
+            patch_artifacts.append(record.name)
+        if not report.passed:
+            raise TestQualityError(report)
 
     def revise_on_branch(self, task: AgentTask, branch: str) -> ImplementationReport:
         errors: list[str] = []
@@ -475,6 +507,7 @@ class ImplementationAgent:
             risk = assess_risk(task, diff_stats.changed_files, risk_input)
             if risk.blocked:
                 raise ToolError("risk assessment blocked patch: " + ", ".join(risk.reasons))
+            self._run_test_quality_check(diff_stats, patch_artifacts)
             commit_sha = self.git_tool.commit(f"agent: revise MR feedback for {task.title}")
             commit_created = commit_sha is not None
             pushed = False
@@ -567,6 +600,23 @@ class ImplementationAgent:
                 commit_sha=commit_sha,
                 errors=errors,
                 failure_stage="git_push",
+                failure_reason=exc.reason,
+                patch_artifacts=patch_artifacts,
+                no_changes_committed=not commit_created,
+                no_branch_pushed=not branch_pushed,
+                implementation_mode=implementation_mode,  # type: ignore[arg-type]
+            )
+        except TestQualityError as exc:
+            errors.append(str(exc))
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                applied=not self.dry_run,
+                pushed=False,
+                commit_sha=commit_sha,
+                errors=errors,
+                failure_stage="test_quality",
                 failure_reason=exc.reason,
                 patch_artifacts=patch_artifacts,
                 no_changes_committed=not commit_created,

@@ -18,6 +18,15 @@ def test_allows_configured_commands() -> None:
     assert policy().is_allowed("pytest -q") is True
 
 
+def test_allows_safe_cd_wrapper_for_allowlisted_inner_command() -> None:
+    rust_policy = CommandPolicy(allowed_commands=["cargo test"], forbidden_commands=[])
+
+    parsed = rust_policy.parse("cd rust-backend && cargo test --package rust-backend")
+
+    assert parsed.raw == "cd rust-backend && cargo test --package rust-backend"
+    assert parsed.argv == ["cargo", "test", "--package", "rust-backend"]
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -26,6 +35,7 @@ def test_allows_configured_commands() -> None:
         "docker run --privileged alpine",
         "git push --force origin main",
         "python setup.py test",
+        "cd ../other && pytest",
     ],
 )
 def test_blocks_unsafe_or_unlisted_commands(command: str) -> None:
