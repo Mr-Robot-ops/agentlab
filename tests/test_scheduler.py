@@ -45,6 +45,8 @@ class FakeOrchestrator:
         self.result = result or {"status": "passed", "merge_request": {"status": "created"}}
         self.plan_called = False
         self.full_flow_called = False
+        self.full_flow_task_id = None
+        self.full_flow_approved_plan = None
 
     def plan(self) -> TaskPlan:
         self.plan_called = True
@@ -62,9 +64,15 @@ class FakeOrchestrator:
             ]
         )
 
-    def full_flow(self) -> dict[str, object]:
+    def full_flow(self, *, task_id=None, approved_plan=None, auto_approval_report=None) -> dict[str, object]:
         self.full_flow_called = True
-        return self.result
+        self.full_flow_task_id = task_id
+        self.full_flow_approved_plan = approved_plan
+        if task_id == "missing-task":
+            return {"status": "blocked", "reason": "selected task not found in approved plan", "selected_task_id": task_id}
+        if task_id == "rejected-task":
+            return {"status": "blocked", "reason": "selected task is not approved", "selected_task_id": task_id}
+        return {**self.result, "selected_task_id": task_id or self.result.get("selected_task_id")}
 
 
 class HelperScheduler(Scheduler):
@@ -80,6 +88,29 @@ class HelperScheduler(Scheduler):
 
     def _gitlab(self) -> FakeGitLab:
         return self.fake_gitlab
+
+
+def task(task_id: str, task_type: TaskType, *, approved: bool) -> AgentTask:
+    affected_files = ["README.md"] if task_type == TaskType.DOCS else ["tests/smoke.py"]
+    return AgentTask(
+        id=task_id,
+        title=task_id,
+        task_type=task_type,
+        risk_level=RiskLevel.LOW,
+        risk_score=1,
+        affected_files=affected_files,
+        approved=approved,
+    )
+
+
+def write_approved_plan(scheduler: HelperScheduler, plan: TaskPlan) -> None:
+    plan_run_id = "plan-run"
+    artifacts_dir = Path(scheduler.config.workspace_root) / plan_run_id / "artifacts"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    (artifacts_dir / "approved_plan.json").write_text(plan.model_dump_json(indent=2), encoding="utf-8")
+    state, _ = scheduler.state_store.read()
+    state["last_plan_run_id"] = plan_run_id
+    scheduler.state_store.write(state)
 
 
 def test_schedule_defaults_disabled(tmp_path: Path) -> None:
@@ -177,6 +208,8 @@ def test_scheduler_plan_applies_auto_approval(tmp_path: Path) -> None:
     assert report["selected_task_id"] == "docs-readme"
     auto = json.loads((scheduler.artifacts.artifacts_dir / "auto_approval_report.json").read_text(encoding="utf-8"))
     assert auto["selected_task_id"] == "docs-readme"
+    state, _ = scheduler.state_store.read()
+    assert state["last_plan_run_id"] == "run-1"
 
 
 def test_scheduler_action_skips_limits_and_cooldown(tmp_path: Path) -> None:
@@ -201,9 +234,63 @@ def test_scheduler_action_runs_one_flow_and_updates_mr_count(tmp_path: Path) -> 
 
     assert report["status"] == "passed"
     assert scheduler.orchestrator.full_flow_called is True
+    assert scheduler.orchestrator.full_flow_task_id is None
     state, _ = scheduler.state_store.read()
     assert state["new_mrs_today"] == 1
     assert state["last_action_run"]
+
+
+def test_scheduler_action_with_task_id_selects_matching_approved_task(tmp_path: Path) -> None:
+    scheduler = HelperScheduler(config(tmp_path), gitlab=FakeGitLab(open_mrs=0))
+    write_approved_plan(
+        scheduler,
+        TaskPlan(
+            tasks=[
+                task("docs-01-credentials", TaskType.DOCS, approved=True),
+                task("tests-02-smoke-baseline", TaskType.TESTS, approved=True),
+            ]
+        ),
+    )
+
+    report = scheduler.action(task_id="tests-02-smoke-baseline")
+
+    assert report["status"] == "passed"
+    assert report["selected_task_id"] == "tests-02-smoke-baseline"
+    assert scheduler.orchestrator.full_flow_task_id == "tests-02-smoke-baseline"
+    assert [item.id for item in scheduler.orchestrator.full_flow_approved_plan.tasks] == [
+        "docs-01-credentials",
+        "tests-02-smoke-baseline",
+    ]
+    scheduler_report = json.loads((scheduler.artifacts.artifacts_dir / "scheduler_report.json").read_text(encoding="utf-8"))
+    assert scheduler_report["selected_task_id"] == "tests-02-smoke-baseline"
+
+
+def test_scheduler_action_with_unknown_task_id_fails_clearly(tmp_path: Path) -> None:
+    scheduler = HelperScheduler(config(tmp_path), gitlab=FakeGitLab(open_mrs=0))
+    write_approved_plan(
+        scheduler,
+        TaskPlan(tasks=[task("docs-01-credentials", TaskType.DOCS, approved=True)]),
+    )
+
+    report = scheduler.action(task_id="missing-task")
+
+    assert report["status"] == "failed"
+    assert report["reason"] == "selected task not found in approved plan"
+    assert report["selected_task_id"] == "missing-task"
+
+
+def test_scheduler_action_with_rejected_task_id_fails_clearly(tmp_path: Path) -> None:
+    scheduler = HelperScheduler(config(tmp_path), gitlab=FakeGitLab(open_mrs=0))
+    write_approved_plan(
+        scheduler,
+        TaskPlan(tasks=[task("rejected-task", TaskType.TESTS, approved=False)]),
+    )
+
+    report = scheduler.action(task_id="rejected-task")
+
+    assert report["status"] == "failed"
+    assert report["reason"] == "selected task is not approved"
+    assert report["selected_task_id"] == "rejected-task"
 
 
 def test_scheduler_action_skips_no_auto_approved_task(tmp_path: Path) -> None:

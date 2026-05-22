@@ -23,12 +23,14 @@ from agentlab.review_comments import (
     parse_review_command,
     review_comment_key,
 )
+from agentlab.models import TaskPlan
 from agentlab.tools.gitlab_tool import GitLabTool
 
 
 STATE_DEFAULTS: dict[str, Any] = {
     "last_watch_run": None,
     "last_plan_run": None,
+    "last_plan_run_id": None,
     "last_action_run": None,
     "last_default_branch_head": None,
     "new_mrs_today": 0,
@@ -122,11 +124,18 @@ class Scheduler:
         self.artifacts.write_json("approved_plan", approved_plan)
         now = _now()
         selected_task_id = auto_report.get("selected_task_id")
-        state.update({"last_plan_run": now, "last_default_branch_head": head, "last_selected_task_id": selected_task_id})
+        state.update(
+            {
+                "last_plan_run": now,
+                "last_plan_run_id": self.run_id,
+                "last_default_branch_head": head,
+                "last_selected_task_id": selected_task_id,
+            }
+        )
         self.state_store.write(state)
         return self._write_report(self._report("passed", "plan_completed", state_warning=warning, selected_task_id=selected_task_id))
 
-    def action(self) -> dict[str, Any]:
+    def action(self, task_id: str | None = None) -> dict[str, Any]:
         if not self.config.schedule.enabled:
             return self._write_report(self._report("skipped", "schedule_disabled"))
         if not self.config.schedule.action.enabled:
@@ -163,9 +172,39 @@ class Scheduler:
         if cooldown_until and datetime.now(UTC) < cooldown_until:
             return self._write_report(self._report("skipped", "action_cooldown_active", cooldown_until=state.get("cooldown_until")))
 
-        result = self.orchestrator.full_flow()
+        approved_plan = None
+        approved_plan_source = None
+        if task_id is not None:
+            try:
+                approved_plan, approved_plan_source = self._load_current_approved_plan(state)
+            except Exception as exc:
+                return self._write_report(
+                    self._report(
+                        "failed",
+                        "approved_plan_unavailable",
+                        selected_task_id=task_id,
+                        error=str(exc),
+                        state_warning=warning,
+                    )
+                )
+
+        result = self.orchestrator.full_flow(task_id=task_id, approved_plan=approved_plan)
         if result.get("status") == "blocked" and result.get("reason") == "no approved task available for implementation":
             return self._write_report(self._report("skipped", "no_auto_approved_task", full_flow=result))
+        if task_id is not None and result.get("status") == "blocked" and result.get("reason") in {
+            "selected task not found in approved plan",
+            "selected task is not approved",
+        }:
+            return self._write_report(
+                self._report(
+                    "failed",
+                    str(result.get("reason")),
+                    selected_task_id=task_id,
+                    approved_plan_source=approved_plan_source,
+                    full_flow=result,
+                    state_warning=warning,
+                )
+            )
         now_dt = datetime.now(UTC)
         state["last_action_run"] = now_dt.isoformat()
         state["cooldown_until"] = (now_dt + timedelta(hours=limits.min_hours_between_action_runs)).isoformat()
@@ -174,7 +213,17 @@ class Scheduler:
             state["new_mrs_date"] = today
         self.state_store.write(state)
         status = "passed" if result.get("status") in {"passed", "blocked"} else "failed"
-        return self._write_report(self._report(status, "action_completed", state_warning=warning, full_flow=result, new_mrs_today=state["new_mrs_today"]))
+        return self._write_report(
+            self._report(
+                status,
+                "action_completed",
+                state_warning=warning,
+                selected_task_id=result.get("selected_task_id") or task_id,
+                approved_plan_source=approved_plan_source,
+                full_flow=result,
+                new_mrs_today=state["new_mrs_today"],
+            )
+        )
 
     def review_comments(self) -> dict[str, Any]:
         if not self.config.schedule.enabled:
@@ -429,6 +478,19 @@ class Scheduler:
 
     def _gitlab(self) -> GitLabTool:
         return GitLabTool(self.config)
+
+    def _load_current_approved_plan(self, state: dict[str, Any]) -> tuple[TaskPlan, str]:
+        workspace_root = Path(self.config.workspace_root)
+        run_id = state.get("last_plan_run_id")
+        if isinstance(run_id, str) and run_id:
+            path = workspace_root / run_id / "artifacts" / "approved_plan.json"
+            if not path.exists():
+                raise FileNotFoundError(f"approved_plan.json not found for last_plan_run_id {run_id}: {path}")
+            return _load_approved_plan(path), str(path)
+        path = _latest_approved_plan_path(workspace_root)
+        if path is None:
+            raise FileNotFoundError("approved_plan.json not found; run scheduler-plan before scheduler-action --task-id")
+        return _load_approved_plan(path), str(path)
 
     @property
     def orchestrator(self) -> Orchestrator:
@@ -739,6 +801,17 @@ def _note_id_value(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _load_approved_plan(path: Path) -> TaskPlan:
+    return TaskPlan.model_validate_json(path.read_text(encoding="utf-8"))
+
+
+def _latest_approved_plan_path(workspace_root: Path) -> Path | None:
+    candidates = [path for path in workspace_root.glob("*/artifacts/approved_plan.json") if path.is_file()]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
 def _mr_created(result: dict[str, Any]) -> bool:
