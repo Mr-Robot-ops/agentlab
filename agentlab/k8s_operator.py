@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Protocol, TextIO
@@ -232,10 +233,14 @@ class K8sOperator:
         namespace: str = DEFAULT_NAMESPACE,
         manifest_dir: str | Path = DEFAULT_MANIFEST_DIR,
         runner: KubectlRunner | None = None,
+        log_retry_attempts: int = 5,
+        log_retry_delay_seconds: float = 1.0,
     ) -> None:
         self.namespace = namespace
         self.manifest_dir = Path(manifest_dir)
         self.runner = runner or SubprocessKubectlRunner()
+        self.log_retry_attempts = log_retry_attempts
+        self.log_retry_delay_seconds = log_retry_delay_seconds
 
     def status(self, *, manifest_dir: str | Path | None = None) -> ClusterStatus:
         configmap = self._run_json(["get", "configmap", "agentlab-config", "-o", "json"], check=False)
@@ -281,12 +286,13 @@ class K8sOperator:
         if tail is not None:
             args.append(f"--tail={tail}")
         if follow:
+            self._logs_with_retry(args)
             args.append("-f")
             code = self._stream(args)
             if code:
                 raise K8sOperatorError(f"kubectl logs failed with exit code {code}")
             return ""
-        return self._run(args)
+        return self._logs_with_retry(args)
 
     def run_component(self, component: str, *, follow: bool = True) -> str:
         manifest = manifest_for_component(component, self.manifest_dir)
@@ -298,10 +304,13 @@ class K8sOperator:
         self._run(["delete", "job", job_name, "--ignore-not-found=true"])
         self._run(["apply", "-f", str(manifest)])
         if follow:
-            code = self._stream(["logs", f"job/{job_name}", "-f"])
-            if code:
-                raise K8sOperatorError(f"kubectl logs failed with exit code {code}")
+            self.job_logs(job_name, follow=True)
         return str(manifest)
+
+    def run_doctor_job(self) -> str:
+        self.run_component("doctor", follow=False)
+        logs = self.job_logs(run_job_name_for_component("doctor"), follow=False)
+        return _doctor_status_from_logs(logs)
 
     def ensure_artifact_shell(self, *, pvc: str = "agentlab-runs", shell_pod: str = "artifact-shell") -> None:
         pod = self._run_json(["get", "pod", shell_pod, "-o", "json"], check=False)
@@ -481,8 +490,7 @@ class K8sOperator:
                     report.image_drift.extend(cluster_drifts)
                     raise K8sOperatorError("image drift remains after apply: " + "; ".join(cluster_drifts))
             if run_doctor:
-                self.run_component("doctor", follow=True)
-                report.doctor_status = "completed"
+                report.doctor_status = self.run_doctor_job()
             if cleanup_failed:
                 report.cleanup_report = self.cleanup_failed(dry_run=False)
         return report
@@ -529,6 +537,24 @@ class K8sOperator:
 
     def _run(self, args: list[str], *, input_text: str | None = None, check: bool = True) -> str:
         return self.runner.run(self._ns(args), input_text=input_text, check=check).stdout
+
+    def _logs_with_retry(self, args: list[str]) -> str:
+        attempts = max(1, self.log_retry_attempts)
+        last_result: KubectlResult | None = None
+        for attempt in range(attempts):
+            result = self.runner.run(self._ns(args), check=False)
+            if result.returncode == 0:
+                return result.stdout
+            last_result = result
+            message = f"{result.stderr}\n{result.stdout}"
+            if not _is_transient_log_error(message) or attempt == attempts - 1:
+                break
+            if self.log_retry_delay_seconds > 0:
+                time.sleep(self.log_retry_delay_seconds)
+        message = ""
+        if last_result is not None:
+            message = (last_result.stderr or last_result.stdout).strip()
+        raise K8sOperatorError(message or f"kubectl logs failed: {' '.join(args)}")
 
     def _stream(self, args: list[str]) -> int:
         return self.runner.stream(self._ns(args))
@@ -1008,6 +1034,28 @@ def _reason_from_payload(payload: dict[str, Any]) -> str:
     if isinstance(blockers, list) and blockers:
         return str(blockers[0])
     return ""
+
+
+def _is_transient_log_error(message: str) -> bool:
+    lowered = message.lower()
+    return any(
+        term in lowered
+        for term in (
+            "containercreating",
+            "podinitializing",
+            "waiting to start",
+        )
+    )
+
+
+def _doctor_status_from_logs(logs: str) -> str:
+    if "AgentLab doctor: failed" in logs:
+        raise K8sOperatorError("Doctor failed: AgentLab doctor: failed")
+    if "AgentLab doctor: warning" in logs:
+        return "warning"
+    if "AgentLab doctor: passed" in logs:
+        return "passed"
+    raise K8sOperatorError("Doctor logs did not contain an AgentLab doctor status line.")
 
 
 class K8sTUI:

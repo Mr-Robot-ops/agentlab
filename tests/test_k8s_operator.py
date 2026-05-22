@@ -30,10 +30,13 @@ class FakeRunner:
         self.calls: list[tuple[list[str], str | None]] = []
         self.stream_calls: list[list[str]] = []
         self.interactive_calls: list[list[str]] = []
-        self.responses: dict[tuple[str, ...], KubectlResult] = {}
+        self.responses: dict[tuple[str, ...], KubectlResult | list[KubectlResult]] = {}
 
     def respond(self, args: list[str], stdout: str = "", *, returncode: int = 0, stderr: str = "") -> None:
         self.responses[tuple(args)] = KubectlResult(args=args, stdout=stdout, stderr=stderr, returncode=returncode)
+
+    def respond_many(self, args: list[str], responses: list[KubectlResult]) -> None:
+        self.responses[tuple(args)] = responses
 
     def run(
         self,
@@ -44,7 +47,11 @@ class FakeRunner:
         capture: bool = True,
     ) -> KubectlResult:
         self.calls.append((args, input_text))
-        result = self.responses.get(tuple(args), KubectlResult(args=args, stdout="{}", returncode=0))
+        configured = self.responses.get(tuple(args), KubectlResult(args=args, stdout="{}", returncode=0))
+        if isinstance(configured, list):
+            result = configured.pop(0) if configured else KubectlResult(args=args, stdout="{}", returncode=0)
+        else:
+            result = configured
         if check and result.returncode != 0:
             raise K8sOperatorError(result.stderr or result.stdout or "kubectl failed")
         return result
@@ -545,6 +552,7 @@ def test_upgrade_dry_run_does_not_apply_but_apply_does(tmp_path: Path) -> None:
 def test_upgrade_run_doctor_and_cleanup_after_successful_apply(tmp_path: Path) -> None:
     write_upgrade_manifests(tmp_path)
     runner = FakeRunner()
+    runner.respond(["-n", "agentlab", "logs", "job/agentlab-doctor"], "AgentLab doctor: passed\n")
     runner.respond(["-n", "agentlab", "get", "jobs", "-o", "json"], json.dumps({"items": []}))
     runner.respond(["-n", "agentlab", "get", "pods", "-o", "json"], json.dumps({"items": []}))
 
@@ -558,8 +566,100 @@ def test_upgrade_run_doctor_and_cleanup_after_successful_apply(tmp_path: Path) -
     calls = [call[0] for call in runner.calls]
     assert ["-n", "agentlab", "delete", "job", "agentlab-doctor", "--ignore-not-found=true"] in calls
     assert ["-n", "agentlab", "apply", "-f", str(tmp_path / "job-doctor.yaml")] in calls
-    assert report.doctor_status == "completed"
+    assert report.doctor_status == "passed"
     assert report.cleanup_report is not None
+
+
+def test_upgrade_treats_doctor_warning_as_nonfatal(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path)
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "logs", "job/agentlab-doctor"],
+        "AgentLab doctor: warning\n- push_agent_branches_enabled is false\n",
+    )
+
+    report = K8sOperator(manifest_dir=tmp_path, runner=runner).upgrade(
+        image="registry/agentlab:new",
+        apply=True,
+        run_doctor=True,
+    )
+
+    assert report.doctor_status == "warning"
+    assert report.applied is True
+
+
+def test_upgrade_treats_doctor_failed_as_fatal(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path)
+    runner = FakeRunner()
+    runner.respond(["-n", "agentlab", "logs", "job/agentlab-doctor"], "AgentLab doctor: failed\n")
+
+    with pytest.raises(K8sOperatorError, match="Doctor failed"):
+        K8sOperator(manifest_dir=tmp_path, runner=runner).upgrade(
+            image="registry/agentlab:new",
+            apply=True,
+            run_doctor=True,
+        )
+
+
+def test_doctor_fails_when_logs_are_missing_or_unreadable(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path)
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "logs", "job/agentlab-doctor"],
+        stderr="pods not found",
+        returncode=1,
+    )
+
+    with pytest.raises(K8sOperatorError, match="pods not found"):
+        K8sOperator(manifest_dir=tmp_path, runner=runner).upgrade(
+            image="registry/agentlab:new",
+            apply=True,
+            run_doctor=True,
+        )
+
+
+def test_container_creating_log_error_is_retried(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path)
+    runner = FakeRunner()
+    args = ["-n", "agentlab", "logs", "job/agentlab-doctor"]
+    runner.respond_many(
+        args,
+        [
+            KubectlResult(args=args, stderr="container is waiting to start: ContainerCreating", returncode=1),
+            KubectlResult(args=args, stdout="AgentLab doctor: warning\n", returncode=0),
+        ],
+    )
+
+    logs = K8sOperator(
+        manifest_dir=tmp_path,
+        runner=runner,
+        log_retry_delay_seconds=0,
+    ).job_logs("agentlab-doctor", follow=False)
+
+    assert logs == "AgentLab doctor: warning\n"
+    assert [call[0] for call in runner.calls].count(args) == 2
+
+
+def test_run_doctor_retries_container_creating_before_streaming(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path)
+    runner = FakeRunner()
+    args = ["-n", "agentlab", "logs", "job/agentlab-doctor"]
+    runner.respond_many(
+        args,
+        [
+            KubectlResult(args=args, stderr="pod is PodInitializing", returncode=1),
+            KubectlResult(args=args, stdout="AgentLab doctor: warning\n", returncode=0),
+        ],
+    )
+
+    K8sOperator(
+        manifest_dir=tmp_path,
+        runner=runner,
+        log_retry_delay_seconds=0,
+    ).run_component("doctor", follow=True)
+
+    assert [call[0] for call in runner.calls].count(args) == 2
+    assert runner.stream_calls == [["-n", "agentlab", "logs", "job/agentlab-doctor", "-f"]]
 
 
 def test_format_upgrade_report_mentions_drift() -> None:
