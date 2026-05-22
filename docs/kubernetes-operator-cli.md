@@ -16,6 +16,13 @@ agentlab k8s tui
 
 All commands default to the `agentlab` namespace. Use `--namespace` to override it.
 
+Help is available through either form:
+
+```bash
+agentlab k8s --help
+agentlab k8s help
+```
+
 ## Status
 
 Show current AgentLab Kubernetes status:
@@ -244,6 +251,24 @@ Open the interactive menu:
 agentlab k8s tui
 ```
 
+The fallback TUI is a numbered prompt. It accepts either the displayed number or a short command name:
+
+```text
+status
+runs
+logs
+run
+artifact
+reset-state
+suspend
+resume
+shell
+upgrade
+cleanup
+quit
+exit
+```
+
 The TUI provides:
 
 1. Status anzeigen
@@ -259,4 +284,23 @@ The TUI provides:
 11. Cleanup failed resources
 12. Beenden
 
-Mutating actions require confirmation. If no interactive TTY is available, the TUI fails clearly and suggests equivalent non-interactive commands.
+Component prompts accept either the number or exact component name. For logs, valid names are `watch`, `plan`, `action`, `review-comments`, and `doctor`. For job runs, `reset-state` is also valid.
+
+Artifact lookup defaults the run ID to `latest` when the prompt is left empty:
+
+```text
+artifact
+Run ID (default: latest):
+Artifact name: gate_decision.json
+```
+
+Upgrade requires a non-empty image before any generated manifest can be changed:
+
+```text
+upgrade
+Image (example: 10.159.21.58:5000/agentlab:0.1.17): 10.159.21.58:5000/agentlab:0.1.17
+Preserve config: cluster config
+Apply generated manifests to the cluster? [y/N] y
+```
+
+When apply is selected, the TUI prints a summary and asks for final confirmation before calling upgrade. Mutating actions require confirmation. If no interactive TTY is available, the TUI fails clearly and suggests equivalent non-interactive commands.

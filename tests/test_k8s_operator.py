@@ -15,6 +15,7 @@ from agentlab.k8s_operator import (
     K8sOperatorError,
     K8sTUI,
     KubectlResult,
+    TuiChoice,
     TuiUnavailableError,
     artifact_path,
     cronjob_for_component,
@@ -26,6 +27,7 @@ from agentlab.k8s_operator import (
     job_prefix_for_component,
     kubectl_args,
     manifest_for_component,
+    resolve_tui_choice,
     run_tui,
 )
 
@@ -99,6 +101,14 @@ class FakeOperator:
     def logs(self, component: str, *, follow: bool = True, tail: int | None = None):
         self.calls.append(("logs", (component, follow, tail)))
         return "job", "logs"
+
+    def latest_job_name(self, component: str) -> str:
+        self.calls.append(("latest_job_name", component))
+        return f"agentlab-{component}"
+
+    def job_logs(self, job_name: str, *, follow: bool = True, tail: int | None = None) -> str:
+        self.calls.append(("job_logs", (job_name, follow, tail)))
+        return f"{job_name} logs"
 
     def run_component(self, component: str, *, follow: bool = True):
         self.calls.append(("run_component", (component, follow)))
@@ -1524,6 +1534,7 @@ def test_format_upgrade_report_mentions_drift() -> None:
 
     assert "AgentLab Kubernetes upgrade plan" in rendered
     assert "- image drift: cronjob old image" in rendered
+    assert "- Upgrade was not applied because manifest drift/preflight failed." in rendered
 
 
 def test_failed_agentlab_job_is_selected() -> None:
@@ -1679,6 +1690,105 @@ def test_cleanup_failed_deletes_only_selected_agentlab_jobs_and_pods() -> None:
     assert not any(resource in call for call in delete_calls for resource in ("cronjob", "pvc", "configmap", "secret", "serviceaccount"))
 
 
+def test_tui_selector_accepts_numbers_and_exact_text() -> None:
+    choices = ["watch", "plan", "action", "review-comments", "doctor"]
+
+    assert resolve_tui_choice("1", choices) == "watch"
+    assert resolve_tui_choice("5", choices) == "doctor"
+    assert resolve_tui_choice("doctor", choices) == "doctor"
+    assert resolve_tui_choice("review-comments", choices) == "review-comments"
+
+
+def test_tui_selector_accepts_display_labels_and_case_insensitive_input() -> None:
+    choices = [TuiChoice("status", "Status anzeigen"), TuiChoice("quit", "Beenden", aliases=("exit",))]
+
+    assert resolve_tui_choice("STATUS ANZEIGEN", choices) == "status"
+    assert resolve_tui_choice("exit", choices) == "quit"
+
+
+def test_tui_selector_invalid_input_lists_valid_choices() -> None:
+    with pytest.raises(K8sOperatorError) as excinfo:
+        resolve_tui_choice("wat", ["watch", "plan", "action", "review-comments", "doctor"])
+
+    assert "Invalid selection: wat" in str(excinfo.value)
+    assert "Valid choices: 1-5 or watch, plan, action, review-comments, doctor" in str(excinfo.value)
+
+
+def test_tui_logs_accepts_doctor_text_selection() -> None:
+    operator = FakeOperator()
+    answers = iter(["doctor"])
+    output: list[str] = []
+    tui = K8sTUI(
+        operator,  # type: ignore[arg-type]
+        input_func=lambda _prompt: next(answers),
+        output_func=output.append,
+    )
+
+    tui.run_once("logs")
+
+    assert operator.calls == [
+        ("latest_job_name", "doctor"),
+        ("job_logs", ("agentlab-doctor", False, None)),
+    ]
+    assert "Selected Job: agentlab-doctor" in output
+
+
+def test_tui_logs_accepts_doctor_numeric_selection() -> None:
+    operator = FakeOperator()
+    answers = iter(["5"])
+    tui = K8sTUI(
+        operator,  # type: ignore[arg-type]
+        input_func=lambda _prompt: next(answers),
+        output_func=lambda _text: None,
+    )
+
+    tui.run_once("3")
+
+    assert operator.calls == [
+        ("latest_job_name", "doctor"),
+        ("job_logs", ("agentlab-doctor", False, None)),
+    ]
+
+
+def test_tui_artifact_empty_run_id_defaults_to_latest() -> None:
+    operator = FakeOperator()
+    answers = iter(["", "gate_decision.json"])
+    tui = K8sTUI(
+        operator,  # type: ignore[arg-type]
+        input_func=lambda _prompt: next(answers),
+        output_func=lambda _text: None,
+        confirm_func=lambda _message: True,
+    )
+
+    tui.run_once("artifact")
+
+    assert operator.calls == [("artifact", ("latest", "gate_decision.json"))]
+
+
+def test_tui_artifact_missing_prints_available_artifacts_and_returns_to_menu() -> None:
+    class MissingArtifactOperator(FakeOperator):
+        def artifact(self, run_id: str, artifact: str):
+            self.calls.append(("artifact", (run_id, artifact)))
+            raise ArtifactNotFoundError("/runs/latest/artifacts/missing.json", ["gate_decision.json", "proposed.diff"])
+
+    operator = MissingArtifactOperator()
+    answers = iter(["", "missing.json"])
+    output: list[str] = []
+    tui = K8sTUI(
+        operator,  # type: ignore[arg-type]
+        input_func=lambda _prompt: next(answers),
+        output_func=output.append,
+        confirm_func=lambda _message: True,
+    )
+
+    assert tui.run_once("5") is True
+
+    assert operator.calls == [("artifact", ("latest", "missing.json"))]
+    assert any("artifact not found" in line for line in output)
+    assert "- gate_decision.json" in output
+    assert "- proposed.diff" in output
+
+
 def test_tui_action_mapping_calls_same_operator_helpers() -> None:
     operator = FakeOperator()
     answers = iter(["3"])
@@ -1714,7 +1824,7 @@ def test_tui_cleanup_failed_maps_to_same_helper() -> None:
 def test_tui_upgrade_action_calls_same_upgrade_helper() -> None:
     operator = FakeOperator()
     answers = iter(["registry/agentlab:new", "2"])
-    confirmations = iter([True, True, True])
+    confirmations = iter([True, True, True, True])
     tui = K8sTUI(
         operator,  # type: ignore[arg-type]
         input_func=lambda _prompt: next(answers),
@@ -1737,6 +1847,85 @@ def test_tui_upgrade_action_calls_same_upgrade_helper() -> None:
             },
         )
     ]
+
+
+@pytest.mark.parametrize("image", ["", "   "])
+def test_tui_upgrade_empty_image_does_not_call_operator(image: str) -> None:
+    operator = FakeOperator()
+    answers = iter([image])
+    output: list[str] = []
+    tui = K8sTUI(
+        operator,  # type: ignore[arg-type]
+        input_func=lambda _prompt: next(answers),
+        output_func=output.append,
+        confirm_func=lambda _message: pytest.fail("upgrade follow-up prompt should not be shown"),
+    )
+
+    tui.run_once("upgrade")
+
+    assert operator.calls == []
+    assert output == ["Image is required. Upgrade cancelled."]
+
+
+def test_tui_upgrade_valid_image_without_apply_calls_operator() -> None:
+    operator = FakeOperator()
+    answers = iter(["registry/agentlab:new", "cluster config"])
+    confirmations = iter([False, False, False])
+    tui = K8sTUI(
+        operator,  # type: ignore[arg-type]
+        input_func=lambda _prompt: next(answers),
+        output_func=lambda _text: None,
+        confirm_func=lambda _message: next(confirmations),
+    )
+
+    tui.run_once("upgrade")
+
+    assert operator.calls == [
+        (
+            "upgrade",
+            {
+                "image": "registry/agentlab:new",
+                "apply": False,
+                "preserve_local_config": False,
+                "preserve_cluster_config": True,
+                "run_doctor": False,
+                "cleanup_failed": False,
+            },
+        )
+    ]
+
+
+def test_tui_upgrade_apply_declined_confirmation_does_not_call_operator() -> None:
+    operator = FakeOperator()
+    answers = iter(["registry/agentlab:new", "1"])
+    confirmations = iter([True, False, False, False])
+    output: list[str] = []
+    tui = K8sTUI(
+        operator,  # type: ignore[arg-type]
+        input_func=lambda _prompt: next(answers),
+        output_func=output.append,
+        confirm_func=lambda _message: next(confirmations),
+    )
+
+    tui.run_once("10")
+
+    assert operator.calls == []
+    assert "Upgrade will apply generated manifests to the cluster." in output
+    assert "Upgrade cancelled." in output
+
+
+def test_tui_ctrl_c_exits_without_traceback() -> None:
+    output: list[str] = []
+    tui = K8sTUI(
+        FakeOperator(),  # type: ignore[arg-type]
+        input_func=lambda _prompt: (_ for _ in ()).throw(KeyboardInterrupt()),
+        output_func=output.append,
+    )
+
+    assert tui.run_once("logs") is True
+
+    assert output[-1] == "Cancelled."
+    assert not any("Traceback" in line for line in output)
 
 
 def test_tui_non_interactive_fallback() -> None:
