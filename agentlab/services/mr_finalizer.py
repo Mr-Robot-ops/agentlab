@@ -394,11 +394,14 @@ class MRFinalizer:
         ]
         docs_status = gate.check_statuses.get("docs_check")
         structure_status = gate.check_statuses.get("structure_evidence_check")
+        test_quality_status = gate.check_statuses.get("test_quality")
         if readme_only or docs_status is not None:
             lines.insert(0, f"- Docs check: {MRFinalizer._label(docs_status or 'skipped')}")
         if readme_only or structure_status is not None:
             insert_at = 1 if readme_only or docs_status is not None else 0
             lines.insert(insert_at, f"- Structure evidence: {MRFinalizer._label(structure_status or 'skipped')}")
+        if test_quality_status is not None:
+            lines.insert(0, f"- Test quality: {MRFinalizer._label(test_quality_status)}")
         if failed_policy_checks:
             checks = ", ".join(f"`{name}`" for name in failed_policy_checks)
             lines.append(f"- Failed policy checks: {checks}")

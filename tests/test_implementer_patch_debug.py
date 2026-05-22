@@ -158,6 +158,25 @@ class ValidatingFakeFileTool(FakeFileTool):
         return super().apply_patch(proposal)
 
 
+class RustPlaceholderFileTool(FakeFileTool):
+    def list_files(self) -> list[str]:
+        return ["rust-backend/Cargo.toml", "rust-backend/tests/smoke.rs"]
+
+    def read_file(self, path: str) -> str:
+        if path == "rust-backend/Cargo.toml":
+            return '[package]\nname = "rust-backend"\nversion = "0.1.0"\nedition = "2021"\n'
+        if path == "rust-backend/tests/smoke.rs":
+            return "#[test]\nfn test_smoke() {\n    assert!(true);\n}\n"
+        return super().read_file(path)
+
+    def validate_patch(self, proposal: PatchProposal) -> DiffStats:
+        return DiffStats(changed_files=["rust-backend/tests/smoke.rs"], added_lines=4)
+
+    def apply_patch(self, proposal: PatchProposal) -> DiffStats:
+        self.apply_calls += 1
+        return DiffStats(changed_files=["rust-backend/tests/smoke.rs"], added_lines=4)
+
+
 class FakeOllama:
     def __init__(self, proposals: list[PatchProposal | StructuredEditProposal]) -> None:
         self.proposals = proposals
@@ -240,6 +259,16 @@ def proposal_with_patch(patch: str, summary: str = "docs") -> PatchProposal:
         affected_files=["README.md"],
         expected_tests=[],
         rollback="Revert README.md changes.",
+    )
+
+
+def rust_test_task() -> AgentTask:
+    return AgentTask(
+        id="tests-02-smoke-baseline",
+        title="Add Rust smoke baseline",
+        task_type=TaskType.TESTS,
+        affected_files=["rust-backend/tests/smoke.rs"],
+        approved=True,
     )
 
 
@@ -1069,6 +1098,40 @@ def test_patch_proposal_remains_for_non_docs_tasks(tmp_path: Path) -> None:
     assert report.status == ReportStatus.PASSED
     assert report.implementation_mode == "patch"
     assert ollama.response_models == [PatchProposal]
+
+
+def test_placeholder_test_quality_blocks_commit_and_push(tmp_path: Path) -> None:
+    git = FakeGitTool()
+    store = ArtifactStore(tmp_path / "run", "run-1")
+    placeholder_proposal = PatchProposal(
+        task_id="tests-02-smoke-baseline",
+        summary="add smoke test",
+        patch="diff --git a/rust-backend/tests/smoke.rs b/rust-backend/tests/smoke.rs\n",
+        affected_files=["rust-backend/tests/smoke.rs"],
+        expected_tests=["cd rust-backend && cargo test --package rust-backend"],
+        rollback="Revert rust-backend/tests/smoke.rs.",
+    )
+
+    report = ImplementationAgent(
+        config(tmp_path).model_copy(update={"push_agent_branches_enabled": True}),
+        git,
+        RustPlaceholderFileTool(),
+        FakeOllama([placeholder_proposal]),
+        artifacts=store,
+        run_id="run-1",
+    ).implement(rust_test_task())
+
+    assert report.status == ReportStatus.FAILED
+    assert report.failure_stage == "test_quality"
+    assert report.failure_reason == "placeholder_test_detected"
+    assert git.committed is False
+    assert git.pushed is False
+    assert report.no_changes_committed is True
+    assert report.no_branch_pushed is True
+    assert "test_quality_report.json" in report.patch_artifacts
+    quality = json.loads(read_artifact(store, "test_quality_report.json"))
+    assert quality["reason"] == "placeholder_test_detected"
+    assert quality["findings"][0]["reason"] == "assert_true"
 
 
 def test_corrupt_patch_for_docs_task_can_fallback_to_structured_edit(tmp_path: Path) -> None:

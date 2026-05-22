@@ -37,6 +37,7 @@ ARTIFACT_COMPLETIONS = (
     "gate_decision.json",
     "implementation_report.json",
     "docs_check_report.json",
+    "test_quality_report.json",
     "structured_proposal.json",
     "structured_proposal_report.json",
     "proposed.diff",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import tomllib
 
 from agentlab.models import ReportStatus, TestReport
 from agentlab.tools.file_tool import FileTool
@@ -10,9 +11,10 @@ from agentlab.tools.test_tool import TestTool
 class FunctionalTestAgent:
     name = "functional_test"
 
-    def __init__(self, file_tool: FileTool, test_tool: TestTool) -> None:
+    def __init__(self, file_tool: FileTool, test_tool: TestTool, *, changed_files: list[str] | None = None) -> None:
         self.file_tool = file_tool
         self.test_tool = test_tool
+        self.changed_files = [path.replace("\\", "/") for path in changed_files or []]
 
     def run(self) -> TestReport:
         commands = self.detect_commands()
@@ -43,4 +45,26 @@ class FunctionalTestAgent:
             commands.append("go test ./...")
         if "Cargo.toml" in files:
             commands.append("cargo test")
+        if self._rust_backend_tests_changed(files):
+            commands.append(self._rust_backend_test_command())
         return [command for command in commands if self.test_tool.is_allowed(command)]
+
+    def _rust_backend_tests_changed(self, files: set[str]) -> bool:
+        if "rust-backend/Cargo.toml" not in files:
+            return False
+        return any(path.startswith("rust-backend/tests/") and path.endswith(".rs") for path in self.changed_files)
+
+    def _rust_backend_test_command(self) -> str:
+        package = self._cargo_package_name("rust-backend/Cargo.toml")
+        if package:
+            return f"cd rust-backend && cargo test --package {package}"
+        return "cd rust-backend && cargo test"
+
+    def _cargo_package_name(self, path: str) -> str | None:
+        try:
+            payload = tomllib.loads(self.file_tool.read_file(path))
+        except Exception:
+            return None
+        package = payload.get("package") if isinstance(payload, dict) else None
+        name = package.get("name") if isinstance(package, dict) else None
+        return str(name) if name else None

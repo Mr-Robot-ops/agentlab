@@ -7,6 +7,7 @@ from urllib.parse import urlparse
 
 from agentlab.config import AppConfig
 from agentlab.models import PreflightCheck, PreflightReport
+from agentlab.policies.command_policy import CommandPolicy
 from agentlab.tools.common import run_subprocess
 
 
@@ -124,7 +125,11 @@ class PreflightChecker:
             self._passed("auto_merge_enabled", "auto merge is disabled")
 
     def _check_required_commands(self) -> None:
-        missing = [cmd for cmd in self.config.required_test_commands if cmd not in self.config.allowed_commands]
+        policy = CommandPolicy(
+            allowed_commands=self.config.allowed_commands,
+            forbidden_commands=self.config.forbidden_commands,
+        )
+        missing = [cmd for cmd in self.config.required_test_commands if not policy.is_allowed(cmd)]
         if missing:
             self._failed(
                 "required_test_commands",
