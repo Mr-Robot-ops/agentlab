@@ -24,6 +24,10 @@ class FakeOperator:
         self.calls.append(("job_logs", (job_name, follow, tail)))
         return "log output"
 
+    def run_component(self, component: str, *, follow: bool = True, task_id: str | None = None) -> str:
+        self.calls.append(("run_component", (component, follow, task_id)))
+        return f"manifest-{component}"
+
     def failed_resources(self) -> FailedResources:
         self.calls.append(("failed_resources", None))
         return FailedResources(jobs=["agentlab-failed-job"], pods=["agentlab-failed-pod"])
@@ -91,6 +95,23 @@ def test_k8s_command_invocation_still_works_with_completions(monkeypatch) -> Non
     assert fake.calls == [
         ("latest_job_name", "action"),
         ("job_logs", ("agentlab-scheduler-action", False, None)),
+    ]
+
+
+def test_k8s_run_action_passes_task_id(monkeypatch) -> None:
+    fake = FakeOperator()
+    monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
+    monkeypatch.setattr(k8s_cli, "manifest_for_component", lambda component, manifest_dir: Path("job-scheduler-action.yaml"))
+    monkeypatch.setattr(k8s_cli, "run_job_name_for_component", lambda component: "agentlab-scheduler-action")
+
+    result = runner.invoke(
+        app,
+        ["k8s", "run", "action", "--task-id", "tests-02-smoke-baseline", "--no-follow"],
+    )
+
+    assert result.exit_code == 0
+    assert fake.calls == [
+        ("run_component", ("action", False, "tests-02-smoke-baseline")),
     ]
 
 
