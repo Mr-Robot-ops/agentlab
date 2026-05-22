@@ -167,7 +167,12 @@ def pod_item(name: str, *, phase: str, reason: str | None = None) -> dict[str, o
     }
 
 
-def write_upgrade_manifests(path: Path, *, image: str = "registry/agentlab:old") -> None:
+def write_upgrade_manifests(
+    path: Path,
+    *,
+    image: str = "registry/agentlab:old",
+    include_review_comments_cronjob: bool = True,
+) -> None:
     path.mkdir(parents=True, exist_ok=True)
     (path / "configmap.yaml").write_text(
         yaml.safe_dump(
@@ -198,6 +203,8 @@ def write_upgrade_manifests(path: Path, *, image: str = "registry/agentlab:old")
     for name in (
         "job-doctor.yaml",
         "job-scheduler-watch.yaml",
+        "job-scheduler-plan.yaml",
+        "job-scheduler-action.yaml",
         "job-scheduler-review-comments.yaml",
         "job-scheduler-reset-state.yaml",
     ):
@@ -211,7 +218,10 @@ def write_upgrade_manifests(path: Path, *, image: str = "registry/agentlab:old")
             ),
             encoding="utf-8",
         )
-    for name in ("cronjob-scheduler-watch.yaml", "cronjob-scheduler-review-comments.yaml"):
+    cronjobs = ["cronjob-scheduler-watch.yaml"]
+    if include_review_comments_cronjob:
+        cronjobs.append("cronjob-scheduler-review-comments.yaml")
+    for name in cronjobs:
         (path / name).write_text(
             yaml.safe_dump(
                 {
@@ -252,6 +262,32 @@ def manifest_image(path: Path) -> str:
 def configmap_config(path: Path) -> dict[str, object]:
     configmap = yaml.safe_load((path / "configmap.yaml").read_text(encoding="utf-8"))
     return yaml.safe_load(configmap["data"]["config.yaml"])
+
+
+def cronjob_names_json(*, configmap_image: str, cronjob_images: dict[str, str]) -> tuple[str, str]:
+    configmap = json.dumps({"metadata": {"annotations": {"agentlab.io/image": configmap_image}}})
+    cronjobs = json.dumps(
+        {
+            "items": [
+                {
+                    "metadata": {"name": name},
+                    "spec": {
+                        "schedule": "*/5 * * * *",
+                        "jobTemplate": {
+                            "spec": {
+                                "template": {
+                                    "spec": {"containers": [{"image": image}]}
+                                }
+                            }
+                        },
+                    },
+                    "status": {},
+                }
+                for name, image in cronjob_images.items()
+            ]
+        }
+    )
+    return configmap, cronjobs
 
 
 def test_component_mappings() -> None:
@@ -513,6 +549,72 @@ def test_upgrade_preserves_cluster_config_and_rejects_conflicting_preserve_sourc
         )
 
 
+def test_upgrade_preserved_review_comments_creates_cronjob_manifest_and_kustomization(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path, include_review_comments_cronjob=False)
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"],
+        json.dumps(
+            {
+                "data": {
+                    "config.yaml": yaml.safe_dump(
+                        {
+                            "schedule": {
+                                "review_comments": {
+                                    "enabled": True,
+                                    "cron": "*/1 * * * *",
+                                }
+                            }
+                        },
+                        sort_keys=False,
+                    )
+                }
+            }
+        ),
+    )
+
+    report = K8sOperator(manifest_dir=tmp_path, runner=runner).upgrade(
+        image="registry/agentlab:new",
+        preserve_cluster_config=True,
+    )
+
+    cronjob_path = tmp_path / "cronjob-scheduler-review-comments.yaml"
+    assert cronjob_path.exists()
+    assert manifest_image(cronjob_path) == "registry/agentlab:new"
+    cronjob = yaml.safe_load(cronjob_path.read_text(encoding="utf-8"))
+    assert cronjob["metadata"]["name"] == "agentlab-scheduler-review-comments"
+    assert cronjob["spec"]["schedule"] == "*/1 * * * *"
+    kustomization = yaml.safe_load((tmp_path / "kustomization.yaml").read_text(encoding="utf-8"))
+    assert "cronjob-scheduler-review-comments.yaml" in kustomization["resources"]
+    assert "cronjob-scheduler-review-comments.yaml" in report.updated_manifests
+    assert "kustomization.yaml" in report.updated_manifests
+
+
+def test_upgrade_fails_when_enabled_cronjob_has_no_generated_job_manifest(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path, include_review_comments_cronjob=False)
+    (tmp_path / "job-scheduler-review-comments.yaml").unlink()
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"],
+        json.dumps(
+            {
+                "data": {
+                    "config.yaml": yaml.safe_dump(
+                        {"schedule": {"review_comments": {"enabled": True}}},
+                        sort_keys=False,
+                    )
+                }
+            }
+        ),
+    )
+
+    with pytest.raises(K8sOperatorError, match="missing generated Job manifest for enabled CronJob review-comments"):
+        K8sOperator(manifest_dir=tmp_path, runner=runner).upgrade(
+            image="registry/agentlab:new",
+            preserve_cluster_config=True,
+        )
+
+
 def test_upgrade_fails_if_manifest_dir_missing(tmp_path: Path) -> None:
     with pytest.raises(K8sOperatorError, match="manifest dir is missing"):
         K8sOperator(manifest_dir=tmp_path / "missing", runner=FakeRunner()).upgrade(image="registry/agentlab:new")
@@ -547,6 +649,81 @@ def test_upgrade_dry_run_does_not_apply_but_apply_does(tmp_path: Path) -> None:
     K8sOperator(manifest_dir=tmp_path, runner=runner).upgrade(image="registry/agentlab:new", apply=True)
 
     assert ["-n", "agentlab", "apply", "-k", str(tmp_path)] in [call[0] for call in runner.calls]
+
+
+def test_upgrade_apply_reapplies_preserved_review_comments_cronjob_and_clears_drift(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path, include_review_comments_cronjob=False)
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"],
+        json.dumps(
+            {
+                "metadata": {"annotations": {"agentlab.io/image": "registry/agentlab:new"}},
+                "data": {
+                    "config.yaml": yaml.safe_dump(
+                        {"schedule": {"review_comments": {"enabled": True}}},
+                        sort_keys=False,
+                    )
+                },
+            }
+        ),
+    )
+    runner.respond(
+        ["-n", "agentlab", "get", "cronjobs", "-o", "json"],
+        json.dumps(
+            {
+                "items": [
+                    {
+                        "metadata": {"name": "agentlab-scheduler-review-comments"},
+                        "spec": {
+                            "schedule": "*/10 * * * *",
+                            "jobTemplate": {
+                                "spec": {
+                                    "template": {
+                                        "spec": {"containers": [{"image": "registry/agentlab:new"}]}
+                                    }
+                                }
+                            },
+                        },
+                        "status": {},
+                    }
+                ]
+            }
+        ),
+    )
+    runner.respond(["-n", "agentlab", "get", "jobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(["-n", "agentlab", "get", "pods", "-o", "json"], json.dumps({"items": []}))
+
+    report = K8sOperator(manifest_dir=tmp_path, runner=runner).upgrade(
+        image="registry/agentlab:new",
+        preserve_cluster_config=True,
+        apply=True,
+    )
+
+    calls = [call[0] for call in runner.calls]
+    assert ["-n", "agentlab", "apply", "-k", str(tmp_path)] in calls
+    assert ["-n", "agentlab", "apply", "-f", str(tmp_path / "cronjob-scheduler-review-comments.yaml")] in calls
+    assert "cronjob-scheduler-review-comments.yaml" in yaml.safe_load(
+        (tmp_path / "kustomization.yaml").read_text(encoding="utf-8")
+    )["resources"]
+    assert report.image_drift == []
+
+
+def test_status_detects_review_comments_image_drift() -> None:
+    runner = FakeRunner()
+    configmap, cronjobs = cronjob_names_json(
+        configmap_image="registry/agentlab:new",
+        cronjob_images={"agentlab-scheduler-review-comments": "registry/agentlab:old"},
+    )
+    runner.respond(["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"], configmap)
+    runner.respond(["-n", "agentlab", "get", "cronjobs", "-o", "json"], cronjobs)
+    runner.respond(["-n", "agentlab", "get", "jobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(["-n", "agentlab", "get", "pods", "-o", "json"], json.dumps({"items": []}))
+
+    status = K8sOperator(runner=runner).status()
+
+    assert status.cronjobs[0].name == "agentlab-scheduler-review-comments"
+    assert status.cronjobs[0].image_drift is True
 
 
 def test_upgrade_run_doctor_and_cleanup_after_successful_apply(tmp_path: Path) -> None:
