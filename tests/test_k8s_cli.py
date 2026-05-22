@@ -1,11 +1,19 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from typer.testing import CliRunner
 
 import agentlab.k8s_cli as k8s_cli
-from agentlab.k8s_operator import CleanupReport, FailedResources
+from agentlab.k8s_operator import (
+    CleanupReport,
+    ConfigSetReport,
+    ConfigValueReport,
+    FailedResources,
+    HealthReport,
+    MergeRequestListReport,
+)
 from agentlab.main import app
 
 
@@ -27,6 +35,94 @@ class FakeOperator:
     def run_component(self, component: str, *, follow: bool = True, task_id: str | None = None) -> str:
         self.calls.append(("run_component", (component, follow, task_id)))
         return f"manifest-{component}"
+
+    def config_get(self, path: str) -> ConfigValueReport:
+        self.calls.append(("config_get", path))
+        return ConfigValueReport(path=path, value=True)
+
+    def config_set(self, path: str, value: str) -> ConfigSetReport:
+        self.calls.append(("config_set", (path, value)))
+        return ConfigSetReport(path=path, before=False, after=value == "true", changed=True)
+
+    def mrs(
+        self,
+        *,
+        state: str = "opened",
+        label: str = "agent/generated",
+        secret_name: str = "agentlab-secrets",
+    ) -> MergeRequestListReport:
+        self.calls.append(("mrs", (state, label, secret_name)))
+        return MergeRequestListReport(
+            namespace="agentlab",
+            state=state,
+            label=label,
+            merge_requests=[
+                {
+                    "iid": 18,
+                    "title": "Add smoke baseline",
+                    "state": state,
+                    "source_branch": "agent/tests-02-smoke-baseline",
+                    "web_url": "https://gitlab.example.com/group/project/-/merge_requests/18",
+                    "labels": [label],
+                    "updated_at": "2026-05-22T12:00:00Z",
+                }
+            ],
+        )
+
+    def health(
+        self,
+        *,
+        manifest_dir: Path | None = None,
+        pvc: str = "agentlab-runs",
+        shell_pod: str = "artifact-shell",
+    ) -> HealthReport:
+        self.calls.append(("health", (manifest_dir, pvc, shell_pod)))
+        return HealthReport(
+            namespace="agentlab",
+            status="warning",
+            images={
+                "configmap_image": "registry/agentlab:new",
+                "generated_configmap_image": "registry/agentlab:new",
+                "cronjobs": [],
+                "drift": [],
+            },
+            failed_resources={"jobs": [], "pods": []},
+            open_agent_mrs=[
+                {
+                    "iid": 18,
+                    "title": "Add smoke baseline",
+                    "source_branch": "agent/tests-02-smoke-baseline",
+                    "web_url": "https://gitlab.example.com/group/project/-/merge_requests/18",
+                    "labels": ["agent/generated"],
+                    "updated_at": "2026-05-22T12:00:00Z",
+                }
+            ],
+            gitlab={
+                "url": "https://gitlab.example.com",
+                "project_id": 1,
+                "open_agent_mrs_count": 1,
+                "status": "ok",
+                "warning": None,
+            },
+            scheduler={
+                "state_path": "/var/lib/agentlab/runs/scheduler/state.json",
+                "state_exists": True,
+                "state_age_seconds": 60,
+                "last_watch_run": "2026-05-22T09:00:00Z",
+                "last_plan_run": "2026-05-22T10:00:00Z",
+                "last_action_run": "2026-05-22T11:00:00Z",
+                "last_review_run": "2026-05-22T12:00:00Z",
+                "action_enabled": True,
+                "review_comments": {
+                    "enabled": True,
+                    "allowed_authors": ["alice"],
+                    "require_author_role": ["owner"],
+                },
+            },
+            models={"base_url": "http://ollama.local:11434", "default": "qwen-health", "models": {"default": "qwen-health"}},
+            doctor={"status": "warning", "job": "agentlab-doctor"},
+            warnings=["doctor status: warning"],
+        )
 
     def failed_resources(self) -> FailedResources:
         self.calls.append(("failed_resources", None))
@@ -81,6 +177,7 @@ def test_static_completion_candidates() -> None:
         "structured_proposal.json",
         "structured_proposal_report.json",
     ]
+    assert "schedule.action.enabled" in k8s_cli.complete_config_path("schedule.action")
 
 
 def test_k8s_command_invocation_still_works_with_completions(monkeypatch) -> None:
@@ -113,6 +210,87 @@ def test_k8s_run_action_passes_task_id(monkeypatch) -> None:
     assert fake.calls == [
         ("run_component", ("action", False, "tests-02-smoke-baseline")),
     ]
+
+
+def test_k8s_config_get_invokes_operator(monkeypatch) -> None:
+    fake = FakeOperator()
+    monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
+
+    result = runner.invoke(app, ["k8s", "config", "get", "schedule.action.enabled"])
+
+    assert result.exit_code == 0
+    assert "schedule.action.enabled: true" in result.output
+    assert fake.calls == [("config_get", "schedule.action.enabled")]
+
+
+def test_k8s_config_set_invokes_operator_and_prints_before_after(monkeypatch) -> None:
+    fake = FakeOperator()
+    monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
+
+    result = runner.invoke(app, ["k8s", "config", "set", "schedule.action.enabled", "true"])
+
+    assert result.exit_code == 0
+    assert "Before: false" in result.output
+    assert "After: true" in result.output
+    assert fake.calls == [("config_set", ("schedule.action.enabled", "true"))]
+
+
+def test_k8s_mrs_invokes_operator_and_prints_table(monkeypatch) -> None:
+    fake = FakeOperator()
+    monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
+
+    result = runner.invoke(app, ["k8s", "mrs", "--state", "opened", "--label", "agent/generated"])
+
+    assert result.exit_code == 0
+    assert (
+        "!18 | Add smoke baseline | opened | agent/tests-02-smoke-baseline | "
+        "https://gitlab.example.com/group/project/-/merge_requests/18 | agent/generated"
+    ) in result.output
+    assert fake.calls == [("mrs", ("opened", "agent/generated", "agentlab-secrets"))]
+
+
+def test_k8s_mrs_supports_json(monkeypatch) -> None:
+    fake = FakeOperator()
+    monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
+
+    result = runner.invoke(app, ["k8s", "mrs", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["state"] == "opened"
+    assert payload["label"] == "agent/generated"
+    assert payload["merge_requests"][0]["iid"] == 18
+    assert "super-secret" not in result.output
+    assert fake.calls == [("mrs", ("opened", "agent/generated", "agentlab-secrets"))]
+
+
+def test_k8s_health_invokes_operator_and_prints_summary(monkeypatch) -> None:
+    fake = FakeOperator()
+    monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
+
+    result = runner.invoke(app, ["k8s", "health", "--manifest-dir", "deploy/kubernetes/generated"])
+
+    assert result.exit_code == 0
+    assert "AgentLab health: warning" in result.output
+    assert "Open Agent MRs: 1" in result.output
+    assert "action: enabled" in result.output
+    assert fake.calls == [("health", (Path("deploy/kubernetes/generated"), "agentlab-runs", "artifact-shell"))]
+
+
+def test_k8s_health_supports_json(monkeypatch) -> None:
+    fake = FakeOperator()
+    monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
+
+    result = runner.invoke(app, ["k8s", "health", "--json"])
+
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["status"] == "warning"
+    assert payload["open_agent_mrs"][0]["iid"] == 18
+    assert payload["scheduler"]["action_enabled"] is True
+    assert payload["doctor"]["status"] == "warning"
+    assert "super-secret" not in result.output
+    assert fake.calls == [("health", (Path("deploy/kubernetes/generated"), "agentlab-runs", "artifact-shell"))]
 
 
 def test_show_completion_still_works() -> None:
