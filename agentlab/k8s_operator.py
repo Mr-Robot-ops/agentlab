@@ -426,10 +426,10 @@ class K8sOperator:
         deleted_pods: list[str] = []
         if not dry_run:
             for job in resources.jobs:
-                self._run(["delete", "job", job])
+                self._run(["delete", "job", job, "--ignore-not-found=true"])
                 deleted_jobs.append(job)
             for pod in resources.pods:
-                self._run(["delete", "pod", pod])
+                self._run(["delete", "pod", pod, "--ignore-not-found=true"])
                 deleted_pods.append(pod)
         return CleanupReport(
             namespace=self.namespace,
