@@ -177,7 +177,17 @@ def test_static_completion_candidates() -> None:
         "structured_proposal.json",
         "structured_proposal_report.json",
     ]
+    assert "functional_test_report.json" in k8s_cli.complete_artifact()
+    assert "raw_patch.diff" in k8s_cli.complete_artifact()
     assert "schedule.action.enabled" in k8s_cli.complete_config_path("schedule.action")
+
+
+def test_k8s_help_alias_lists_key_commands() -> None:
+    result = runner.invoke(app, ["k8s", "help"])
+
+    assert result.exit_code == 0
+    for command in ("status", "mrs", "health", "logs", "run", "artifact", "upgrade", "config", "tui"):
+        assert command in result.output
 
 
 def test_k8s_command_invocation_still_works_with_completions(monkeypatch) -> None:

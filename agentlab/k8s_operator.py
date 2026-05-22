@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import importlib
 import json
 import subprocess
 import sys
@@ -103,6 +104,21 @@ class ArtifactNotFoundError(K8sOperatorError):
 
 class TuiUnavailableError(K8sOperatorError):
     pass
+
+
+class TuiCancelled(K8sOperatorError):
+    pass
+
+
+@dataclass(frozen=True)
+class TuiChoice:
+    value: str
+    label: str | None = None
+    aliases: tuple[str, ...] = ()
+
+    @property
+    def display(self) -> str:
+        return self.label or self.value
 
 
 @dataclass
@@ -1269,6 +1285,8 @@ def format_upgrade_report(report: UpgradeReport) -> str:
             f"- doctor: {report.doctor_status}",
         ]
     )
+    if report.apply and not report.applied and report.image_drift:
+        lines.append("- Upgrade was not applied because manifest drift/preflight failed.")
     if report.cleanup_report is not None:
         lines.append(f"- cleanup deleted jobs: {len(report.cleanup_report.deleted_jobs)}")
         lines.append(f"- cleanup deleted pods: {len(report.cleanup_report.deleted_pods)}")
@@ -1965,7 +1983,172 @@ def _validate_task_id(task_id: str) -> None:
         raise K8sOperatorError("task_id may only contain letters, numbers, hyphen and underscore")
 
 
+def resolve_tui_choice(
+    raw: str,
+    choices: list[str | TuiChoice],
+    *,
+    case_insensitive: bool = True,
+) -> str:
+    normalized_choices = [_tui_choice(choice) for choice in choices]
+    value = raw.strip()
+    if value.isdecimal():
+        index = int(value) - 1
+        if 0 <= index < len(normalized_choices):
+            return normalized_choices[index].value
+
+    candidate = _normalize_tui_match(value, case_insensitive=case_insensitive)
+    for choice in normalized_choices:
+        aliases = (choice.value, choice.display, *choice.aliases)
+        for alias in aliases:
+            if _normalize_tui_match(alias, case_insensitive=case_insensitive) == candidate:
+                return choice.value
+    raise K8sOperatorError(_invalid_tui_selection_message(value, normalized_choices))
+
+
+def _tui_choice(choice: str | TuiChoice) -> TuiChoice:
+    return choice if isinstance(choice, TuiChoice) else TuiChoice(choice)
+
+
+def _normalize_tui_match(value: str, *, case_insensitive: bool) -> str:
+    value = value.strip()
+    return value.casefold() if case_insensitive else value
+
+
+def _invalid_tui_selection_message(raw: str, choices: list[TuiChoice]) -> str:
+    upper = len(choices)
+    values = ", ".join(choice.value for choice in choices)
+    return f"Invalid selection: {raw}\nValid choices: 1-{upper} or {values}"
+
+
+class TUIAdapter(Protocol):
+    def select(self, label: str, choices: list[str | TuiChoice], *, default: str | None = None) -> str:
+        ...
+
+    def confirm(self, message: str, *, default: bool = False) -> bool:
+        ...
+
+    def text(self, label: str, *, default: str | None = None) -> str:
+        ...
+
+
+class FallbackTUIAdapter:
+    def __init__(
+        self,
+        *,
+        input_func: Callable[[str], str] = input,
+        output_func: Callable[[str], None] = print,
+    ) -> None:
+        self.input = input_func
+        self.output = output_func
+
+    def select(self, label: str, choices: list[str | TuiChoice], *, default: str | None = None) -> str:
+        normalized = [_tui_choice(choice) for choice in choices]
+        for index, choice in enumerate(normalized, start=1):
+            self.output(f"{index}. {choice.display}")
+        raw = self._read(f"{label}: ").strip()
+        if not raw:
+            if default is not None:
+                return default
+            raise K8sOperatorError(f"{label} is required.")
+        return resolve_tui_choice(raw, normalized)
+
+    def confirm(self, message: str, *, default: bool = False) -> bool:
+        suffix = "[Y/n]" if default else "[y/N]"
+        while True:
+            raw = self._read(f"{message} {suffix} ").strip().lower()
+            if not raw:
+                return default
+            if raw in {"y", "yes"}:
+                return True
+            if raw in {"n", "no"}:
+                return False
+            self.output("Please answer y or n.")
+
+    def text(self, label: str, *, default: str | None = None) -> str:
+        prompt = f"{label}: " if default is None else f"{label} (default: {default}): "
+        raw = self._read(prompt).strip()
+        return default if raw == "" and default is not None else raw
+
+    def _read(self, prompt: str) -> str:
+        try:
+            return self.input(prompt)
+        except KeyboardInterrupt as exc:
+            raise TuiCancelled("Cancelled.") from exc
+
+
+class QuestionaryTUIAdapter:
+    def __init__(self, questionary_module: Any) -> None:
+        self.questionary = questionary_module
+
+    def select(self, label: str, choices: list[str | TuiChoice], *, default: str | None = None) -> str:
+        normalized = [_tui_choice(choice) for choice in choices]
+        labels = [choice.display for choice in normalized]
+        values_by_label = {choice.display: choice.value for choice in normalized}
+        default_label = next((choice.display for choice in normalized if choice.value == default), None)
+        kwargs: dict[str, Any] = {"choices": labels}
+        if default_label is not None:
+            kwargs["default"] = default_label
+        answer = self._ask(self.questionary.select(label, **kwargs))
+        if not answer:
+            if default is not None:
+                return default
+            raise TuiCancelled("Cancelled.")
+        return values_by_label.get(str(answer), str(answer))
+
+    def confirm(self, message: str, *, default: bool = False) -> bool:
+        answer = self._ask(self.questionary.confirm(message, default=default))
+        return default if answer is None else bool(answer)
+
+    def text(self, label: str, *, default: str | None = None) -> str:
+        answer = self._ask(self.questionary.text(label, default=default or ""))
+        if answer is None:
+            raise TuiCancelled("Cancelled.")
+        value = str(answer).strip()
+        return default if value == "" and default is not None else value
+
+    def _ask(self, prompt: Any) -> Any:
+        try:
+            return prompt.ask()
+        except KeyboardInterrupt as exc:
+            raise TuiCancelled("Cancelled.") from exc
+
+
+def create_tui_adapter(
+    *,
+    input_func: Callable[[str], str] = input,
+    output_func: Callable[[str], None] = print,
+) -> TUIAdapter:
+    try:
+        questionary = importlib.import_module("questionary")
+    except ImportError:
+        return FallbackTUIAdapter(input_func=input_func, output_func=output_func)
+    return QuestionaryTUIAdapter(questionary)
+
+
 class K8sTUI:
+    MAIN_CHOICES = [
+        TuiChoice("status", "Status anzeigen"),
+        TuiChoice("runs", "Recent runs anzeigen"),
+        TuiChoice("logs", "Logs ansehen"),
+        TuiChoice("run", "Job starten"),
+        TuiChoice("artifact", "Artifact ansehen"),
+        TuiChoice("reset-state", "Scheduler state resetten"),
+        TuiChoice("suspend", "CronJob pausieren"),
+        TuiChoice("resume", "CronJob fortsetzen"),
+        TuiChoice("shell", "Artifact shell öffnen"),
+        TuiChoice("upgrade", "Upgrade / reconcile deployment"),
+        TuiChoice("cleanup", "Cleanup failed resources"),
+        TuiChoice("quit", "Beenden", aliases=("exit",)),
+    ]
+    COMPONENT_CHOICES = ["watch", "plan", "action", "review-comments", "doctor"]
+    RUN_COMPONENT_CHOICES = ["watch", "plan", "action", "review-comments", "doctor", "reset-state"]
+    CRONJOB_CHOICES = ["watch", "plan", "action", "review-comments"]
+    PRESERVE_CHOICES = [
+        TuiChoice("none"),
+        TuiChoice("local generated config"),
+        TuiChoice("cluster config"),
+    ]
+
     def __init__(
         self,
         operator: K8sOperator,
@@ -1973,128 +2156,200 @@ class K8sTUI:
         input_func: Callable[[str], str] = input,
         output_func: Callable[[str], None] = print,
         confirm_func: Callable[[str], bool] | None = None,
+        adapter: TUIAdapter | None = None,
     ) -> None:
         self.operator = operator
-        self.input = input_func
         self.output = output_func
         self.confirm_func = confirm_func
+        self.adapter = adapter or FallbackTUIAdapter(input_func=input_func, output_func=output_func)
 
     def run_once(self, choice: str) -> bool:
-        if choice == "1":
-            self.output(format_status(self.operator.status()))
-        elif choice == "2":
-            if self._confirm("Create artifact-shell pod if missing to list runs?"):
-                self.output(format_runs(self.operator.runs()))
-        elif choice == "3":
-            component = self._select_component(include_reset=False)
-            job, logs = self.operator.logs(component, follow=False)
-            self.output(f"Selected Job: {job}")
-            if logs:
-                self.output(logs)
-        elif choice == "4":
-            component = self._select_component(include_reset=True)
-            if component == "action":
-                message = "This may create or update a Merge Request. Continue?"
-            elif component == "reset-state":
-                message = "This clears scheduler state. Continue?"
-            else:
-                message = f"Run {component} Job?"
-            if self._confirm(message):
-                manifest = self.operator.run_component(component)
-                self.output(f"Manifest: {manifest}")
-        elif choice == "5":
-            if self._confirm("Create artifact-shell pod if missing to read artifacts?"):
-                run_id = self.input("Run ID (or latest): ").strip() or "latest"
-                artifact = self.input("Artifact: ").strip()
-                result = self.operator.artifact(run_id, artifact)
-                self.output(result.path)
-                self.output(result.content)
-        elif choice == "6":
-            if self._confirm("This clears scheduler state. Continue?"):
-                manifest = self.operator.run_component("reset-state")
-                self.output(f"Manifest: {manifest}")
-        elif choice == "7":
-            component = self._select_cronjob()
-            if self._confirm(f"Suspend CronJob {cronjob_for_component(component)}?"):
-                self.output(str(self.operator.set_cronjob_suspend(component, True)))
-        elif choice == "8":
-            component = self._select_cronjob()
-            if self._confirm(f"Resume CronJob {cronjob_for_component(component)}?"):
-                self.output(str(self.operator.set_cronjob_suspend(component, False)))
-        elif choice == "9":
-            if self._confirm("Create artifact-shell pod if missing and open shell?"):
-                self.operator.shell()
-        elif choice == "10":
-            image = self.input("Image: ").strip()
-            preserve_source = self._select("Preserve config", ["none", "local generated config", "cluster config"])
-            apply = self._confirm("Apply generated manifests to the cluster?")
-            run_doctor = self._confirm("Run doctor after apply?")
-            cleanup_failed = self._confirm("Cleanup failed resources after apply?")
-            report = self.operator.upgrade(
-                image=image,
-                apply=apply,
-                preserve_local_config=preserve_source == "local generated config",
-                preserve_cluster_config=preserve_source == "cluster config",
-                run_doctor=run_doctor,
-                cleanup_failed=cleanup_failed,
-            )
-            self.output(format_upgrade_report(report))
-        elif choice == "11":
-            resources = self.operator.failed_resources()
-            self.output(format_failed_resources(resources, namespace=self.operator.namespace))
-            if resources.found and self._confirm("Delete failed AgentLab resources?"):
-                self.output(format_cleanup_report(self.operator.cleanup_failed()))
-        elif choice == "12":
-            return False
-        else:
-            self.output("Unknown selection.")
+        try:
+            action = self._select_main(choice)
+            if action == "status":
+                self.output(format_status(self.operator.status()))
+            elif action == "runs":
+                if self._confirm("Create artifact-shell pod if missing to list runs?", default=True):
+                    self.output(format_runs(self.operator.runs()))
+            elif action == "logs":
+                self._show_logs()
+            elif action == "run":
+                self._run_job()
+            elif action == "artifact":
+                self._show_artifact()
+            elif action == "reset-state":
+                if self._confirm("This clears scheduler state. Continue?", default=False):
+                    manifest = self.operator.run_component("reset-state")
+                    self.output(f"Manifest: {manifest}")
+            elif action == "suspend":
+                component = self._select_cronjob()
+                if self._confirm(f"Suspend CronJob {cronjob_for_component(component)}?", default=False):
+                    self.output(str(self.operator.set_cronjob_suspend(component, True)))
+            elif action == "resume":
+                component = self._select_cronjob()
+                if self._confirm(f"Resume CronJob {cronjob_for_component(component)}?", default=False):
+                    self.output(str(self.operator.set_cronjob_suspend(component, False)))
+            elif action == "shell":
+                if self._confirm("Create artifact-shell pod if missing and open shell?", default=False):
+                    self.operator.shell()
+            elif action == "upgrade":
+                self._upgrade()
+            elif action == "cleanup":
+                resources = self.operator.failed_resources()
+                self.output(format_failed_resources(resources, namespace=self.operator.namespace))
+                if resources.found and self._confirm("Delete failed AgentLab resources?", default=False):
+                    self.output(format_cleanup_report(self.operator.cleanup_failed()))
+            elif action == "quit":
+                return False
+        except TuiCancelled:
+            self.output("Cancelled.")
+        except K8sOperatorError as exc:
+            self.output(str(exc))
         return True
 
     def run(self) -> None:
         keep_running = True
         while keep_running:
-            self.output(
-                "\n".join(
-                    [
-                        "1. Status anzeigen",
-                        "2. Recent runs anzeigen",
-                        "3. Logs ansehen",
-                        "4. Job starten",
-                        "5. Artifact ansehen",
-                        "6. Scheduler state resetten",
-                        "7. CronJob pausieren",
-                        "8. CronJob fortsetzen",
-                        "9. Artifact shell öffnen",
-                        "10. Upgrade / reconcile deployment",
-                        "11. Cleanup failed resources",
-                        "12. Beenden",
-                    ]
-                )
-            )
-            keep_running = self.run_once(self.input("Auswahl: ").strip())
+            try:
+                keep_running = self.run_once(self.adapter.select("Auswahl", self.MAIN_CHOICES, default="status"))
+            except TuiCancelled:
+                self.output("Cancelled.")
+                return
+
+    def _select_main(self, choice: str) -> str:
+        return resolve_tui_choice(choice, self.MAIN_CHOICES)
+
+    def _show_logs(self) -> None:
+        component = self._select_component(include_reset=False)
+        job_name = self.operator.latest_job_name(component)
+        logs = self.operator.job_logs(job_name, follow=False)
+        self.output(f"Selected Job: {job_name}")
+        if logs:
+            self.output(logs)
+
+    def _run_job(self) -> None:
+        component = self._select_component(include_reset=True)
+        if component == "action":
+            message = "This may create or update a Merge Request. Continue?"
+        elif component == "reset-state":
+            message = "This clears scheduler state. Continue?"
+        else:
+            message = f"Run {component} Job?"
+        if self._confirm(message, default=False):
+            manifest = self.operator.run_component(component)
+            self.output(f"Manifest: {manifest}")
+
+    def _show_artifact(self) -> None:
+        if not self._confirm("Create artifact-shell pod if missing to read artifacts?", default=True):
+            return
+        self._ensure_artifact_shell()
+        run_id = self._select_run_id()
+        resolved_run_id = self._resolve_run_id(run_id)
+        if not resolved_run_id:
+            return
+        self.output(f"Run ID: {resolved_run_id}")
+        artifacts = self.operator.available_artifacts(resolved_run_id)
+        if not artifacts:
+            self.output(f"No artifacts found for run {resolved_run_id}")
+            return
+        self.output("Available artifacts:")
+        artifact = self._select_artifact(artifacts)
+        if artifact is None:
+            return
+        try:
+            result = self.operator.artifact(resolved_run_id, artifact)
+        except ArtifactNotFoundError as exc:
+            self.output(str(exc))
+            self.output("Available artifacts:")
+            if exc.available_artifacts:
+                for available in exc.available_artifacts:
+                    self.output(f"- {available}")
+            else:
+                self.output("- none")
+            return
+        self.output(result.path)
+        if result.content:
+            self.output(result.content)
+
+    def _ensure_artifact_shell(self) -> None:
+        ensure = getattr(self.operator, "ensure_artifact_shell", None)
+        if callable(ensure):
+            ensure()
+
+    def _select_run_id(self) -> str:
+        try:
+            runs = self.operator.runs(limit=20)
+            run_ids = [item.run_id for item in runs]
+        except Exception as exc:
+            self.output(f"Could not list recent runs: {exc}")
+            return self.adapter.text("Run ID", default="latest")
+        choices = ["latest", *[run_id for run_id in run_ids if run_id != "latest"]]
+        return self.adapter.select("Run ID", choices, default="latest")
+
+    def _resolve_run_id(self, run_id: str) -> str | None:
+        if run_id != "latest":
+            return run_id
+        try:
+            return self.operator.latest_run_id()
+        except K8sOperatorError as exc:
+            self.output(str(exc))
+            return None
+
+    def _select_artifact(self, artifacts: list[str]) -> str | None:
+        try:
+            return self.adapter.select("Artifact name", artifacts)
+        except K8sOperatorError as exc:
+            if str(exc) == "Artifact name is required.":
+                self.output("Artifact name is required.")
+                return None
+            raise
+
+    def _upgrade(self) -> None:
+        image = self.adapter.text("Image (example: 10.159.21.58:5000/agentlab:0.1.17)").strip()
+        if not image:
+            self.output("Image is required. Upgrade cancelled.")
+            return
+        preserve_source = self._select("Preserve config", self.PRESERVE_CHOICES)
+        apply = self._confirm("Apply generated manifests to the cluster?", default=False)
+        run_doctor = False
+        cleanup_failed = False
+        if apply:
+            run_doctor = self._confirm("Run doctor after apply?", default=True)
+            cleanup_failed = self._confirm("Cleanup failed resources after successful apply?", default=True)
+            self.output("Upgrade will apply generated manifests to the cluster.")
+            self.output(f"Image: {image}")
+            self.output(f"Preserve config: {preserve_source}")
+            self.output(f"Run doctor: {'yes' if run_doctor else 'no'}")
+            self.output(f"Cleanup failed: {'yes' if cleanup_failed else 'no'}")
+            if not self._confirm("Continue?", default=False):
+                self.output("Upgrade cancelled.")
+                return
+        report = self.operator.upgrade(
+            image=image,
+            apply=apply,
+            preserve_local_config=preserve_source == "local generated config",
+            preserve_cluster_config=preserve_source == "cluster config",
+            run_doctor=run_doctor,
+            cleanup_failed=cleanup_failed,
+        )
+        self.output(format_upgrade_report(report))
 
     def _select_component(self, *, include_reset: bool) -> str:
-        values = ["watch", "plan", "action", "review-comments", "doctor"]
-        if include_reset:
-            values.append("reset-state")
-        return self._select("Component", values)
+        return self._select("Component", self.RUN_COMPONENT_CHOICES if include_reset else self.COMPONENT_CHOICES)
 
     def _select_cronjob(self) -> str:
-        return self._select("CronJob", ["watch", "plan", "action", "review-comments"])
+        return self._select("CronJob", self.CRONJOB_CHOICES)
 
-    def _select(self, label: str, values: list[str]) -> str:
-        for index, value in enumerate(values, start=1):
-            self.output(f"{index}. {value}")
-        raw = self.input(f"{label}: ").strip()
+    def _select(self, label: str, values: list[str | TuiChoice]) -> str:
+        return self.adapter.select(label, values)
+
+    def _confirm(self, message: str, *, default: bool = False) -> bool:
         try:
-            return values[int(raw) - 1]
-        except (ValueError, IndexError) as exc:
-            raise K8sOperatorError(f"invalid {label} selection: {raw}") from exc
-
-    def _confirm(self, message: str) -> bool:
-        if self.confirm_func is not None:
-            return self.confirm_func(message)
-        return self.input(f"{message} [y/N] ").strip().lower() in {"y", "yes"}
+            if self.confirm_func is not None:
+                return self.confirm_func(message)
+            return self.adapter.confirm(message, default=default)
+        except KeyboardInterrupt as exc:
+            raise TuiCancelled("Cancelled.") from exc
 
 
 def run_tui(
@@ -2108,6 +2363,13 @@ def run_tui(
     if not stdin.isatty() or not stdout.isatty():
         raise TuiUnavailableError(
             "Interactive TUI requires a TTY. Use `agentlab k8s status`, "
-            "`agentlab k8s logs <component>`, or `agentlab k8s run <component>` instead."
+            "`agentlab k8s logs <component>`, `agentlab k8s run <component>`, "
+            "`agentlab k8s artifact latest <artifact>`, or "
+            "`agentlab k8s upgrade --image <image>` instead."
         )
-    K8sTUI(operator, input_func=input_func, output_func=output_func).run()
+    K8sTUI(
+        operator,
+        input_func=input_func,
+        output_func=output_func,
+        adapter=create_tui_adapter(input_func=input_func, output_func=output_func),
+    ).run()
