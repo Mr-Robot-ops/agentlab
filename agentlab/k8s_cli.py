@@ -118,6 +118,7 @@ def run(
     namespace: str = typer.Option(DEFAULT_NAMESPACE, "--namespace"),
     manifest_dir: Path = typer.Option(DEFAULT_MANIFEST_DIR, "--manifest-dir"),
     follow: bool = typer.Option(True, "--follow/--no-follow"),
+    task_id: str | None = typer.Option(None, "--task-id", help="Run a specific approved scheduler task ID. Only valid with action."),
 ) -> None:
     """Run a generated AgentLab Kubernetes Job manifest."""
     operator = _operator(namespace, manifest_dir)
@@ -128,7 +129,7 @@ def run(
         _fail(str(exc))
     typer.echo(f"Manifest: {manifest}")
     try:
-        operator.run_component(component, follow=False)
+        operator.run_component(component, follow=False, task_id=task_id)
         if follow:
             operator.job_logs(job_name, follow=True)
     except K8sOperatorError as exc:

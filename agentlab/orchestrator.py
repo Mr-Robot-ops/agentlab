@@ -237,20 +237,67 @@ class Orchestrator:
             raise RuntimeError("preflight failed: " + ", ".join(failed))
         return report
 
-    def full_flow(self) -> dict[str, object]:
-        self.audit.emit(agent="orchestrator", action="full_flow", status="started")
+    def full_flow(
+        self,
+        *,
+        task_id: str | None = None,
+        approved_plan: TaskPlan | None = None,
+        auto_approval_report: dict[str, Any] | None = None,
+    ) -> dict[str, object]:
+        self.audit.emit(agent="orchestrator", action="full_flow", status="started", metadata={"selected_task_id": task_id})
         try:
-            plan = self.plan()
-            approved_plan, auto_approval_report = AutoApprovalPolicy(self.config).apply(plan)
+            if approved_plan is None:
+                plan = self.plan()
+                approved_plan, auto_approval_report = AutoApprovalPolicy(self.config).apply(plan)
+            else:
+                auto_approval_report = auto_approval_report or _auto_approval_report_from_approved_plan(approved_plan, task_id)
             self.artifacts.write_json("auto_approval_report", auto_approval_report)
             if self.config.auto_approve.enabled:
                 self.artifacts.write_json("approved_plan", approved_plan)
+            if task_id is not None:
+                matching = [task for task in approved_plan.tasks if task.id == task_id]
+                if not matching:
+                    result = {
+                        "run_id": self.run_id,
+                        "status": "blocked",
+                        "reason": "selected task not found in approved plan",
+                        "selected_task_id": task_id,
+                        "plan": approved_plan.model_dump(mode="json"),
+                        "auto_approval": auto_approval_report,
+                    }
+                    self.audit.emit(
+                        agent="orchestrator",
+                        action="full_flow",
+                        status="blocked",
+                        metadata={"reason": result["reason"], "selected_task_id": task_id},
+                        output_payload=result,
+                    )
+                    return result
+                task = matching[0]
+                if not task.approved:
+                    result = {
+                        "run_id": self.run_id,
+                        "status": "blocked",
+                        "reason": "selected task is not approved",
+                        "selected_task_id": task_id,
+                        "plan": approved_plan.model_dump(mode="json"),
+                        "auto_approval": auto_approval_report,
+                    }
+                    self.audit.emit(
+                        agent="orchestrator",
+                        action="full_flow",
+                        status="blocked",
+                        metadata={"reason": result["reason"], "selected_task_id": task_id},
+                        output_payload=result,
+                    )
+                    return result
             approved_tasks = [task for task in approved_plan.tasks if task.approved]
             if not approved_tasks:
                 result = {
                     "run_id": self.run_id,
                     "status": "blocked",
                     "reason": "no approved task available for implementation",
+                    "selected_task_id": task_id,
                     "plan": approved_plan.model_dump(mode="json"),
                     "auto_approval": auto_approval_report,
                 }
@@ -262,14 +309,21 @@ class Orchestrator:
                     output_payload=result,
                 )
                 return result
-            if self.config.auto_approve.enabled:
+            if task_id is None and self.config.auto_approve.enabled:
                 task = AutoApprovalPolicy.select_task(approved_tasks)
                 assert task is not None
-            else:
+            elif task_id is None:
                 task = approved_tasks[0]
+            self.artifacts.write_json(
+                "selected_task",
+                {
+                    "selected_task_id": task.id,
+                    "selection_mode": "requested" if task_id is not None else "auto",
+                },
+            )
             implementation = self.run_task(task)
             if implementation.status != ReportStatus.PASSED:
-                result = {"run_id": self.run_id, "status": "failed", "implementation": implementation.model_dump(mode="json")}
+                result = {"run_id": self.run_id, "status": "failed", "selected_task_id": task.id, "implementation": implementation.model_dump(mode="json")}
                 self.audit.emit(
                     agent="orchestrator",
                     action="full_flow",
@@ -313,6 +367,7 @@ class Orchestrator:
             result = {
                 "run_id": self.run_id,
                 "status": "passed" if decision.allowed else "blocked",
+                "selected_task_id": task.id,
                 "implementation": implementation.model_dump(mode="json"),
                 "merge_request": mr_result,
                 "gate": decision.model_dump(mode="json"),
@@ -1053,6 +1108,34 @@ def _review_task_type(command: str, affected_files: list[str]) -> TaskType:
     if command == "fix":
         return TaskType.BUGFIX
     return TaskType.DOCS if not normalized else TaskType.REFACTOR
+
+
+def _auto_approval_report_from_approved_plan(plan: TaskPlan, selected_task_id: str | None) -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "policy_name": "auto_approval",
+        "policy_version": "from_approved_plan",
+        "evaluated_tasks": [
+            {
+                "task_id": task.id,
+                "approved": task.approved,
+                "reasons": ["loaded_from_approved_plan"],
+                "details": {},
+            }
+            for task in plan.tasks
+        ],
+        "approved_tasks": [task.id for task in plan.tasks if task.approved],
+        "rejected_tasks": [
+            {
+                "task_id": task.id,
+                "reasons": ["not_approved_in_approved_plan"],
+                "details": {},
+            }
+            for task in plan.tasks
+            if not task.approved
+        ],
+        "selected_task_id": selected_task_id,
+    }
 
 
 README_BASE_CONTEXT_RE = re.compile(

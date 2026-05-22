@@ -136,6 +136,74 @@ def test_full_flow_uses_auto_approved_task() -> None:
     assert report["selected_task_id"] == "docs-readme"
 
 
+def test_full_flow_with_task_id_uses_matching_approved_task() -> None:
+    config = AppConfig(
+        gitlab_url="https://gitlab.example.com",
+        project_id=1,
+        target_repo_path=Path("."),
+        workspace_root=Path(".runs"),
+        push_agent_branches_enabled=False,
+        auto_approve={"enabled": True},
+    )
+    orchestrator = DummyOrchestrator(config)
+    approved_plan = TaskPlan(
+        tasks=[
+            AgentTask(id="docs-01-credentials", title="Docs", approved=True),
+            AgentTask(id="tests-02-smoke-baseline", title="Tests", approved=True),
+        ]
+    )
+
+    result = orchestrator.full_flow(task_id="tests-02-smoke-baseline", approved_plan=approved_plan)
+
+    assert result["status"] == "passed"
+    assert result["selected_task_id"] == "tests-02-smoke-baseline"
+    assert result["implementation"]["task_id"] == "tests-02-smoke-baseline"
+    selected = orchestrator.artifacts.payloads["selected_task"]
+    assert isinstance(selected, dict)
+    assert selected["selected_task_id"] == "tests-02-smoke-baseline"
+    assert selected["selection_mode"] == "requested"
+
+
+def test_full_flow_with_unknown_task_id_does_not_fall_back() -> None:
+    config = AppConfig(
+        gitlab_url="https://gitlab.example.com",
+        project_id=1,
+        target_repo_path=Path("."),
+        workspace_root=Path(".runs"),
+        push_agent_branches_enabled=False,
+        auto_approve={"enabled": True},
+    )
+    orchestrator = DummyOrchestrator(config)
+    approved_plan = TaskPlan(tasks=[AgentTask(id="docs-01-credentials", title="Docs", approved=True)])
+
+    result = orchestrator.full_flow(task_id="tests-02-smoke-baseline", approved_plan=approved_plan)
+
+    assert result["status"] == "blocked"
+    assert result["reason"] == "selected task not found in approved plan"
+    assert result["selected_task_id"] == "tests-02-smoke-baseline"
+    assert "implementation_report" not in orchestrator.artifacts.payloads
+
+
+def test_full_flow_with_rejected_task_id_does_not_fall_back() -> None:
+    config = AppConfig(
+        gitlab_url="https://gitlab.example.com",
+        project_id=1,
+        target_repo_path=Path("."),
+        workspace_root=Path(".runs"),
+        push_agent_branches_enabled=False,
+        auto_approve={"enabled": True},
+    )
+    orchestrator = DummyOrchestrator(config)
+    approved_plan = TaskPlan(tasks=[AgentTask(id="tests-02-smoke-baseline", title="Tests", approved=False)])
+
+    result = orchestrator.full_flow(task_id="tests-02-smoke-baseline", approved_plan=approved_plan)
+
+    assert result["status"] == "blocked"
+    assert result["reason"] == "selected task is not approved"
+    assert result["selected_task_id"] == "tests-02-smoke-baseline"
+    assert "implementation_report" not in orchestrator.artifacts.payloads
+
+
 class FakeReadmeGit:
     def diff(self, base: str = "main") -> str:
         return "diff --git a/README.md b/README.md\n"

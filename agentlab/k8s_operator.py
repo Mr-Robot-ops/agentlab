@@ -351,15 +351,20 @@ class K8sOperator:
             return self._stream_with_retry(args)
         return self._logs_with_retry(args)
 
-    def run_component(self, component: str, *, follow: bool = True) -> str:
+    def run_component(self, component: str, *, follow: bool = True, task_id: str | None = None) -> str:
         manifest = manifest_for_component(component, self.manifest_dir)
         if not manifest.exists():
             raise MissingManifestError(
                 f"missing manifest: {manifest}. Re-run Kubernetes bootstrap to generate {manifest.name}."
             )
+        if task_id is not None and component != "action":
+            raise K8sOperatorError("--task-id is only supported for the action component")
         job_name = run_job_name_for_component(component)
         self._run(["delete", "job", job_name, "--ignore-not-found=true"])
-        self._run(["apply", "-f", str(manifest)])
+        if task_id is not None:
+            self._run(["apply", "-f", "-"], input_text=_manifest_with_task_id(manifest, task_id))
+        else:
+            self._run(["apply", "-f", str(manifest)])
         if follow:
             self.job_logs(job_name, follow=True)
         return str(manifest)
@@ -1272,6 +1277,29 @@ def _log_snippet(logs: str, *, limit: int = 500) -> str:
     if len(snippet) > limit:
         return snippet[: limit - 3] + "..."
     return snippet
+
+
+def _manifest_with_task_id(path: Path, task_id: str) -> str:
+    _validate_task_id(task_id)
+    manifest = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    try:
+        containers = manifest["spec"]["template"]["spec"]["containers"]
+        args = list(containers[0].get("args") or [])
+    except (KeyError, IndexError, TypeError) as exc:
+        raise K8sOperatorError(f"could not add --task-id to generated Job manifest: {path}") from exc
+    if not args:
+        raise K8sOperatorError(f"could not add --task-id to generated Job manifest without args: {path}")
+    if "--task-id" in args:
+        index = args.index("--task-id")
+        args = args[:index] + args[index + 2 :]
+    containers[0]["args"] = [*args, "--task-id", task_id]
+    return yaml.safe_dump(manifest, sort_keys=False)
+
+
+def _validate_task_id(task_id: str) -> None:
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_")
+    if not task_id or any(char not in allowed for char in task_id):
+        raise K8sOperatorError("task_id may only contain letters, numbers, hyphen and underscore")
 
 
 class K8sTUI:
