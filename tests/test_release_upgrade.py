@@ -7,6 +7,7 @@ from typer.testing import CliRunner
 
 from agentlab.k8s_operator import ClusterStatus
 from agentlab.main import app
+import agentlab.release_upgrade as release_upgrade
 from agentlab.release_upgrade import (
     ReleaseCommandResult,
     ReleaseUpgradeError,
@@ -93,7 +94,8 @@ def test_dry_run_prints_planned_commands_and_executes_nothing(tmp_path: Path) ->
     assert "git pull" in rendered
     assert "docker build -t registry/agentlab:new ." in rendered
     assert "agentlab k8s upgrade" in rendered
-    assert "python3" not in rendered
+    assert next(step.command for step in report.steps if step.name == "Tests") == [sys.executable, "-m", "pytest"]
+    assert ["python3", "-m", "pytest"] not in [step.command for step in report.steps]
 
 
 def test_dirty_repo_without_allow_dirty_fails_before_tests_or_build(tmp_path: Path) -> None:
@@ -266,10 +268,13 @@ def test_successful_apply_flow_runs_steps_in_order(tmp_path: Path) -> None:
     assert report.failed_step is None
 
 
-def test_release_upgrade_cli_dry_run_invocation() -> None:
+def test_release_upgrade_cli_dry_run_invocation(monkeypatch) -> None:
+    monkeypatch.setattr(release_upgrade.sys, "executable", "agentlab-current-python")
+
     result = CliRunner().invoke(app, ["release", "upgrade", "--image", "registry/agentlab:new", "--dry-run"])
 
     assert result.exit_code == 0
     assert "AgentLab release upgrade" in result.output
     assert "docker build -t registry/agentlab:new ." in result.output
-    assert "python3" not in result.output
+    assert "agentlab-current-python -m pytest" in result.output
+    assert "Command: python3 -m pytest" not in result.output
