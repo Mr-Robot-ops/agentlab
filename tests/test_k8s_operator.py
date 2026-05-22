@@ -1114,8 +1114,8 @@ def test_cleanup_failed_deletes_only_selected_agentlab_jobs_and_pods() -> None:
     assert report.deleted_pods == ["agentlab-failed-pod"]
     delete_calls = [call[0] for call in runner.calls if "delete" in call[0]]
     assert delete_calls == [
-        ["-n", "agentlab", "delete", "job", "agentlab-failed"],
-        ["-n", "agentlab", "delete", "pod", "agentlab-failed-pod"],
+        ["-n", "agentlab", "delete", "job", "agentlab-failed", "--ignore-not-found=true"],
+        ["-n", "agentlab", "delete", "pod", "agentlab-failed-pod", "--ignore-not-found=true"],
     ]
     assert not any(resource in call for call in delete_calls for resource in ("cronjob", "pvc", "configmap", "secret", "serviceaccount"))
 
