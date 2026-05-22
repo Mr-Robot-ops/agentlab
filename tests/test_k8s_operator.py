@@ -1801,11 +1801,27 @@ def test_questionary_tui_style_uses_pointer_without_background() -> None:
         Style = FakeStyle
 
     style = build_questionary_tui_style(FakeQuestionary)
+    required_keys = {
+        "highlighted",
+        "selected",
+        "pointer",
+        "answer",
+        "text",
+        "instruction",
+        "qmark",
+        "question",
+        "checkbox",
+        "separator",
+        "disabled",
+        "shortcut",
+    }
 
     assert style.rules["pointer"] == "bold"
-    assert style.rules["highlighted"] == "bold"
+    assert style.rules["highlighted"] == ""
     assert style.rules["selected"] == ""
-    assert all("bg:" not in rule for rule in style.rules.values())
+    assert required_keys.issubset(style.rules)
+    assert all("bg:" not in rule.lower() for rule in style.rules.values())
+    assert all("reverse" not in rule.lower() for rule in style.rules.values())
 
 
 def test_create_tui_adapter_missing_questionary_prints_install_hint_once(monkeypatch) -> None:

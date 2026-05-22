@@ -2025,12 +2025,14 @@ QUESTIONARY_TUI_STYLE_RULES = [
     ("question", "bold"),
     ("answer", "bold"),
     ("pointer", "bold"),
-    ("highlighted", "bold"),
+    ("highlighted", ""),
     ("selected", ""),
-    ("separator", ""),
     ("instruction", ""),
     ("text", ""),
+    ("checkbox", ""),
+    ("separator", ""),
     ("disabled", "fg:#888888"),
+    ("shortcut", ""),
 ]
 
 QUESTIONARY_TUI_INSTALL_HINT = (
