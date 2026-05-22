@@ -324,7 +324,7 @@ class K8sOperator:
 
     def run_doctor_job(self) -> str:
         self.run_component("doctor", follow=False)
-        logs = self.job_logs(run_job_name_for_component("doctor"), follow=False)
+        logs = self._doctor_logs_with_status_retry(run_job_name_for_component("doctor"))
         return _doctor_status_from_logs(logs)
 
     def ensure_artifact_shell(self, *, pvc: str = "agentlab-runs", shell_pod: str = "artifact-shell") -> None:
@@ -575,6 +575,23 @@ class K8sOperator:
         if last_result is not None:
             message = (last_result.stderr or last_result.stdout).strip()
         raise K8sOperatorError(message or f"kubectl logs failed: {' '.join(args)}")
+
+    def _doctor_logs_with_status_retry(self, job_name: str) -> str:
+        attempts = max(1, self.log_retry_attempts)
+        last_logs = ""
+        for attempt in range(attempts):
+            logs = self.job_logs(job_name, follow=False)
+            if _doctor_logs_have_status(logs):
+                return logs
+            last_logs = logs
+            if attempt < attempts - 1 and self.log_retry_delay_seconds > 0:
+                time.sleep(self.log_retry_delay_seconds)
+        if last_logs.strip():
+            raise K8sOperatorError(
+                "Doctor logs did not contain an AgentLab doctor status line after retries. "
+                f"Last log snippet: {_log_snippet(last_logs)}"
+            )
+        raise K8sOperatorError("Doctor logs were empty after retries.")
 
     def _stream(self, args: list[str]) -> int:
         return self.runner.stream(self._ns(args))
@@ -1169,6 +1186,24 @@ def _doctor_status_from_logs(logs: str) -> str:
     if "AgentLab doctor: passed" in logs:
         return "passed"
     raise K8sOperatorError("Doctor logs did not contain an AgentLab doctor status line.")
+
+
+def _doctor_logs_have_status(logs: str) -> bool:
+    return any(
+        status_line in logs
+        for status_line in (
+            "AgentLab doctor: passed",
+            "AgentLab doctor: warning",
+            "AgentLab doctor: failed",
+        )
+    )
+
+
+def _log_snippet(logs: str, *, limit: int = 500) -> str:
+    snippet = " ".join(line.strip() for line in logs.splitlines() if line.strip())
+    if len(snippet) > limit:
+        return snippet[: limit - 3] + "..."
+    return snippet
 
 
 class K8sTUI:
