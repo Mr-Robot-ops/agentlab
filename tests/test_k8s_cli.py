@@ -186,7 +186,7 @@ def test_k8s_help_alias_lists_key_commands() -> None:
     result = runner.invoke(app, ["k8s", "help"])
 
     assert result.exit_code == 0
-    for command in ("status", "run", "artifact", "upgrade", "config", "health", "mrs", "tui"):
+    for command in ("status", "mrs", "health", "logs", "run", "artifact", "upgrade", "config", "tui"):
         assert command in result.output
 
 
