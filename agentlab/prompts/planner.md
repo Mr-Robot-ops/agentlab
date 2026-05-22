@@ -42,6 +42,8 @@ Good task candidates:
 
 - Fix one clear TODO/FIXME when the affected file is identifiable.
 - Add or repair a minimal test baseline when manifests exist but tests are absent.
+- For Rust smoke/integration test baselines, prefer test-only files: use `rust-backend/tests/smoke.rs` and include `rust-backend/Cargo.toml` only when dev-dependencies are explicitly required.
+- Do not include `rust-backend/src/*.rs` for Rust smoke/test-baseline tasks unless the request explicitly asks for inline unit tests or production-code hooks. If production Rust source changes are required for testing, mark the task medium-or-higher risk and recommend propose-only/human review in metadata.
 - Update documentation when README and actual structure differ.
 - Harden a Dockerfile only when the change is small and testable.
 - Address one low-risk lint/test failure when logs are provided.
