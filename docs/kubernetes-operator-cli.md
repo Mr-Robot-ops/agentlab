@@ -251,13 +251,39 @@ Open the interactive menu:
 agentlab k8s tui
 ```
 
-When `questionary` is installed, the TUI uses arrow-key selection and Enter for menus. Install the optional TUI dependency when packaging AgentLab for interactive operators:
+When `questionary` is installed, the TUI uses arrow-key selection and Enter for menus. You can verify arrow-key mode by the `Use arrow keys` hint in the prompt.
+
+For editable/dev installs, install the optional TUI extra from the repository root:
 
 ```bash
-python -m pip install 'agentlab[tui]'
+python -m pip install -e '.[tui]'
 ```
 
-Without `questionary`, AgentLab uses the numbered fallback prompt. The fallback accepts either the displayed number or a short command name:
+For a normal source checkout install, use:
+
+```bash
+python -m pip install '.[tui]'
+```
+
+If you only need the prompt dependency, install it directly:
+
+```bash
+python -m pip install questionary
+```
+
+You can check support without launching the TUI:
+
+```bash
+agentlab k8s tui-check
+```
+
+To install the optional extra intentionally with the current Python interpreter:
+
+```bash
+agentlab k8s tui-check --install
+```
+
+Without `questionary`, AgentLab prints a one-time hint and uses the numbered fallback prompt. The fallback accepts either the displayed number or a short command name:
 
 ```text
 status

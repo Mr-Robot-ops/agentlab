@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import importlib.util
 import json
+import subprocess
+import sys
 from dataclasses import asdict
 from pathlib import Path
 
@@ -32,6 +35,8 @@ from agentlab.k8s_operator import (
 k8s_app = typer.Typer(help="Operate AgentLab Kubernetes runtime resources.")
 config_app = typer.Typer(help="Read and safely update allowed AgentLab ConfigMap settings.")
 k8s_app.add_typer(config_app, name="config")
+
+TUI_INSTALL_COMMAND_DISPLAY = "python -m pip install -e '.[tui]'"
 
 LOG_COMPONENT_COMPLETIONS = ("latest", "watch", "plan", "action", "review-comments", "doctor")
 RUN_COMPONENT_COMPLETIONS = ("watch", "plan", "action", "review-comments", "doctor", "reset-state")
@@ -96,6 +101,14 @@ def _fail(message: str, *, code: int = 1) -> None:
     raise typer.Exit(code=code)
 
 
+def _questionary_available() -> bool:
+    return importlib.util.find_spec("questionary") is not None
+
+
+def _tui_install_command() -> list[str]:
+    return [sys.executable, "-m", "pip", "install", "-e", ".[tui]"]
+
+
 def _format_config_value(value: object, *, exists: bool = True) -> str:
     if not exists:
         return "<unset>"
@@ -124,6 +137,31 @@ def help_command(ctx: typer.Context) -> None:
     """Show help for AgentLab Kubernetes commands."""
     parent = ctx.parent
     typer.echo(parent.get_help() if parent is not None else ctx.get_help())
+
+
+@k8s_app.command("tui-check")
+def tui_check(
+    install: bool = typer.Option(
+        False,
+        "--install",
+        help="Install optional questionary support for arrow-key TUI navigation.",
+    ),
+) -> None:
+    """Check whether optional arrow-key TUI support is available."""
+    if _questionary_available():
+        typer.echo("Arrow-key TUI support: available")
+        return
+
+    typer.echo("Arrow-key TUI support: missing")
+    typer.echo(f"Install with: {TUI_INSTALL_COMMAND_DISPLAY}")
+    if not install:
+        return
+
+    command = _tui_install_command()
+    typer.echo(f"Running: {sys.executable} -m pip install -e '.[tui]'")
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        _fail(f"questionary install failed with exit code {result.returncode}", code=result.returncode)
 
 
 @k8s_app.command()
