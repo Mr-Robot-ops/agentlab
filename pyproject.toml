@@ -19,6 +19,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.2"]
+tui = ["questionary>=2.0"]
 
 [project.scripts]
 agentlab = "agentlab.main:app"
