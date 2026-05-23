@@ -14,6 +14,7 @@ from agentlab.k8s_operator import (
     DEPRECATED_K8S_IMAGE_ANNOTATION_WARNING,
     FailedResources,
     K8S_IMAGE_ANNOTATION,
+    K8S_VERSION_ANNOTATION,
     K8sOperator,
     K8sOperatorError,
     K8sTUI,
@@ -658,6 +659,44 @@ def test_status_prefers_new_image_annotation_when_both_exist() -> None:
     assert status.configmap_image == "registry/agentlab:new"
 
 
+def test_status_ignores_unowned_github_pages_image_annotation() -> None:
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"],
+        json.dumps({"metadata": {"annotations": {"agentlab.github.io/agentlab-image": "registry/agentlab:wrong"}}}),
+    )
+    runner.respond(
+        ["-n", "agentlab", "get", "cronjobs", "-o", "json"],
+        json.dumps({"items": []}),
+    )
+    runner.respond(["-n", "agentlab", "get", "jobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(["-n", "agentlab", "get", "pods", "-o", "json"], json.dumps({"items": []}))
+
+    status = K8sOperator(runner=runner).status()
+
+    assert status.configmap_image is None
+    assert status.image_annotation_warning is None
+
+
+def test_status_reads_release_version_annotation() -> None:
+    runner = FakeRunner()
+    runner.respond(
+        ["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"],
+        json.dumps({"metadata": {"annotations": {K8S_VERSION_ANNOTATION: "v0.1.18"}}}),
+    )
+    runner.respond(
+        ["-n", "agentlab", "get", "cronjobs", "-o", "json"],
+        json.dumps({"items": []}),
+    )
+    runner.respond(["-n", "agentlab", "get", "jobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(["-n", "agentlab", "get", "pods", "-o", "json"], json.dumps({"items": []}))
+
+    status = K8sOperator(runner=runner).status()
+
+    assert status.configmap_version == "v0.1.18"
+    assert "ConfigMap version: v0.1.18" in format_status(status)
+
+
 def test_manifest_image_drift_detection(tmp_path: Path) -> None:
     (tmp_path / "configmap.yaml").write_text(
         """
@@ -731,6 +770,19 @@ def test_upgrade_migrates_deprecated_configmap_image_annotation(tmp_path: Path) 
     migrated = yaml.safe_load((tmp_path / "configmap.yaml").read_text(encoding="utf-8"))
     assert migrated["metadata"]["annotations"][K8S_IMAGE_ANNOTATION] == "registry/agentlab:new"
     assert DEPRECATED_K8S_IMAGE_ANNOTATION not in migrated["metadata"]["annotations"]
+
+
+def test_upgrade_writes_release_version_annotation(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path)
+
+    report = K8sOperator(manifest_dir=tmp_path, runner=FakeRunner()).upgrade(
+        image="registry/agentlab:new",
+        version="v0.1.18",
+    )
+
+    configmap = yaml.safe_load((tmp_path / "configmap.yaml").read_text(encoding="utf-8"))
+    assert configmap["metadata"]["annotations"][K8S_VERSION_ANNOTATION] == "v0.1.18"
+    assert report.version == "v0.1.18"
 
 
 def test_upgrade_preserves_selected_local_config_sections(tmp_path: Path) -> None:

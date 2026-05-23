@@ -407,6 +407,7 @@ def cleanup_failed(
 @k8s_app.command()
 def upgrade(
     image: str = typer.Option(..., "--image", help="New AgentLab container image for generated manifests."),
+    version: str | None = typer.Option(None, "--version", help="AgentLab release version to write to generated manifests."),
     namespace: str = typer.Option(DEFAULT_NAMESPACE, "--namespace"),
     manifest_dir: Path = typer.Option(DEFAULT_MANIFEST_DIR, "--manifest-dir"),
     apply: bool = typer.Option(False, "--apply/--no-apply"),
@@ -427,15 +428,18 @@ def upgrade(
             typer.echo("Upgrade cancelled.")
             return
     try:
-        report = operator.upgrade(
-            image=image,
-            apply=apply,
-            preserve_cluster_config=preserve_cluster_config,
-            preserve_local_config=preserve_local_config,
-            run_doctor=run_doctor,
-            show_status=status,
-            cleanup_failed=cleanup_failed,
-        )
+        kwargs = {
+            "image": image,
+            "apply": apply,
+            "preserve_cluster_config": preserve_cluster_config,
+            "preserve_local_config": preserve_local_config,
+            "run_doctor": run_doctor,
+            "show_status": status,
+            "cleanup_failed": cleanup_failed,
+        }
+        if version:
+            kwargs["version"] = version
+        report = operator.upgrade(**kwargs)
     except K8sOperatorError as exc:
         _fail(str(exc))
     typer.echo(format_upgrade_report(report))

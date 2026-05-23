@@ -26,6 +26,7 @@ DEFAULT_MANIFEST_DIR = Path("deploy/kubernetes/generated")
 RUNS_ROOT = "/var/lib/agentlab/runs"
 ARTIFACT_SHELL_IMAGE = "busybox:1.36"
 K8S_IMAGE_ANNOTATION = "mr-robot-ops.github.io/agentlab-image"
+K8S_VERSION_ANNOTATION = "mr-robot-ops.github.io/agentlab-version"
 DEPRECATED_K8S_IMAGE_ANNOTATION = "agentlab.io/image"
 DEPRECATED_K8S_IMAGE_ANNOTATION_WARNING = (
     f"Deprecated annotation key `{DEPRECATED_K8S_IMAGE_ANNOTATION}` found; "
@@ -269,6 +270,7 @@ class ManifestImageDrift:
 class ClusterStatus:
     namespace: str
     configmap_image: str | None
+    configmap_version: str | None = None
     image_annotation_warning: str | None = None
     open_agent_mrs: list[dict[str, Any]] = field(default_factory=list)
     open_agent_mrs_count: int | None = None
@@ -278,6 +280,7 @@ class ClusterStatus:
     failed_jobs: list[JobStatus] = field(default_factory=list)
     failed_pods: list[PodStatus] = field(default_factory=list)
     manifest_configmap_image: str | None = None
+    manifest_configmap_version: str | None = None
     manifest_image_annotation_warning: str | None = None
     manifest_image_drifts: list[ManifestImageDrift] = field(default_factory=list)
 
@@ -322,6 +325,7 @@ class UpgradeReport:
     namespace: str
     manifest_dir: str
     image: str
+    version: str | None = None
     updated_manifests: list[str] = field(default_factory=list)
     preserved_sections: list[str] = field(default_factory=list)
     apply: bool = False
@@ -393,6 +397,7 @@ class K8sOperator:
     def status(self, *, manifest_dir: str | Path | None = None) -> ClusterStatus:
         configmap = self._run_json(["get", "configmap", "agentlab-config", "-o", "json"], check=False)
         configmap_image = _configmap_image(configmap)
+        configmap_version = _configmap_version(configmap)
         image_annotation_warning = _configmap_image_annotation_warning(configmap)
         open_agent_mrs, open_agent_mrs_warning = self._open_agent_mrs_from_configmap(configmap)
         cronjobs = [_cronjob_status(item, configmap_image) for item in self._items("cronjobs")]
@@ -409,6 +414,7 @@ class K8sOperator:
         status = ClusterStatus(
             namespace=self.namespace,
             configmap_image=configmap_image,
+            configmap_version=configmap_version,
             image_annotation_warning=image_annotation_warning,
             open_agent_mrs=open_agent_mrs,
             open_agent_mrs_count=len(open_agent_mrs),
@@ -423,6 +429,7 @@ class K8sOperator:
             status.manifest_configmap_image, status.manifest_image_drifts = detect_manifest_image_drift(Path(manifest_dir))
             if manifest_path.exists():
                 manifest_configmap = yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+                status.manifest_configmap_version = _configmap_version(manifest_configmap)
                 status.manifest_image_annotation_warning = _configmap_image_annotation_warning(manifest_configmap)
         return status
 
@@ -686,6 +693,7 @@ class K8sOperator:
         self,
         *,
         image: str,
+        version: str | None = None,
         apply: bool = False,
         preserve_cluster_config: bool = False,
         preserve_local_config: bool = False,
@@ -709,6 +717,7 @@ class K8sOperator:
         updated = update_generated_manifests(
             manifest_dir=self.manifest_dir,
             image=image,
+            version=version,
             preserved_config=preserved_config,
         )
         expected_image, drifts = detect_manifest_image_drift(self.manifest_dir)
@@ -723,6 +732,7 @@ class K8sOperator:
             namespace=self.namespace,
             manifest_dir=str(self.manifest_dir),
             image=image,
+            version=version,
             updated_manifests=updated["updated_manifests"],
             preserved_sections=updated["preserved_sections"],
             apply=apply,
@@ -1012,6 +1022,7 @@ def update_generated_manifests(
     *,
     manifest_dir: Path,
     image: str,
+    version: str | None = None,
     preserved_config: dict[str, Any] | None = None,
 ) -> dict[str, list[str]]:
     configmap_path = manifest_dir / "configmap.yaml"
@@ -1025,6 +1036,8 @@ def update_generated_manifests(
     annotations = metadata.setdefault("annotations", {})
     annotations.pop(DEPRECATED_K8S_IMAGE_ANNOTATION, None)
     annotations[K8S_IMAGE_ANNOTATION] = image
+    if version:
+        annotations[K8S_VERSION_ANNOTATION] = version
     config = _config_from_configmap_document(configmap)
     if preserved_config:
         preserved_sections = _merge_preserved_config_sections(config, preserved_config)
@@ -1079,6 +1092,7 @@ def format_status(status: ClusterStatus) -> str:
     lines = [
         f"Namespace: {status.namespace}",
         f"ConfigMap image: {status.configmap_image or 'not found'}",
+        f"ConfigMap version: {status.configmap_version or 'not found'}",
         "",
         "CronJobs:",
     ]
@@ -1132,6 +1146,8 @@ def format_status(status: ClusterStatus) -> str:
         warnings.append(f"Generated manifest: {status.manifest_image_annotation_warning}")
     if status.manifest_configmap_image:
         lines.extend(["", f"Generated manifest ConfigMap image: {status.manifest_configmap_image}"])
+    if status.manifest_configmap_version:
+        lines.append(f"Generated manifest ConfigMap version: {status.manifest_configmap_version}")
     if warnings:
         lines.extend(["", "Warnings:"])
         lines.extend(f"- {warning}" for warning in warnings)
@@ -1177,7 +1193,9 @@ def format_health(report: HealthReport) -> str:
         "",
         "Runtime:",
         f"- ConfigMap image: {_display_value(report.images.get('configmap_image'))}",
+        f"- ConfigMap version: {_display_value(report.images.get('configmap_version'))}",
         f"- Generated manifest image: {_display_value(report.images.get('generated_configmap_image'))}",
+        f"- Generated manifest version: {_display_value(report.images.get('generated_configmap_version'))}",
         f"- Image drift: {'none' if not drift else str(len(drift))}",
         f"- Failed jobs: {len(failed_jobs)}",
         f"- Failed pods: {len(failed_pods)}",
@@ -1281,6 +1299,7 @@ def format_upgrade_report(report: UpgradeReport) -> str:
         f"Namespace: {report.namespace}",
         f"Manifest dir: {report.manifest_dir}",
         f"New image: {report.image}",
+        f"New version: {getattr(report, 'version', None) or 'not set'}",
         "",
         "Updated manifests:",
     ]
@@ -1324,7 +1343,9 @@ def _health_images(status: ClusterStatus) -> dict[str, Any]:
     )
     return {
         "configmap_image": status.configmap_image,
+        "configmap_version": status.configmap_version,
         "generated_configmap_image": status.manifest_configmap_image,
+        "generated_configmap_version": status.manifest_configmap_version,
         "cronjobs": [
             {
                 "name": item.name,
@@ -1436,6 +1457,13 @@ def _configmap_image(configmap: dict[str, Any]) -> str | None:
     annotations = metadata.get("annotations") or {}
     image = annotations.get(K8S_IMAGE_ANNOTATION) or annotations.get(DEPRECATED_K8S_IMAGE_ANNOTATION)
     return str(image) if image else None
+
+
+def _configmap_version(configmap: dict[str, Any]) -> str | None:
+    metadata = configmap.get("metadata") or {}
+    annotations = metadata.get("annotations") or {}
+    version = annotations.get(K8S_VERSION_ANNOTATION)
+    return str(version) if version else None
 
 
 def _configmap_image_annotation_warning(configmap: dict[str, Any]) -> str | None:
