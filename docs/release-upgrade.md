@@ -149,7 +149,7 @@ agentlab release upgrade \
   --bootstrap-k8s \
   --gitlab-url https://gitlab.example.com/ \
   --project-id 5 \
-  --target-repo-url https://gitlab.example.com/re/project.git \
+  --target-repo-url https://gitlab.example.com/group/project.git \
   --target-repo-ref main \
   --ollama-url http://127.0.0.1:11434 \
   --model qwen3.6:35b \
