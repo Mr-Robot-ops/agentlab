@@ -146,6 +146,7 @@ class FakeOperator:
                 "namespace": "agentlab",
                 "manifest_dir": "deploy/kubernetes/generated",
                 "image": kwargs["image"],
+                "version": kwargs.get("version"),
                 "updated_manifests": ["configmap.yaml", "job-doctor.yaml"],
                 "preserved_sections": ["auto_approve"] if kwargs.get("preserve_local_config") else [],
                 "apply": kwargs.get("apply", False),
@@ -435,6 +436,17 @@ def test_upgrade_command_invokes_operator_without_apply_by_default(monkeypatch) 
             },
         )
     ]
+
+
+def test_upgrade_command_passes_optional_version(monkeypatch) -> None:
+    fake = FakeOperator()
+    monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
+
+    result = runner.invoke(app, ["k8s", "upgrade", "--image", "registry/agentlab:new", "--version", "v0.1.18"])
+
+    assert result.exit_code == 0
+    assert "New version: v0.1.18" in result.output
+    assert fake.calls[0][1]["version"] == "v0.1.18"
 
 
 def test_upgrade_apply_with_yes_invokes_apply_options(monkeypatch) -> None:

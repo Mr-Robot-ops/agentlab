@@ -193,7 +193,7 @@ metadata:
   name: agentlab-config
   namespace: {namespace}
   annotations:
-    agentlab.io/image: "{image}"
+    mr-robot-ops.github.io/agentlab-image: "{image}"
 data:
   config.yaml: |
 {indent(config_yaml, 4)}

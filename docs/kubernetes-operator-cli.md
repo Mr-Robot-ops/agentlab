@@ -80,7 +80,7 @@ agentlab k8s config set schedule.action.enabled false
 agentlab k8s config set schedule.review_comments.cooldown_minutes 0
 ```
 
-The command validates paths against an allowlist, supports bool, int, and string values, prints before/after values, and patches only `data.config.yaml`. It does not read or modify Secrets, and it leaves ConfigMap metadata and annotations such as `agentlab.io/image` untouched.
+The command validates paths against an allowlist, supports bool, int, and string values, prints before/after values, and patches only `data.config.yaml`. It does not read or modify Secrets, and it leaves ConfigMap metadata and annotations such as `mr-robot-ops.github.io/agentlab-image` untouched.
 
 ## Logs
 
@@ -129,34 +129,40 @@ The command deletes the fixed-name Job if it already exists, applies the generat
 Update all generated manifests to a new AgentLab image:
 
 ```bash
-agentlab k8s upgrade --image 10.159.21.58:5000/agentlab:0.1.13
+agentlab k8s upgrade --image registry.example.com/agentlab:0.1.13
 ```
 
 Apply the generated manifests after updating them:
 
 ```bash
-agentlab k8s upgrade --image 10.159.21.58:5000/agentlab:0.1.13 --apply
+agentlab k8s upgrade --image registry.example.com/agentlab:0.1.13 --apply
+```
+
+Optionally write the release-version annotation at the same time:
+
+```bash
+agentlab k8s upgrade --image registry.example.com/agentlab:0.1.18 --version v0.1.18
 ```
 
 Preserve operator-tuned config from the live cluster ConfigMap:
 
 ```bash
-agentlab k8s upgrade --image 10.159.21.58:5000/agentlab:0.1.13 --preserve-cluster-config --apply
+agentlab k8s upgrade --image registry.example.com/agentlab:0.1.13 --preserve-cluster-config --apply
 ```
 
 Preserve operator-tuned config from the local generated `configmap.yaml` when the cluster is not reachable:
 
 ```bash
-agentlab k8s upgrade --image 10.159.21.58:5000/agentlab:0.1.13 --preserve-local-config
+agentlab k8s upgrade --image registry.example.com/agentlab:0.1.13 --preserve-local-config
 ```
 
 Run the doctor job and clean stale failed resources after a successful apply:
 
 ```bash
-agentlab k8s upgrade --image 10.159.21.58:5000/agentlab:0.1.13 --apply --run-doctor --cleanup-failed
+agentlab k8s upgrade --image registry.example.com/agentlab:0.1.13 --apply --run-doctor --cleanup-failed
 ```
 
-The upgrade command updates `configmap.yaml` annotation `agentlab.io/image`, all generated `job-*.yaml` and `cronjob-*.yaml` container images, and ensures enabled generated CronJobs are included in `kustomization.yaml`. If preserved config enables a CronJob such as `schedule.review_comments.enabled`, upgrade recreates the missing generated CronJob manifest from the matching generated Job manifest and applies enabled CronJob manifests after `kubectl apply -k`. It can preserve `auto_approve`, `schedule`, `schedule.review_comments`, `schedule.limits`, `schedule.behavior`, and `required_test_commands`. It does not preserve image annotations, Secrets, GitLab tokens, `auto_merge_enabled`, or `direct_main_push_enabled`.
+The upgrade command updates `configmap.yaml` annotations `mr-robot-ops.github.io/agentlab-image` and, when supplied by release upgrade, `mr-robot-ops.github.io/agentlab-version`; it also updates all generated `job-*.yaml` and `cronjob-*.yaml` container images and ensures enabled generated CronJobs are included in `kustomization.yaml`. Existing clusters using the deprecated `agentlab.io/image` annotation remain readable during migration, but generated manifests and upgrades write only the new `mr-robot-ops.github.io` annotation keys. If preserved config enables a CronJob such as `schedule.review_comments.enabled`, upgrade recreates the missing generated CronJob manifest from the matching generated Job manifest and applies enabled CronJob manifests after `kubectl apply -k`. It can preserve `auto_approve`, `schedule`, `schedule.review_comments`, `schedule.limits`, `schedule.behavior`, and `required_test_commands`. It does not preserve image annotations, Secrets, GitLab tokens, `auto_merge_enabled`, or `direct_main_push_enabled`.
 
 ## Artifacts
 
@@ -335,7 +341,7 @@ Upgrade requires a non-empty image before any generated manifest can be changed:
 
 ```text
 upgrade
-Image (example: 10.159.21.58:5000/agentlab:0.1.17): 10.159.21.58:5000/agentlab:0.1.17
+Image (example: registry.example.com/agentlab:0.1.17): registry.example.com/agentlab:0.1.17
 Preserve config: cluster config
 Apply generated manifests to the cluster? [y/N] y
 ```
