@@ -16,11 +16,11 @@ Generate the Kubernetes runtime and use a numeric GitLab project ID when possibl
 ```bash
 python scripts/bootstrap_k8s.py \
   --namespace agentlab \
-  --image 10.159.21.58:5000/agentlab:0.1.9 \
+  --image registry.example.com/agentlab:0.1.9 \
   --gitlab-url https://gitlab.example.com \
   --project-id "5" \
   --target-repo-url https://gitlab.example.com/re/project.git \
-  --ollama-url http://ollama:11434
+  --ollama-url http://127.0.0.1:11434
 ```
 
 Apply base resources and run manual scheduler jobs:

@@ -19,7 +19,19 @@ release_app = typer.Typer(help="Run local AgentLab release and upgrade workflows
 
 @release_app.command()
 def upgrade(
-    image: str = typer.Option(..., "--image", help="Container image tag to build, push, and deploy."),
+    image: str | None = typer.Option(None, "--image", help="Container image tag to build, push, and deploy."),
+    version: str | None = typer.Option(None, "--version", help="Explicit release version, for example 0.1.18 or v0.1.18."),
+    current_version: str | None = typer.Option(None, "--current-version", help="Override current release version for bump calculations."),
+    bump_patch: bool = typer.Option(False, "--bump-patch", help="Bump the patch release version."),
+    bump_minor: bool = typer.Option(False, "--bump-minor", help="Bump the minor release version."),
+    bump_major: bool = typer.Option(False, "--bump-major", help="Bump the major release version."),
+    image_repository: str | None = typer.Option(None, "--image-repository", help="Docker image repository to tag for versioned releases."),
+    image_tag_prefix_v: bool = typer.Option(False, "--image-tag-prefix-v", help="Use v-prefixed Docker image tags."),
+    tag: bool = typer.Option(False, "--tag/--no-tag", help="Create a local Git tag for versioned releases."),
+    push_tag: bool = typer.Option(False, "--push-tag/--no-push-tag", help="Push the Git tag after image push and verification."),
+    github_release: bool = typer.Option(False, "--github-release/--no-github-release", help="Create a GitHub Release after successful deploy."),
+    verify_image: bool = typer.Option(False, "--verify-image", help="Verify the pushed image before Kubernetes upgrade."),
+    no_verify_image: bool = typer.Option(False, "--no-verify-image", help="Skip image verification."),
     repo: Path = typer.Option(Path("."), "--repo", help="AgentLab repository path."),
     manifest_dir: Path = typer.Option(DEFAULT_MANIFEST_DIR, "--manifest-dir"),
     namespace: str = typer.Option(DEFAULT_NAMESPACE, "--namespace"),
@@ -62,6 +74,22 @@ def upgrade(
     try:
         options = ReleaseUpgradeOptions(
             image=image,
+            version=version,
+            current_version=current_version,
+            bump_patch=bump_patch,
+            bump_minor=bump_minor,
+            bump_major=bump_major,
+            image_repository=image_repository,
+            image_tag_prefix_v=image_tag_prefix_v,
+            tag=tag,
+            push_tag=push_tag,
+            github_release=github_release,
+            verify_image=_effective_optional_flag(
+                positive=verify_image,
+                negative=no_verify_image,
+                default=None,
+                name="verify-image",
+            ),
             repo=repo,
             manifest_dir=manifest_dir,
             namespace=namespace,

@@ -12,8 +12,12 @@ from agentlab.release_upgrade import (
     ReleaseCommandResult,
     ReleaseUpgradeError,
     ReleaseUpgradeOptions,
+    ReleaseVersion,
     ReleaseUpgrader,
+    bump_release_version,
     format_release_report,
+    image_repository_from_image,
+    parse_release_version,
 )
 
 
@@ -46,6 +50,9 @@ class FakeK8sOperator:
         self.upgrade_image_drift: list[str] = []
         self.status_image_drift = False
         self.doctor_status = "completed"
+        self.status_configmap_image = "registry/agentlab:new"
+        self.status_configmap_version: str | None = None
+        self.status_image_annotation_warning: str | None = None
 
     def upgrade(self, **kwargs):
         self.calls.append(("upgrade", kwargs))
@@ -56,6 +63,7 @@ class FakeK8sOperator:
                 "namespace": "agentlab",
                 "manifest_dir": "deploy/kubernetes/generated",
                 "image": kwargs["image"],
+                "version": kwargs.get("version"),
                 "updated_manifests": ["configmap.yaml"],
                 "preserved_sections": ["schedule.review_comments"],
                 "apply": kwargs.get("apply", False),
@@ -71,7 +79,12 @@ class FakeK8sOperator:
 
     def status(self, *, manifest_dir: Path):
         self.calls.append(("status", manifest_dir))
-        return ClusterStatus(namespace="agentlab", configmap_image="registry/agentlab:new")
+        return ClusterStatus(
+            namespace="agentlab",
+            configmap_image=self.status_configmap_image,
+            configmap_version=self.status_configmap_version,
+            image_annotation_warning=self.status_image_annotation_warning,
+        )
 
 
 def make_upgrader(fake_operator: FakeK8sOperator | None = None) -> tuple[ReleaseUpgrader, FakeCommandRunner, FakeK8sOperator]:
@@ -95,6 +108,186 @@ def options(tmp_path: Path, **updates) -> ReleaseUpgradeOptions:
     }
     values.update(updates)
     return ReleaseUpgradeOptions(**values)
+
+
+def test_release_version_parsing_and_rejection() -> None:
+    assert parse_release_version("v0.1.17") == ReleaseVersion(0, 1, 17)
+    assert parse_release_version("0.1.17") == ReleaseVersion(0, 1, 17)
+    for value in ("latest", "dev", "main"):
+        try:
+            parse_release_version(value)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"expected invalid version: {value}")
+
+
+def test_release_version_bumps() -> None:
+    current = ReleaseVersion(0, 1, 17)
+
+    assert bump_release_version(current, part="patch").tag == "v0.1.18"
+    assert bump_release_version(current, part="minor").tag == "v0.2.0"
+    assert bump_release_version(current, part="major").tag == "v1.0.0"
+
+
+def test_image_repository_is_inferred_from_image() -> None:
+    assert image_repository_from_image("10.159.21.58:5000/agentlab:0.1.17") == "10.159.21.58:5000/agentlab"
+
+
+def test_bump_patch_resolves_latest_git_tag_and_deployed_image_repo(tmp_path: Path) -> None:
+    operator = FakeK8sOperator()
+    operator.status_configmap_image = "10.159.21.58:5000/agentlab:0.1.17"
+    upgrader, runner, _operator = make_upgrader(operator)
+    runner.respond(["git", "tag", "--list", "v[0-9]*.[0-9]*.[0-9]*"], stdout="v0.1.16\nv0.1.17\n")
+
+    report = upgrader.run(options(tmp_path, image=None, bump_patch=True, dry_run=True))
+
+    assert report.current_version == "v0.1.17"
+    assert report.new_version == "v0.1.18"
+    assert report.current_image == "10.159.21.58:5000/agentlab:0.1.17"
+    assert report.image == "10.159.21.58:5000/agentlab:0.1.18"
+    assert report.version_source == "git tag"
+    rendered = format_release_report(report)
+    assert "Current version: v0.1.17" in rendered
+    assert "New version:     v0.1.18" in rendered
+    assert "Current image:   10.159.21.58:5000/agentlab:0.1.17" in rendered
+    assert "New image:       10.159.21.58:5000/agentlab:0.1.18" in rendered
+
+
+def test_bump_patch_falls_back_to_kubernetes_version_annotation(tmp_path: Path) -> None:
+    operator = FakeK8sOperator()
+    operator.status_configmap_version = "v0.1.17"
+    operator.status_configmap_image = "registry/agentlab:0.1.16"
+    upgrader, _runner, _operator = make_upgrader(operator)
+
+    report = upgrader.run(options(tmp_path, image=None, bump_patch=True, dry_run=True))
+
+    assert report.current_version == "v0.1.17"
+    assert report.new_version == "v0.1.18"
+    assert report.image == "registry/agentlab:0.1.18"
+    assert report.version_source == "version annotation"
+
+
+def test_bump_patch_falls_back_to_image_annotation(tmp_path: Path) -> None:
+    operator = FakeK8sOperator()
+    operator.status_configmap_image = "registry/agentlab:0.1.17"
+    upgrader, _runner, _operator = make_upgrader(operator)
+
+    report = upgrader.run(options(tmp_path, image=None, bump_patch=True, dry_run=True))
+
+    assert report.current_version == "v0.1.17"
+    assert report.image == "registry/agentlab:0.1.18"
+    assert report.version_source == "image annotation"
+
+
+def test_bump_patch_falls_back_to_deprecated_image_annotation(tmp_path: Path) -> None:
+    operator = FakeK8sOperator()
+    operator.status_configmap_image = "registry/agentlab:0.1.17"
+    operator.status_image_annotation_warning = "deprecated image annotation"
+    upgrader, _runner, _operator = make_upgrader(operator)
+
+    report = upgrader.run(options(tmp_path, image=None, bump_patch=True, dry_run=True))
+
+    assert report.current_version == "v0.1.17"
+    assert report.image == "registry/agentlab:0.1.18"
+    assert report.version_source == "deprecated image annotation"
+
+
+def test_bump_patch_without_source_reports_resolution_failure(tmp_path: Path) -> None:
+    class MissingClusterOperator(FakeK8sOperator):
+        def status(self, *, manifest_dir: Path):
+            raise FileNotFoundError("kubectl")
+
+    upgrader, _runner, _operator = make_upgrader(MissingClusterOperator())
+
+    try:
+        upgrader.run(options(tmp_path, image=None, bump_patch=True, dry_run=True))
+    except ReleaseUpgradeError as exc:
+        report = exc.report
+    else:
+        raise AssertionError("expected release resolution failure")
+
+    assert report.failed_step is not None
+    assert report.failed_step.name == "Resolve release"
+    assert "Unable to resolve current release version" in report.failed_step.detail
+
+
+def test_version_uses_image_repository_override(tmp_path: Path) -> None:
+    upgrader, _runner, _operator = make_upgrader()
+
+    report = upgrader.run(
+        options(
+            tmp_path,
+            image=None,
+            version="0.1.18",
+            image_repository="override/agentlab",
+            dry_run=True,
+        )
+    )
+
+    assert report.new_version == "v0.1.18"
+    assert report.image == "override/agentlab:0.1.18"
+
+
+def test_version_selection_conflicts_fail(tmp_path: Path) -> None:
+    for updates in (
+        {"image": "registry/agentlab:new", "bump_patch": True},
+        {"image": None, "version": "0.1.18", "bump_patch": True},
+    ):
+        upgrader, _runner, _operator = make_upgrader()
+        try:
+            upgrader.run(options(tmp_path, dry_run=True, **updates))
+        except ReleaseUpgradeError as exc:
+            assert "cannot be combined" in str(exc)
+        else:
+            raise AssertionError("expected version selection conflict")
+
+
+def test_image_with_explicit_version_writes_release_annotation(tmp_path: Path) -> None:
+    upgrader, _runner, operator = make_upgrader()
+
+    report = upgrader.run(options(tmp_path, image="registry/agentlab:0.1.18", version="0.1.18", verify_image=False))
+
+    assert report.current_version is None
+    assert report.new_version == "v0.1.18"
+    assert report.current_image is None
+    assert report.image == "registry/agentlab:0.1.18"
+    assert report.version_source == "--image + --version"
+    assert operator.calls[0] == (
+        "upgrade",
+        {
+            "image": "registry/agentlab:0.1.18",
+            "version": "v0.1.18",
+            "apply": False,
+            "preserve_cluster_config": False,
+            "preserve_local_config": False,
+            "run_doctor": False,
+            "show_status": False,
+            "cleanup_failed": False,
+        },
+    )
+
+
+def test_image_without_version_does_not_invent_release_version(tmp_path: Path) -> None:
+    upgrader, _runner, operator = make_upgrader()
+
+    report = upgrader.run(options(tmp_path, image="registry/agentlab:0.1.18"))
+
+    assert report.new_version is None
+    assert "version" not in operator.calls[0][1]
+
+
+def test_image_with_explicit_version_dry_run_passes_version_to_k8s_upgrade(tmp_path: Path) -> None:
+    upgrader, _runner, operator = make_upgrader()
+
+    report = upgrader.run(options(tmp_path, image="registry/agentlab:0.1.18", version="v0.1.18", dry_run=True))
+    rendered = format_release_report(report)
+
+    assert operator.calls == []
+    assert "New version:     v0.1.18" in rendered
+    assert "New image:       registry/agentlab:0.1.18" in rendered
+    assert "agentlab k8s upgrade --image registry/agentlab:0.1.18" in rendered
+    assert "--version v0.1.18" in rendered
 
 
 def test_dry_run_prints_planned_commands_and_executes_nothing(tmp_path: Path) -> None:
@@ -185,6 +378,130 @@ def test_docker_push_failure_stops_before_k8s_upgrade(tmp_path: Path) -> None:
         raise AssertionError("expected push failure")
 
     assert ["docker", "push", "registry/agentlab:new"] in [call[0] for call in runner.calls]
+    assert operator.calls == []
+
+
+def test_bump_release_runs_tests_tag_build_push_verify_then_k8s(tmp_path: Path) -> None:
+    upgrader, runner, operator = make_upgrader()
+
+    report = upgrader.run(
+        options(
+            tmp_path,
+            image=None,
+            current_version="0.1.17",
+            bump_patch=True,
+            image_repository="registry/agentlab",
+            skip_git_pull=True,
+            skip_tests=False,
+            skip_build=False,
+            skip_push=False,
+            tag=True,
+            push_tag=True,
+            apply=True,
+        )
+    )
+
+    assert [call[0] for call in runner.calls] == [
+        ["git", "status", "--porcelain"],
+        [sys.executable, "-m", "pytest"],
+        ["git", "tag", "v0.1.18"],
+        ["docker", "build", "-t", "registry/agentlab:0.1.18", "."],
+        ["docker", "push", "registry/agentlab:0.1.18"],
+        ["docker", "manifest", "inspect", "registry/agentlab:0.1.18"],
+        ["git", "push", "origin", "v0.1.18"],
+    ]
+    assert operator.calls[0] == (
+        "upgrade",
+        {
+            "image": "registry/agentlab:0.1.18",
+            "version": "v0.1.18",
+            "apply": True,
+            "preserve_cluster_config": True,
+            "preserve_local_config": False,
+            "run_doctor": True,
+            "show_status": True,
+            "cleanup_failed": True,
+        },
+    )
+    assert report.failed_step is None
+
+
+def test_bump_release_without_tag_does_not_create_or_push_git_tag(tmp_path: Path) -> None:
+    upgrader, runner, operator = make_upgrader()
+
+    report = upgrader.run(
+        options(
+            tmp_path,
+            image=None,
+            current_version="0.1.17",
+            bump_patch=True,
+            image_repository="registry/agentlab",
+            verify_image=False,
+        )
+    )
+
+    commands = [call[0] for call in runner.calls]
+    assert ["git", "tag", "v0.1.18"] not in commands
+    assert ["git", "push", "origin", "v0.1.18"] not in commands
+    assert operator.calls[0][0] == "upgrade"
+    assert report.new_version == "v0.1.18"
+
+
+def test_tag_is_not_pushed_if_docker_push_fails(tmp_path: Path) -> None:
+    upgrader, runner, operator = make_upgrader()
+    runner.respond(["docker", "push", "registry/agentlab:0.1.18"], stderr="push failed", returncode=1)
+
+    try:
+        upgrader.run(
+            options(
+                tmp_path,
+                image=None,
+                current_version="0.1.17",
+                bump_patch=True,
+                image_repository="registry/agentlab",
+                skip_build=True,
+                skip_push=False,
+                tag=True,
+                push_tag=True,
+            )
+        )
+    except ReleaseUpgradeError:
+        pass
+    else:
+        raise AssertionError("expected docker push failure")
+
+    commands = [call[0] for call in runner.calls]
+    assert ["git", "tag", "v0.1.18"] in commands
+    assert ["git", "push", "origin", "v0.1.18"] not in commands
+    assert operator.calls == []
+
+
+def test_image_verify_failure_stops_before_k8s_upgrade(tmp_path: Path) -> None:
+    upgrader, runner, operator = make_upgrader()
+    runner.respond(["docker", "manifest", "inspect", "registry/agentlab:0.1.18"], stderr="missing image", returncode=1)
+
+    try:
+        upgrader.run(
+            options(
+                tmp_path,
+                image=None,
+                current_version="0.1.17",
+                bump_patch=True,
+                image_repository="registry/agentlab",
+                skip_build=True,
+                skip_push=True,
+                tag=True,
+                push_tag=True,
+            )
+        )
+    except ReleaseUpgradeError as exc:
+        report = exc.report
+    else:
+        raise AssertionError("expected image verification failure")
+
+    assert report.failed_step is not None
+    assert report.failed_step.name == "Image verify"
+    assert ["git", "push", "origin", "v0.1.18"] not in [call[0] for call in runner.calls]
     assert operator.calls == []
 
 
