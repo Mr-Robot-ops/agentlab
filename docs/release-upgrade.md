@@ -20,6 +20,12 @@ agentlab update
 
 `agentlab update` defaults to the current working directory, checks `git status`, allows only generated manifest dirtiness under `deploy/kubernetes/generated/**`, pulls `origin/main` with `git pull --ff-only`, re-checks `git status`, refreshes the editable install with the current Python interpreter, then re-execs itself so the deploy phase uses freshly installed code. It then runs the runtime update workflow with a commit-based image tag, pull-based image verification, Kubernetes apply, cluster config preservation, doctor, failed-resource cleanup, and status.
 
+The image repository is inferred automatically, first from the live Kubernetes ConfigMap image annotation and then from the generated `deploy/kubernetes/generated/configmap.yaml` image annotation. If neither exists, run once with:
+
+```bash
+agentlab update --image-repository registry.example.com/agentlab
+```
+
 Default update behavior does not:
 
 - create a Git tag
@@ -39,11 +45,12 @@ The Kubernetes version annotation is written as a runtime commit marker:
 mr-robot-ops.github.io/agentlab-version=commit 0ae4869
 ```
 
-If a previous release left `.agentlab/release-state.json` incomplete, `agentlab update` refuses to start a fresh release and tells you to resume:
+If a previous runtime update failed before Docker build, Docker push, or Kubernetes apply, the next `agentlab update` clears that pre-deploy state and retries cleanly. If the state reached a deploy step, `agentlab update` refuses to start a fresh run and tells you to resume or clear the state explicitly:
 
 ```bash
 agentlab update --resume --dry-run
 agentlab update --resume
+agentlab update --clear-state
 ```
 
 Useful update overrides:
@@ -53,10 +60,13 @@ agentlab update --image-repository registry.example.com/agentlab
 agentlab update --repo /opt/agentlab
 agentlab update --no-git-pull
 agentlab update --no-self-install
+agentlab update --no-tests
 agentlab update --verify-image-method manifest
 ```
 
 `agentlab update --dry-run` may run `git fetch origin` so it can compare local `HEAD` with `origin/main`, but it does not modify the working tree. The report shows whether the checkout is equal to, behind, ahead of, or diverged from `origin/main`. Diverged history fails clearly before planning a release.
+
+When a command fails, the report includes the command, working directory, exit code, stdout/stderr tail, and the full log path under `.agentlab/logs/`.
 
 ## Official Releases
 

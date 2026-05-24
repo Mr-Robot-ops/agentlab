@@ -8,7 +8,7 @@ from typer.testing import CliRunner
 import agentlab.update_cli as update_cli
 from agentlab.k8s_operator import ClusterStatus
 from agentlab.main import app
-from agentlab.release_upgrade import ReleaseCommandResult, ReleaseStep, ReleaseUpgradeReport, ReleaseUpgrader
+from agentlab.release_upgrade import ReleaseCommandResult, ReleaseStep, ReleaseUpgradeError, ReleaseUpgradeReport, ReleaseUpgrader
 from agentlab.update_cli import UPDATE_REEXEC_ENV, UpdateError, UpdateOptions, UpdateRunner, format_update_report
 
 
@@ -65,6 +65,8 @@ class FakeReleaseUpgrader:
                 steps.insert(1, ReleaseStep(name="Git tag", status="planned", command=["git", "tag", new_version]))
             if options.push_tag:
                 steps.append(ReleaseStep(name="Git tag push", status="planned", command=["git", "push", "origin", new_version]))
+        if options.skip_tests:
+            steps[0] = ReleaseStep(name="Tests", status="skipped", detail="--skip-tests")
         return ReleaseUpgradeReport(
             image=image,
             repo=str(options.repo),
@@ -101,13 +103,14 @@ class FakeReleaseResumer:
 
 
 class FakeStatusOperator:
-    def __init__(self, image: str = "registry/agentlab:0.1.20") -> None:
+    def __init__(self, image: str | None = "registry/agentlab:0.1.20", manifest_image: str | None = None) -> None:
         self.image = image
+        self.manifest_image = manifest_image
         self.calls: list[object] = []
 
     def status(self, *, manifest_dir: Path):
         self.calls.append(("status", manifest_dir))
-        return ClusterStatus(namespace="agentlab", configmap_image=self.image)
+        return ClusterStatus(namespace="agentlab", configmap_image=self.image, manifest_configmap_image=self.manifest_image)
 
 
 class FakeReexecutor:
@@ -207,6 +210,7 @@ def test_default_update_dry_run_prints_runtime_plan_without_git_tags(tmp_path: P
     assert "-m pip install -e ." in rendered
     assert "Runtime:" in rendered
     assert "Image:         registry/agentlab:new4567" in rendered
+    assert "Image repo:    registry/agentlab" in rendered
     assert "Version:       commit new4567" in rendered
     assert "Verify method: pull" in rendered
     assert "Namespace:     agentlab" in rendered
@@ -237,6 +241,37 @@ def test_default_update_dry_run_infers_image_repository_from_cluster_status(tmp_
     assert "--version 'commit 8f1aff3'" not in rendered
     assert "git tag" not in rendered
     assert "git push origin" not in rendered
+
+
+def test_default_update_dry_run_infers_image_repository_from_generated_manifest(tmp_path: Path) -> None:
+    repo = write_agentlab_repo(tmp_path)
+    command_runner = FakeCommandRunner()
+    configure_git_state(command_runner, current="8f1aff3abcdef", target="8f1aff3abcdef", merge_base="8f1aff3abcdef", behind="0")
+    operator = FakeStatusOperator(None, "generated.local/agentlab:0.1.20")
+    upgrader = ReleaseUpgrader(command_runner=command_runner, operator_factory=lambda namespace, manifest_dir: operator)
+    update_runner = UpdateRunner(command_runner=command_runner, release_upgrader=upgrader, release_resumer=FakeReleaseResumer())
+
+    report = update_runner.run(UpdateOptions(repo=repo, dry_run=True))
+    rendered = format_update_report(report)
+
+    assert "Image repo:    generated.local/agentlab" in rendered
+    assert "Image:         generated.local/agentlab:8f1aff3" in rendered
+
+
+def test_default_update_without_image_repository_has_clear_failure(tmp_path: Path) -> None:
+    repo = write_agentlab_repo(tmp_path)
+    command_runner = FakeCommandRunner()
+    configure_git_state(command_runner, current="8f1aff3abcdef", target="8f1aff3abcdef", merge_base="8f1aff3abcdef", behind="0")
+    operator = FakeStatusOperator(None, None)
+    upgrader = ReleaseUpgrader(command_runner=command_runner, operator_factory=lambda namespace, manifest_dir: operator)
+    update_runner = UpdateRunner(command_runner=command_runner, release_upgrader=upgrader, release_resumer=FakeReleaseResumer())
+
+    try:
+        update_runner.run(UpdateOptions(repo=repo, dry_run=True))
+    except ReleaseUpgradeError as exc:
+        assert "Unable to infer image repository. Run once with --image-repository REPO." in exc.report.failed_step.detail
+    else:
+        raise AssertionError("expected image repository inference failure")
 
 
 def test_update_dry_run_identifies_equal_ahead_and_diverged(tmp_path: Path) -> None:
@@ -273,6 +308,20 @@ def test_update_dry_run_no_self_install_marks_step_skipped(tmp_path: Path) -> No
 
     assert any(step.name == "Self install" and step.status == "skipped" for step in report.steps)
     assert report.self_install_command is None
+
+
+def test_update_no_tests_is_passed_to_runtime_deploy(tmp_path: Path) -> None:
+    repo = write_agentlab_repo(tmp_path)
+    update_runner, runner, upgrader, _resumer = make_update_runner()
+    configure_git_state(runner)
+
+    report = update_runner.run(
+        UpdateOptions(repo=repo, dry_run=True, image_repository="registry/agentlab", no_tests=True)
+    )
+    rendered = format_update_report(report)
+
+    assert upgrader.calls[0].skip_tests is True
+    assert "Tests: --skip-tests" in rendered
 
 
 def test_update_resume_dry_run_delegates_to_release_resume(tmp_path: Path) -> None:
@@ -408,14 +457,14 @@ def test_real_update_runs_pull_self_install_then_reexec_before_release_deploy(tm
     repo = write_agentlab_repo(tmp_path)
     reexecutor = FakeReexecutor()
     update_runner, runner, upgrader, _resumer = make_update_runner_with_reexecutor(reexecutor)
-    monkeypatch.setattr(sys, "argv", ["agentlab", "update", "--current-version", "0.1.19"])
+    monkeypatch.setattr(sys, "argv", ["agentlab", "update", "--no-tests"])
     runner.responses[("git", "status", "--porcelain")] = [
         ReleaseCommandResult(args=["git", "status", "--porcelain"], stdout=""),
         ReleaseCommandResult(args=["git", "status", "--porcelain"], stdout=""),
     ]
 
     try:
-        update_runner.run(UpdateOptions(repo=repo, current_version="0.1.19", image_repository="registry/agentlab"))
+        update_runner.run(UpdateOptions(repo=repo, image_repository="registry/agentlab", no_tests=True))
     except ReexecRequested:
         pass
     else:
@@ -431,7 +480,7 @@ def test_real_update_runs_pull_self_install_then_reexec_before_release_deploy(tm
     assert not upgrader.calls
     assert reexecutor.calls
     command, env = reexecutor.calls[0]
-    assert command == [sys.executable, "-m", "agentlab.main", "update", "--current-version", "0.1.19"]
+    assert command == [sys.executable, "-m", "agentlab.main", "update", "--no-tests"]
     assert env[UPDATE_REEXEC_ENV] == "1"
 
 
@@ -454,6 +503,17 @@ def test_reexec_marker_skips_pull_and_self_install_then_release_deploy(tmp_path:
     assert upgrader.calls[0].skip_git_pull is True
     assert upgrader.calls[0].verify_image_method == "pull"
     assert upgrader.calls[0].push_tag_after_k8s is True
+
+
+def test_reexec_marker_preserves_no_tests_in_release_options(tmp_path: Path, monkeypatch) -> None:
+    repo = write_agentlab_repo(tmp_path)
+    update_runner, runner, upgrader, _resumer = make_update_runner()
+    runner.respond(["git", "status", "--porcelain"], stdout="")
+
+    monkeypatch.setenv(UPDATE_REEXEC_ENV, "1")
+    update_runner.run(UpdateOptions(repo=repo, image_repository="registry/agentlab", no_tests=True))
+
+    assert upgrader.calls[0].skip_tests is True
 
 
 def test_update_dry_run_resume_and_no_self_install_do_not_reexec(tmp_path: Path) -> None:
@@ -483,20 +543,56 @@ def test_update_dry_run_resume_and_no_self_install_do_not_reexec(tmp_path: Path)
     assert not reexecutor.calls
 
 
-def test_update_refuses_existing_incomplete_release_state(tmp_path: Path) -> None:
+def test_update_auto_clears_pre_deploy_runtime_state(tmp_path: Path) -> None:
     repo = write_agentlab_repo(tmp_path)
     state = repo / ".agentlab" / "release-state.json"
     state.parent.mkdir()
-    state.write_text('{"completed": false}', encoding="utf-8")
+    state.write_text(
+        '{"completed": false, "workflow": "update-runtime", "steps": {"tests": "failed", "docker_build": "pending", "docker_push": "pending", "k8s_upgrade": "pending"}}',
+        encoding="utf-8",
+    )
+    update_runner, runner, _upgrader, _resumer = make_update_runner()
+    configure_git_state(runner)
+
+    report = update_runner.run(UpdateOptions(repo=repo, dry_run=True, image_repository="registry/agentlab"))
+
+    assert not state.exists()
+    assert any(step.name == "Release state" and step.detail == "cleared incomplete pre-deploy update state" for step in report.steps)
+
+
+def test_update_refuses_existing_incomplete_deploy_state_with_clear_hint(tmp_path: Path) -> None:
+    repo = write_agentlab_repo(tmp_path)
+    state = repo / ".agentlab" / "release-state.json"
+    state.parent.mkdir()
+    state.write_text(
+        '{"completed": false, "workflow": "update-runtime", "steps": {"docker_build": "passed", "docker_push": "pending", "k8s_upgrade": "pending"}}',
+        encoding="utf-8",
+    )
     update_runner, runner, _upgrader, _resumer = make_update_runner()
     configure_git_state(runner)
 
     try:
-        update_runner.run(UpdateOptions(repo=repo, dry_run=True, current_version="0.1.19", image_repository="registry/agentlab"))
+        update_runner.run(UpdateOptions(repo=repo, dry_run=True, image_repository="registry/agentlab"))
     except UpdateError as exc:
         assert "update --resume" in str(exc)
+        assert "update --clear-state" in str(exc)
     else:
         raise AssertionError("expected incomplete state failure")
+
+
+def test_update_clear_state_removes_state_without_git_or_release(tmp_path: Path) -> None:
+    repo = write_agentlab_repo(tmp_path)
+    state = repo / ".agentlab" / "release-state.json"
+    state.parent.mkdir()
+    state.write_text('{"completed": false}', encoding="utf-8")
+    update_runner, runner, upgrader, _resumer = make_update_runner()
+
+    report = update_runner.run(UpdateOptions(repo=repo, clear_state=True))
+
+    assert not state.exists()
+    assert any(step.name == "Release state" and step.detail == "cleared" for step in report.steps)
+    assert runner.calls == []
+    assert upgrader.calls == []
 
 
 def test_update_cli_is_registered(monkeypatch) -> None:
