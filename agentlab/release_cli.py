@@ -6,6 +6,9 @@ import typer
 
 from agentlab.k8s_operator import DEFAULT_MANIFEST_DIR, DEFAULT_NAMESPACE
 from agentlab.release_upgrade import (
+    DEFAULT_RELEASE_STATE_FILE,
+    ReleaseResumeOptions,
+    ReleaseResumer,
     ReleaseUpgradeError,
     ReleaseUpgradeOptions,
     ReleaseUpgrader,
@@ -32,6 +35,7 @@ def upgrade(
     github_release: bool = typer.Option(False, "--github-release/--no-github-release", help="Create a GitHub Release after successful deploy."),
     verify_image: bool = typer.Option(False, "--verify-image", help="Verify the pushed image before Kubernetes upgrade."),
     no_verify_image: bool = typer.Option(False, "--no-verify-image", help="Skip image verification."),
+    verify_image_method: str = typer.Option("manifest", "--verify-image-method", help="Image verification method: manifest or pull."),
     repo: Path = typer.Option(Path("."), "--repo", help="AgentLab repository path."),
     manifest_dir: Path = typer.Option(DEFAULT_MANIFEST_DIR, "--manifest-dir"),
     namespace: str = typer.Option(DEFAULT_NAMESPACE, "--namespace"),
@@ -90,6 +94,7 @@ def upgrade(
                 default=None,
                 name="verify-image",
             ),
+            verify_image_method=verify_image_method,
             repo=repo,
             manifest_dir=manifest_dir,
             namespace=namespace,
@@ -150,6 +155,107 @@ def upgrade(
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=1) from exc
     except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(format_release_report(report))
+
+
+@release_app.command()
+def deploy(
+    image: str | None = typer.Option(None, "--image", help="Deploy this explicit image instead of deriving one from a version."),
+    version: str | None = typer.Option(None, "--version", help="Explicit release version, for example 0.1.18 or v0.1.18."),
+    current_version: str | None = typer.Option(None, "--current-version", help="Override current release version for bump calculations."),
+    bump_patch: bool = typer.Option(False, "--bump-patch", help="Bump the patch release version."),
+    bump_minor: bool = typer.Option(False, "--bump-minor", help="Bump the minor release version."),
+    bump_major: bool = typer.Option(False, "--bump-major", help="Bump the major release version."),
+    image_repository: str | None = typer.Option(None, "--image-repository", help="Docker image repository to tag for versioned releases."),
+    repo: Path = typer.Option(Path("."), "--repo", help="AgentLab repository path."),
+    namespace: str = typer.Option(DEFAULT_NAMESPACE, "--namespace"),
+    manifest_dir: Path = typer.Option(DEFAULT_MANIFEST_DIR, "--manifest-dir"),
+    verify_image_method: str = typer.Option("pull", "--verify-image-method", help="Image verification method: manifest or pull."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    no_git_pull: bool = typer.Option(False, "--no-git-pull"),
+    no_tests: bool = typer.Option(False, "--no-tests"),
+    no_build: bool = typer.Option(False, "--no-build"),
+    no_push: bool = typer.Option(False, "--no-push"),
+    no_apply: bool = typer.Option(False, "--no-apply"),
+    no_tag: bool = typer.Option(False, "--no-tag"),
+    no_push_tag: bool = typer.Option(False, "--no-push-tag"),
+    no_doctor: bool = typer.Option(False, "--no-doctor"),
+    no_cleanup_failed: bool = typer.Option(False, "--no-cleanup-failed"),
+    no_status: bool = typer.Option(False, "--no-status"),
+) -> None:
+    """Run the safe one-command AgentLab release deploy workflow."""
+    if not image and not version and not bump_patch and not bump_minor and not bump_major:
+        bump_patch = True
+    apply = not no_apply
+    tag = not no_tag and bool(version or bump_patch or bump_minor or bump_major)
+    push_tag = apply and tag and not no_push_tag
+    try:
+        options = ReleaseUpgradeOptions(
+            image=image,
+            version=version,
+            current_version=current_version,
+            bump_patch=bump_patch,
+            bump_minor=bump_minor,
+            bump_major=bump_major,
+            image_repository=image_repository,
+            tag=tag,
+            push_tag=push_tag,
+            verify_image=True,
+            verify_image_method=verify_image_method,
+            push_tag_after_k8s=True,
+            state_file=None if dry_run else DEFAULT_RELEASE_STATE_FILE,
+            workflow="deploy",
+            repo=repo,
+            manifest_dir=manifest_dir,
+            namespace=namespace,
+            skip_git_pull=no_git_pull,
+            skip_tests=no_tests,
+            skip_build=no_build,
+            skip_push=no_push,
+            apply=apply,
+            preserve_cluster_config=True,
+            run_doctor=not no_doctor,
+            cleanup_failed=not no_cleanup_failed,
+            status=not no_status,
+            dry_run=dry_run,
+        )
+        report = ReleaseUpgrader().run(options)
+    except ReleaseUpgradeError as exc:
+        typer.echo(format_release_report(exc.report))
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(format_release_report(report))
+
+
+@release_app.command()
+def resume(
+    repo: Path = typer.Option(Path("."), "--repo", help="AgentLab repository path."),
+    state_file: Path = typer.Option(DEFAULT_RELEASE_STATE_FILE, "--state-file"),
+    verify_image_method: str | None = typer.Option(None, "--verify-image-method", help="Override image verification method: manifest or pull."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    allow_head_mismatch: bool = typer.Option(False, "--allow-head-mismatch"),
+) -> None:
+    """Resume the latest failed or incomplete release from local state."""
+    try:
+        report = ReleaseResumer().run(
+            ReleaseResumeOptions(
+                repo=repo,
+                state_file=state_file,
+                verify_image_method=verify_image_method,
+                dry_run=dry_run,
+                allow_head_mismatch=allow_head_mismatch,
+            )
+        )
+    except ReleaseUpgradeError as exc:
+        typer.echo(format_release_report(exc.report))
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    except (OSError, ValueError, KeyError) as exc:
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2) from exc
     typer.echo(format_release_report(report))

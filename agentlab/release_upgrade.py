@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import re
 import shlex
 import subprocess
@@ -49,6 +50,37 @@ class SubprocessReleaseCommandRunner:
 
 SEMVER_RE = re.compile(r"^(?P<prefix>v?)(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)$")
 K8S_VERSION_SOURCE = "version annotation"
+DEFAULT_RELEASE_STATE_FILE = Path(".agentlab/release-state.json")
+VERIFY_IMAGE_METHODS = {"manifest", "pull"}
+STATE_STEP_KEYS = {
+    "Git status": "git_status",
+    "Git pull": "git_pull",
+    "Git status after pull": "git_status_after_pull",
+    "Kubernetes bootstrap": "kubernetes_bootstrap",
+    "Kubernetes manifest preflight": "manifest_preflight",
+    "Tests": "tests",
+    "Git tag": "git_tag",
+    "Docker build": "docker_build",
+    "Docker push": "docker_push",
+    "Image verify": "image_verify",
+    "Kubernetes upgrade": "k8s_upgrade",
+    "Status": "status",
+    "Git tag push": "git_tag_push",
+}
+DEFAULT_STATE_STEPS = {
+    "git_status": "pending",
+    "git_pull": "pending",
+    "git_status_after_pull": "pending",
+    "manifest_preflight": "pending",
+    "tests": "pending",
+    "git_tag": "pending",
+    "docker_build": "pending",
+    "docker_push": "pending",
+    "image_verify": "pending",
+    "k8s_upgrade": "pending",
+    "status": "pending",
+    "git_tag_push": "pending",
+}
 
 
 @dataclass(frozen=True, order=True)
@@ -75,6 +107,78 @@ class ResolvedRelease:
     git_tag: str | None = None
     image_repository: str | None = None
     version_source: str = ""
+
+
+@dataclass
+class ReleaseState:
+    version: str
+    image: str
+    repo: str
+    commit: str
+    namespace: str
+    manifest_dir: str
+    verify_image_method: str
+    steps: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_STATE_STEPS))
+    schema_version: int = 1
+    completed: bool = False
+
+    @classmethod
+    def from_file(cls, path: Path) -> "ReleaseState":
+        data = json.loads(path.read_text(encoding="utf-8"))
+        steps = dict(DEFAULT_STATE_STEPS)
+        steps.update(data.get("steps") or {})
+        return cls(
+            schema_version=int(data.get("schema_version", 1)),
+            version=str(data["version"]),
+            image=str(data["image"]),
+            repo=str(data["repo"]),
+            commit=str(data["commit"]),
+            namespace=str(data.get("namespace", DEFAULT_NAMESPACE)),
+            manifest_dir=str(data.get("manifest_dir", DEFAULT_MANIFEST_DIR)),
+            verify_image_method=str(data.get("verify_image_method", "manifest")),
+            steps=steps,
+            completed=bool(data.get("completed", False)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "version": self.version,
+            "image": self.image,
+            "repo": self.repo,
+            "commit": self.commit,
+            "namespace": self.namespace,
+            "manifest_dir": self.manifest_dir,
+            "verify_image_method": self.verify_image_method,
+            "steps": self.steps,
+            "completed": self.completed,
+        }
+
+    def write(self, path: Path) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+    def mark(self, step_key: str, status: str, path: Path) -> None:
+        self.steps[step_key] = status
+        self.completed = all(value in {"passed", "skipped"} for value in self.steps.values())
+        self.write(path)
+
+
+@dataclass
+class ReleaseResumeOptions:
+    repo: Path = field(default_factory=Path.cwd)
+    state_file: Path = DEFAULT_RELEASE_STATE_FILE
+    verify_image_method: str | None = None
+    dry_run: bool = False
+    allow_head_mismatch: bool = False
+
+    def resolved_repo(self) -> Path:
+        return self.repo.resolve()
+
+    def resolved_state_file(self) -> Path:
+        if self.state_file.is_absolute():
+            return self.state_file
+        return self.resolved_repo() / self.state_file
 
 
 def parse_release_version(value: str) -> ReleaseVersion:
@@ -136,6 +240,10 @@ class ReleaseUpgradeOptions:
     push_tag: bool = False
     github_release: bool = False
     verify_image: bool | None = None
+    verify_image_method: str = "manifest"
+    push_tag_after_k8s: bool = False
+    state_file: Path | None = None
+    workflow: str = "upgrade"
     repo: Path = field(default_factory=Path.cwd)
     manifest_dir: Path = DEFAULT_MANIFEST_DIR
     namespace: str = DEFAULT_NAMESPACE
@@ -224,7 +332,14 @@ class ReleaseUpgradeOptions:
         return [self.docker_bin, "push", self.required_image()]
 
     def docker_verify_command(self) -> list[str]:
-        return [self.docker_bin, "manifest", "inspect", self.required_image()]
+        return _verify_command(self.docker_bin, self.required_image(), self.verify_image_method)
+
+    def resolved_state_file(self) -> Path | None:
+        if self.state_file is None:
+            return None
+        if self.state_file.is_absolute():
+            return self.state_file
+        return self.resolved_repo() / self.state_file
 
     def git_tag_command(self) -> list[str]:
         if not self.version:
@@ -350,12 +465,15 @@ class ReleaseUpgradeReport:
     repo: str
     namespace: str
     manifest_dir: str
+    workflow: str = "upgrade"
     dry_run: bool = False
     current_version: str | None = None
     new_version: str | None = None
     current_image: str | None = None
     image_repository: str | None = None
     version_source: str = ""
+    verify_image_method: str = "manifest"
+    state_file: str | None = None
     steps: list[ReleaseStep] = field(default_factory=list)
 
     @property
@@ -387,7 +505,10 @@ class ReleaseUpgrader:
             repo=str(repo),
             namespace=options.namespace,
             manifest_dir=str(manifest_dir),
+            workflow=options.workflow,
             dry_run=options.dry_run,
+            verify_image_method=options.verify_image_method,
+            state_file=str(options.resolved_state_file()) if options.resolved_state_file() else None,
         )
         self._validate_options(options, report)
         operator = self.operator_factory(options.namespace, manifest_dir)
@@ -407,53 +528,55 @@ class ReleaseUpgrader:
         if options.dry_run:
             self._add_dry_run_steps(options, report)
             return report
+        state_path = options.resolved_state_file()
+        state = self._create_state(options, report, cwd=repo) if state_path else None
 
-        self._check_git_status(report, options, "Git status", cwd=repo)
+        self._check_git_status(report, options, "Git status", cwd=repo, state=state, state_path=state_path)
 
         if options.skip_git_pull:
-            report.steps.append(ReleaseStep(name="Git pull", status="skipped", detail="--skip-git-pull"))
+            self._append_step(report, ReleaseStep(name="Git pull", status="skipped", detail="--skip-git-pull"), state=state, state_path=state_path)
         else:
-            self._run_command(report, "Git pull", options.git_pull_command(), cwd=repo)
-            self._check_git_status(report, options, "Git status after pull", cwd=repo)
+            self._run_command(report, "Git pull", options.git_pull_command(), cwd=repo, state=state, state_path=state_path)
+            self._check_git_status(report, options, "Git status after pull", cwd=repo, state=state, state_path=state_path)
 
-        self._ensure_manifest_dir(options, report, repo=repo, manifest_dir=manifest_dir)
+        self._ensure_manifest_dir(options, report, repo=repo, manifest_dir=manifest_dir, state=state, state_path=state_path)
 
         if options.skip_tests:
-            report.steps.append(ReleaseStep(name="Tests", status="skipped", detail="--skip-tests"))
+            self._append_step(report, ReleaseStep(name="Tests", status="skipped", detail="--skip-tests"), state=state, state_path=state_path)
         else:
-            self._run_command(report, "Tests", options.pytest_command(), cwd=repo)
+            self._run_command(report, "Tests", options.pytest_command(), cwd=repo, state=state, state_path=state_path)
 
         if options.prepare_only:
             if options.tag:
-                report.steps.append(ReleaseStep(name="Git tag", status="skipped", detail="--prepare-only"))
-            report.steps.append(ReleaseStep(name="Docker build", status="skipped", detail="--prepare-only"))
-            report.steps.append(ReleaseStep(name="Docker push", status="skipped", detail="--prepare-only"))
+                self._append_step(report, ReleaseStep(name="Git tag", status="skipped", detail="--prepare-only"), state=state, state_path=state_path)
+            self._append_step(report, ReleaseStep(name="Docker build", status="skipped", detail="--prepare-only"), state=state, state_path=state_path)
+            self._append_step(report, ReleaseStep(name="Docker push", status="skipped", detail="--prepare-only"), state=state, state_path=state_path)
             if options.effective_verify_image():
-                report.steps.append(ReleaseStep(name="Image verify", status="skipped", detail="--prepare-only"))
+                self._append_step(report, ReleaseStep(name="Image verify", status="skipped", detail="--prepare-only"), state=state, state_path=state_path)
             if options.push_tag:
-                report.steps.append(ReleaseStep(name="Git tag push", status="skipped", detail="--prepare-only"))
-            report.steps.append(ReleaseStep(name="Kubernetes upgrade", status="skipped", detail="--prepare-only"))
-            report.steps.append(ReleaseStep(name="Status", status="skipped", detail="--prepare-only"))
+                self._append_step(report, ReleaseStep(name="Git tag push", status="skipped", detail="--prepare-only"), state=state, state_path=state_path)
+            self._append_step(report, ReleaseStep(name="Kubernetes upgrade", status="skipped", detail="--prepare-only"), state=state, state_path=state_path)
+            self._append_step(report, ReleaseStep(name="Status", status="skipped", detail="--prepare-only"), state=state, state_path=state_path)
             return report
 
         if options.tag:
-            self._run_command(report, "Git tag", options.git_tag_command(), cwd=repo)
+            self._run_command(report, "Git tag", options.git_tag_command(), cwd=repo, state=state, state_path=state_path)
 
         if options.skip_build:
-            report.steps.append(ReleaseStep(name="Docker build", status="skipped", detail="--skip-build"))
+            self._append_step(report, ReleaseStep(name="Docker build", status="skipped", detail="--skip-build"), state=state, state_path=state_path)
         else:
-            self._run_command(report, "Docker build", options.docker_build_command(), cwd=repo)
+            self._run_command(report, "Docker build", options.docker_build_command(), cwd=repo, state=state, state_path=state_path)
 
         if options.skip_push:
-            report.steps.append(ReleaseStep(name="Docker push", status="skipped", detail="--skip-push"))
+            self._append_step(report, ReleaseStep(name="Docker push", status="skipped", detail="--skip-push"), state=state, state_path=state_path)
         else:
-            self._run_command(report, "Docker push", options.docker_push_command(), cwd=repo)
+            self._run_command(report, "Docker push", options.docker_push_command(), cwd=repo, state=state, state_path=state_path)
 
         if options.effective_verify_image():
-            self._run_command(report, "Image verify", options.docker_verify_command(), cwd=repo)
+            self._run_command(report, "Image verify", options.docker_verify_command(), cwd=repo, state=state, state_path=state_path)
 
-        if options.push_tag:
-            self._run_command(report, "Git tag push", options.git_push_tag_command(), cwd=repo)
+        if options.push_tag and not options.push_tag_after_k8s:
+            self._run_command(report, "Git tag push", options.git_push_tag_command(), cwd=repo, state=state, state_path=state_path)
 
         upgrade_kwargs: dict[str, Any] = {
             "image": options.required_image(),
@@ -469,13 +592,16 @@ class ReleaseUpgrader:
         try:
             upgrade_report = operator.upgrade(**upgrade_kwargs)
         except K8sOperatorError as exc:
-            report.steps.append(
+            self._append_step(
+                report,
                 ReleaseStep(
                     name="Kubernetes upgrade",
                     status="failed",
                     command=options.k8s_upgrade_command(),
                     detail=str(exc),
-                )
+                ),
+                state=state,
+                state_path=state_path,
             )
             raise ReleaseUpgradeError("Kubernetes upgrade failed.", report) from exc
         upgrade_output = format_upgrade_report(upgrade_report)
@@ -485,23 +611,27 @@ class ReleaseUpgrader:
             command=options.k8s_upgrade_command(),
             stdout=upgrade_output,
         )
-        report.steps.append(upgrade_step)
+        self._append_step(report, upgrade_step, state=state, state_path=state_path)
         if getattr(upgrade_report, "image_drift", []):
             upgrade_step.status = "failed"
             upgrade_step.detail = "image drift remains"
+            self._mark_state_step(upgrade_step, state=state, state_path=state_path)
             raise ReleaseUpgradeError("Kubernetes upgrade reported image drift.", report)
 
         if options.effective_status():
             try:
                 cluster_status: ClusterStatus = operator.status(manifest_dir=manifest_dir)
             except K8sOperatorError as exc:
-                report.steps.append(
+                self._append_step(
+                    report,
                     ReleaseStep(
                         name="Status",
                         status="failed",
                         command=options.k8s_status_command(),
                         detail=str(exc),
-                    )
+                    ),
+                    state=state,
+                    state_path=state_path,
                 )
                 raise ReleaseUpgradeError("Kubernetes status failed.", report) from exc
             status_output = format_status(cluster_status)
@@ -511,13 +641,16 @@ class ReleaseUpgrader:
                 command=options.k8s_status_command(),
                 stdout=status_output,
             )
-            report.steps.append(status_step)
+            self._append_step(report, status_step, state=state, state_path=state_path)
             if _status_has_image_drift(cluster_status):
                 status_step.status = "failed"
                 status_step.detail = "image drift remains"
+                self._mark_state_step(status_step, state=state, state_path=state_path)
                 raise ReleaseUpgradeError("Kubernetes status reported image drift.", report)
         else:
-            report.steps.append(ReleaseStep(name="Status", status="skipped", detail="status not requested"))
+            self._append_step(report, ReleaseStep(name="Status", status="skipped", detail="status not requested"), state=state, state_path=state_path)
+        if options.push_tag and options.push_tag_after_k8s:
+            self._run_command(report, "Git tag push", options.git_push_tag_command(), cwd=repo, state=state, state_path=state_path)
         if options.github_release:
             commit_sha = self._command_stdout_or_unknown(["git", "rev-parse", "HEAD"], cwd=repo)
             test_result = _step_status(report, "Tests")
@@ -541,7 +674,68 @@ class ReleaseUpgrader:
             )
         return report
 
+    def _create_state(self, options: ReleaseUpgradeOptions, report: ReleaseUpgradeReport, *, cwd: Path) -> ReleaseState | None:
+        state_path = options.resolved_state_file()
+        if state_path is None:
+            return None
+        commit = self._command_stdout_or_unknown(["git", "rev-parse", "HEAD"], cwd=cwd)
+        steps = dict(DEFAULT_STATE_STEPS)
+        if options.skip_git_pull:
+            steps["git_pull"] = "skipped"
+            steps["git_status_after_pull"] = "skipped"
+        if options.skip_tests:
+            steps["tests"] = "skipped"
+        if not options.tag:
+            steps["git_tag"] = "skipped"
+        if options.skip_build:
+            steps["docker_build"] = "skipped"
+        if options.skip_push:
+            steps["docker_push"] = "skipped"
+        if not options.effective_verify_image():
+            steps["image_verify"] = "skipped"
+        if not options.effective_status():
+            steps["status"] = "skipped"
+        if not options.push_tag:
+            steps["git_tag_push"] = "skipped"
+        state = ReleaseState(
+            version=options.version or "",
+            image=options.required_image(),
+            repo=str(cwd),
+            commit=commit,
+            namespace=options.namespace,
+            manifest_dir=str(options.manifest_dir),
+            verify_image_method=options.verify_image_method,
+            steps=steps,
+        )
+        state.write(state_path)
+        report.state_file = str(state_path)
+        return state
+
+    def _append_step(
+        self,
+        report: ReleaseUpgradeReport,
+        step: ReleaseStep,
+        *,
+        state: ReleaseState | None,
+        state_path: Path | None,
+    ) -> ReleaseStep:
+        report.steps.append(step)
+        self._mark_state_step(step, state=state, state_path=state_path)
+        return step
+
+    def _mark_state_step(self, step: ReleaseStep, *, state: ReleaseState | None, state_path: Path | None) -> None:
+        if state is None or state_path is None:
+            return
+        step_key = STATE_STEP_KEYS.get(step.name)
+        if step_key is None:
+            return
+        state.mark(step_key, step.status, state_path)
+
     def _validate_options(self, options: ReleaseUpgradeOptions, report: ReleaseUpgradeReport) -> None:
+        if options.verify_image_method not in VERIFY_IMAGE_METHODS:
+            detail = "Invalid --verify-image-method. Choose manifest or pull."
+            report.steps.append(ReleaseStep(name="Validate options", status="failed", detail=detail))
+            raise ReleaseUpgradeError(detail, report)
         bump_modes = [
             ("--bump-patch", options.bump_patch),
             ("--bump-minor", options.bump_minor),
@@ -740,15 +934,30 @@ class ReleaseUpgrader:
             report.steps.append(ReleaseStep(name="Docker push", status="planned", command=options.docker_push_command()))
         if options.effective_verify_image():
             report.steps.append(ReleaseStep(name="Image verify", status="planned", command=options.docker_verify_command()))
-        if options.push_tag:
+        if options.push_tag and not options.push_tag_after_k8s:
             report.steps.append(ReleaseStep(name="Git tag push", status="planned", command=options.git_push_tag_command()))
         report.steps.append(ReleaseStep(name="Kubernetes upgrade", status="planned", command=options.k8s_upgrade_command()))
+        if options.apply and options.effective_run_doctor():
+            report.steps.append(ReleaseStep(name="Doctor", status="planned"))
+        if options.apply and options.effective_cleanup_failed():
+            report.steps.append(ReleaseStep(name="Cleanup failed jobs/pods", status="planned"))
         if options.effective_status():
             report.steps.append(ReleaseStep(name="Status", status="planned", command=options.k8s_status_command()))
         else:
             report.steps.append(ReleaseStep(name="Status", status="skipped", detail="status not requested"))
+        if options.push_tag and options.push_tag_after_k8s:
+            report.steps.append(ReleaseStep(name="Git tag push", status="planned", command=options.git_push_tag_command()))
 
-    def _run_command(self, report: ReleaseUpgradeReport, name: str, command: list[str], *, cwd: Path) -> ReleaseStep:
+    def _run_command(
+        self,
+        report: ReleaseUpgradeReport,
+        name: str,
+        command: list[str],
+        *,
+        cwd: Path,
+        state: ReleaseState | None = None,
+        state_path: Path | None = None,
+    ) -> ReleaseStep:
         result = self.command_runner.run(command, cwd=cwd)
         step = ReleaseStep(
             name=name,
@@ -758,25 +967,38 @@ class ReleaseUpgrader:
             stdout=result.stdout,
             stderr=result.stderr,
         )
-        report.steps.append(step)
+        self._append_step(report, step, state=state, state_path=state_path)
         if result.returncode != 0:
             raise ReleaseUpgradeError(f"{name} failed.", report)
         return step
 
-    def _check_git_status(self, report: ReleaseUpgradeReport, options: ReleaseUpgradeOptions, name: str, *, cwd: Path) -> ReleaseStep:
-        step = self._run_command(report, name, ["git", "status", "--porcelain"], cwd=cwd)
+    def _check_git_status(
+        self,
+        report: ReleaseUpgradeReport,
+        options: ReleaseUpgradeOptions,
+        name: str,
+        *,
+        cwd: Path,
+        state: ReleaseState | None = None,
+        state_path: Path | None = None,
+    ) -> ReleaseStep:
+        step = self._run_command(report, name, ["git", "status", "--porcelain"], cwd=cwd, state=state, state_path=state_path)
         dirty = _dirty_paths(step.stdout)
         if not dirty:
             step.detail = "clean"
+            self._mark_state_step(step, state=state, state_path=state_path)
             return step
         if _only_generated_dirty(dirty, repo=cwd, manifest_dir=options.resolved_manifest_dir()) and options.allow_generated_dirty:
             step.detail = "generated manifests dirty allowed"
+            self._mark_state_step(step, state=state, state_path=state_path)
             return step
         if options.allow_dirty:
             step.detail = "dirty allowed"
+            self._mark_state_step(step, state=state, state_path=state_path)
             return step
         step.status = "failed"
         step.detail = "dirty working tree"
+        self._mark_state_step(step, state=state, state_path=state_path)
         raise ReleaseUpgradeError("Working tree is dirty. Use --allow-dirty to continue.", report)
 
     def _ensure_manifest_dir(
@@ -786,24 +1008,238 @@ class ReleaseUpgrader:
         *,
         repo: Path,
         manifest_dir: Path,
+        state: ReleaseState | None = None,
+        state_path: Path | None = None,
     ) -> None:
         if manifest_dir.exists() and not manifest_dir.is_dir():
             detail = f"Kubernetes manifest path is not a directory: {manifest_dir}."
-            report.steps.append(ReleaseStep(name="Kubernetes manifest preflight", status="failed", detail=detail))
+            self._append_step(
+                report,
+                ReleaseStep(name="Kubernetes manifest preflight", status="failed", detail=detail),
+                state=state,
+                state_path=state_path,
+            )
             raise ReleaseUpgradeError("Kubernetes manifest preflight failed.", report)
         if manifest_dir.exists():
-            report.steps.append(ReleaseStep(name="Kubernetes manifest preflight", status="passed", detail="present"))
+            self._append_step(
+                report,
+                ReleaseStep(name="Kubernetes manifest preflight", status="passed", detail="present"),
+                state=state,
+                state_path=state_path,
+            )
             return
         if not options.bootstrap_k8s:
             detail = f"Kubernetes manifest dir is missing: {manifest_dir}. Run bootstrap first or use --bootstrap-k8s."
-            report.steps.append(ReleaseStep(name="Kubernetes manifest preflight", status="failed", detail=detail))
+            self._append_step(
+                report,
+                ReleaseStep(name="Kubernetes manifest preflight", status="failed", detail=detail),
+                state=state,
+                state_path=state_path,
+            )
             raise ReleaseUpgradeError("Kubernetes manifest preflight failed.", report)
-        self._run_command(report, "Kubernetes bootstrap", options.bootstrap_command(), cwd=repo)
+        self._run_command(report, "Kubernetes bootstrap", options.bootstrap_command(), cwd=repo, state=state, state_path=state_path)
         if not manifest_dir.exists() or not manifest_dir.is_dir():
             detail = f"Kubernetes manifest dir is still missing after bootstrap: {manifest_dir}."
-            report.steps.append(ReleaseStep(name="Kubernetes manifest preflight", status="failed", detail=detail))
+            self._append_step(
+                report,
+                ReleaseStep(name="Kubernetes manifest preflight", status="failed", detail=detail),
+                state=state,
+                state_path=state_path,
+            )
             raise ReleaseUpgradeError("Kubernetes manifest preflight failed.", report)
-        report.steps.append(ReleaseStep(name="Kubernetes manifest preflight", status="passed", detail="present after bootstrap"))
+        self._append_step(
+            report,
+            ReleaseStep(name="Kubernetes manifest preflight", status="passed", detail="present after bootstrap"),
+            state=state,
+            state_path=state_path,
+        )
+
+
+class ReleaseResumer:
+    def __init__(
+        self,
+        *,
+        command_runner: ReleaseCommandRunner | None = None,
+        operator_factory: Any | None = None,
+    ) -> None:
+        self.command_runner = command_runner or SubprocessReleaseCommandRunner()
+        self.operator_factory = operator_factory or (lambda namespace, manifest_dir: K8sOperator(namespace=namespace, manifest_dir=manifest_dir))
+
+    def run(self, options: ReleaseResumeOptions) -> ReleaseUpgradeReport:
+        repo = options.resolved_repo()
+        state_path = options.resolved_state_file()
+        state = ReleaseState.from_file(state_path)
+        verify_method = options.verify_image_method or state.verify_image_method
+        report = ReleaseUpgradeReport(
+            image=state.image,
+            repo=state.repo,
+            namespace=state.namespace,
+            manifest_dir=str(repo / state.manifest_dir if not Path(state.manifest_dir).is_absolute() else Path(state.manifest_dir)),
+            workflow="resume",
+            dry_run=options.dry_run,
+            current_version=None,
+            new_version=state.version,
+            verify_image_method=verify_method,
+            state_file=str(state_path),
+        )
+        if verify_method not in VERIFY_IMAGE_METHODS:
+            report.steps.append(ReleaseStep(name="Validate options", status="failed", detail="Invalid --verify-image-method. Choose manifest or pull."))
+            raise ReleaseUpgradeError("Invalid release resume options.", report)
+        current_commit = self._command_stdout_or_unknown(["git", "rev-parse", "HEAD"], cwd=repo)
+        if state.commit != "unknown" and current_commit != state.commit and not options.allow_head_mismatch:
+            report.steps.append(
+                ReleaseStep(
+                    name="Validate state",
+                    status="failed",
+                    detail=f"HEAD {current_commit} does not match release state commit {state.commit}.",
+                )
+            )
+            raise ReleaseUpgradeError("Release state HEAD mismatch.", report)
+        if options.dry_run:
+            self._add_dry_run_steps(report, state=state, verify_method=verify_method)
+            return report
+
+        manifest_dir = Path(state.manifest_dir)
+        if not manifest_dir.is_absolute():
+            manifest_dir = repo / manifest_dir
+        if not _state_step_passed(state, "git_tag"):
+            if self._local_tag_exists(state.version, cwd=repo):
+                self._mark_state(state, state_path, report, "Git tag", "passed", detail="already exists")
+            else:
+                self._run_command(report, state, state_path, "Git tag", ["git", "tag", state.version], cwd=repo)
+        if not _state_step_passed(state, "docker_build"):
+            self._run_command(report, state, state_path, "Docker build", ["docker", "build", "-t", state.image, "."], cwd=repo)
+        if not _state_step_passed(state, "docker_push"):
+            self._run_command(report, state, state_path, "Docker push", ["docker", "push", state.image], cwd=repo)
+        if not _state_step_passed(state, "image_verify"):
+            self._run_command(report, state, state_path, "Image verify", _verify_command("docker", state.image, verify_method), cwd=repo)
+        operator = self.operator_factory(state.namespace, manifest_dir)
+        if not _state_step_passed(state, "k8s_upgrade"):
+            try:
+                upgrade_report = operator.upgrade(
+                    image=state.image,
+                    version=state.version,
+                    apply=True,
+                    preserve_cluster_config=True,
+                    preserve_local_config=False,
+                    run_doctor=True,
+                    show_status=True,
+                    cleanup_failed=True,
+                )
+            except K8sOperatorError as exc:
+                self._mark_state(state, state_path, report, "Kubernetes upgrade", "failed", detail=str(exc))
+                raise ReleaseUpgradeError("Kubernetes upgrade failed.", report) from exc
+            self._mark_state(
+                state,
+                state_path,
+                report,
+                "Kubernetes upgrade",
+                "passed",
+                command=["agentlab", "k8s", "upgrade", "--image", state.image, "--version", state.version, "--apply"],
+                stdout=format_upgrade_report(upgrade_report),
+            )
+            if getattr(upgrade_report, "image_drift", []):
+                state.mark("k8s_upgrade", "failed", state_path)
+                report.steps[-1].status = "failed"
+                report.steps[-1].detail = "image drift remains"
+                raise ReleaseUpgradeError("Kubernetes upgrade reported image drift.", report)
+        if not _state_step_passed(state, "status"):
+            try:
+                cluster_status = operator.status(manifest_dir=manifest_dir)
+            except K8sOperatorError as exc:
+                self._mark_state(state, state_path, report, "Status", "failed", detail=str(exc))
+                raise ReleaseUpgradeError("Kubernetes status failed.", report) from exc
+            self._mark_state(
+                state,
+                state_path,
+                report,
+                "Status",
+                "passed",
+                command=["agentlab", "k8s", "status", "--namespace", state.namespace, "--manifest-dir", state.manifest_dir],
+                stdout=format_status(cluster_status),
+            )
+            if _status_has_image_drift(cluster_status):
+                state.mark("status", "failed", state_path)
+                report.steps[-1].status = "failed"
+                report.steps[-1].detail = "image drift remains"
+                raise ReleaseUpgradeError("Kubernetes status reported image drift.", report)
+        if not _state_step_passed(state, "git_tag_push"):
+            self._run_command(report, state, state_path, "Git tag push", ["git", "push", "origin", state.version], cwd=repo)
+        state.completed = True
+        state.write(state_path)
+        return report
+
+    def _add_dry_run_steps(self, report: ReleaseUpgradeReport, *, state: ReleaseState, verify_method: str) -> None:
+        planned = [
+            ("Git tag", "git_tag", ["git", "tag", state.version]),
+            ("Docker build", "docker_build", ["docker", "build", "-t", state.image, "."]),
+            ("Docker push", "docker_push", ["docker", "push", state.image]),
+            ("Image verify", "image_verify", _verify_command("docker", state.image, verify_method)),
+            ("Kubernetes upgrade", "k8s_upgrade", ["agentlab", "k8s", "upgrade", "--image", state.image, "--version", state.version, "--apply"]),
+            ("Status", "status", ["agentlab", "k8s", "status", "--namespace", state.namespace, "--manifest-dir", state.manifest_dir]),
+            ("Git tag push", "git_tag_push", ["git", "push", "origin", state.version]),
+        ]
+        for name, key, command in planned:
+            if not _state_step_passed(state, key):
+                report.steps.append(ReleaseStep(name=name, status="planned", command=command))
+
+    def _run_command(
+        self,
+        report: ReleaseUpgradeReport,
+        state: ReleaseState,
+        state_path: Path,
+        name: str,
+        command: list[str],
+        *,
+        cwd: Path,
+    ) -> ReleaseStep:
+        result = self.command_runner.run(command, cwd=cwd)
+        status = "passed" if result.returncode == 0 else "failed"
+        step = self._mark_state(
+            state,
+            state_path,
+            report,
+            name,
+            status,
+            command=result.args,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            returncode=result.returncode,
+        )
+        if result.returncode != 0:
+            raise ReleaseUpgradeError(f"{name} failed.", report)
+        return step
+
+    def _mark_state(
+        self,
+        state: ReleaseState,
+        state_path: Path,
+        report: ReleaseUpgradeReport,
+        name: str,
+        status: str,
+        *,
+        command: list[str] | None = None,
+        detail: str = "",
+        stdout: str = "",
+        stderr: str = "",
+        returncode: int | None = None,
+    ) -> ReleaseStep:
+        step = ReleaseStep(name=name, status=status, command=command, detail=detail, stdout=stdout, stderr=stderr, returncode=returncode)
+        report.steps.append(step)
+        step_key = STATE_STEP_KEYS.get(name)
+        if step_key:
+            state.mark(step_key, status, state_path)
+        return step
+
+    def _local_tag_exists(self, tag: str, *, cwd: Path) -> bool:
+        result = self.command_runner.run(["git", "rev-parse", "-q", "--verify", f"refs/tags/{tag}"], cwd=cwd)
+        return result.returncode == 0
+
+    def _command_stdout_or_unknown(self, command: list[str], *, cwd: Path) -> str:
+        result = self.command_runner.run(command, cwd=cwd)
+        if result.returncode != 0:
+            return "unknown"
+        return result.stdout.strip() or "unknown"
 
 
 def parse_command_text(value: str | None) -> list[str] | None:
@@ -814,19 +1250,21 @@ def parse_command_text(value: str | None) -> list[str] | None:
 
 def format_release_report(report: ReleaseUpgradeReport) -> str:
     lines = [
-        "AgentLab release upgrade",
+        f"AgentLab release {report.workflow}",
         "",
         f"Current version: {report.current_version or 'unknown'}",
         f"New version:     {report.new_version or 'not set'}",
         f"Current image:   {report.current_image or 'unknown'}",
         f"New image:       {report.image}",
+        f"Verify method:   {report.verify_image_method}",
         f"Version source:  {report.version_source or 'not applicable'}",
         f"Repo: {report.repo}",
         f"Namespace: {report.namespace}",
         f"Manifest dir: {report.manifest_dir}",
-        "",
-        "Steps:",
     ]
+    if report.state_file:
+        lines.append(f"State file: {report.state_file}")
+    lines.extend(["", "Steps:"])
     for index, step in enumerate(report.steps, start=1):
         status = step.detail or step.status
         lines.append(f"{index}. {step.name}: {status}")
@@ -884,6 +1322,16 @@ def _only_generated_dirty(paths: list[str], *, repo: Path, manifest_dir: Path) -
 
 def _status_has_image_drift(status: ClusterStatus) -> bool:
     return any(item.image_drift for item in status.cronjobs) or bool(status.manifest_image_drifts)
+
+
+def _verify_command(docker_bin: str, image: str, method: str) -> list[str]:
+    if method == "pull":
+        return [docker_bin, "pull", image]
+    return [docker_bin, "manifest", "inspect", image]
+
+
+def _state_step_passed(state: ReleaseState, step_key: str) -> bool:
+    return state.steps.get(step_key) in {"passed", "skipped"}
 
 
 def _step_status(report: ReleaseUpgradeReport, name: str) -> str:
