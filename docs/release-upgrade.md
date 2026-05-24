@@ -2,7 +2,47 @@
 
 `agentlab release upgrade` runs the local release workflow from one command: resolve the release version, pull code, run tests, build and push the image, update Kubernetes manifests, and optionally apply and verify the cluster.
 
-Git tags are the source of release truth. A normal `main` commit does not bump the AgentLab version. A release version changes only when an operator intentionally runs `agentlab release upgrade --bump-patch`, `--bump-minor`, `--bump-major`, or `--version`.
+Git tags are the source of release truth. A normal `main` commit does not bump the AgentLab version. A release version changes only when an operator intentionally runs `agentlab release deploy`, `agentlab release upgrade --bump-patch`, `--bump-minor`, `--bump-major`, or `--version`.
+
+## Simple Deploy
+
+The recommended operator command is:
+
+```bash
+agentlab release deploy
+```
+
+`deploy` is the safe default path. It uses the current working directory, resolves the current version from Git tags and Kubernetes release annotations, defaults to a patch bump, builds and pushes the derived image, verifies the image with `docker pull`, applies the Kubernetes upgrade while preserving cluster config, runs doctor, cleans failed jobs/pods, shows status, and pushes the Git tag only after the Kubernetes upgrade/status path succeeds.
+
+Preview the full plan without mutating Git, Docker, or Kubernetes:
+
+```bash
+agentlab release deploy --dry-run
+```
+
+Useful deploy overrides:
+
+```bash
+agentlab release deploy --bump-minor
+agentlab release deploy --version v0.2.0
+agentlab release deploy --image-repository registry.example.com/agentlab
+agentlab release deploy --no-tests --dry-run
+agentlab release deploy --no-apply --dry-run
+```
+
+Resume the latest failed or incomplete deploy:
+
+```bash
+agentlab release resume
+```
+
+Resume reads `.agentlab/release-state.json`, refuses to continue if `HEAD` differs from the recorded commit unless `--allow-head-mismatch` is supplied, skips steps already marked passed, and pushes the Git tag only after Kubernetes upgrade/status completes.
+
+Preview only the remaining resume work:
+
+```bash
+agentlab release resume --dry-run
+```
 
 ## Recommended Release
 
@@ -55,7 +95,10 @@ Current version: v0.1.17
 New version:     v0.1.18
 Current image:   registry.example.com/agentlab:0.1.17
 New image:       registry.example.com/agentlab:0.1.18
+Verify method:   manifest
 ```
+
+For `agentlab release deploy --dry-run`, the header is the same but the verify method defaults to `pull`.
 
 ## Explicit Version
 
@@ -123,6 +166,48 @@ The bump/version release flow runs in this order:
 
 Docker build and push must pass before Kubernetes upgrade. If image verification fails, Kubernetes upgrade is not run and the Git tag is not pushed.
 
+`agentlab release deploy` pushes the Git tag after Kubernetes upgrade/status succeeds. Existing `agentlab release upgrade --push-tag` preserves its historical ordering unless you use the deploy wrapper.
+
+## Image Verification
+
+`agentlab release upgrade` supports:
+
+```bash
+agentlab release upgrade --verify-image --verify-image-method manifest
+agentlab release upgrade --verify-image --verify-image-method pull
+```
+
+`manifest` runs:
+
+```bash
+docker manifest inspect <image>
+```
+
+`pull` runs:
+
+```bash
+docker pull <image>
+```
+
+Local/private registries may not support `docker manifest inspect` reliably even when `docker pull` succeeds. `agentlab release deploy` therefore defaults to `--verify-image-method pull`. Use `--no-verify-image` with `release upgrade` only when you have verified the image separately.
+
+Manual fallback for older versions or unusual registry behavior:
+
+```bash
+docker pull <image>
+agentlab release upgrade \
+  --image <image> \
+  --version <version> \
+  --skip-build \
+  --skip-push \
+  --no-verify-image \
+  --apply \
+  --preserve-cluster-config \
+  --run-doctor \
+  --cleanup-failed \
+  --status
+```
+
 ## Prepare Only
 
 ```bash
@@ -183,6 +268,7 @@ Use `--no-allow-generated-dirty` to make generated manifest changes fail like an
 - `--tag` / `--no-tag`: create a local Git tag for versioned releases.
 - `--push-tag` / `--no-push-tag`: push the Git tag only after image push and verification succeeds.
 - `--verify-image` / `--no-verify-image`: control pushed image verification.
+- `--verify-image-method manifest|pull`: choose `docker manifest inspect` or `docker pull` verification.
 - `--skip-git-pull`: do not run `git pull`.
 - `--pull-ff-only` / `--no-pull-ff-only`: use `git pull --ff-only` by default.
 - `--allow-dirty`: continue even when `git status --porcelain` reports local changes.
