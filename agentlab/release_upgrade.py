@@ -245,6 +245,7 @@ def image_for_release(repository: str, version: ReleaseVersion, *, prefix_v: boo
 class ReleaseUpgradeOptions:
     image: str | None = None
     version: str | None = None
+    runtime_version: str | None = None
     current_version: str | None = None
     bump_patch: bool = False
     bump_minor: bool = False
@@ -252,7 +253,6 @@ class ReleaseUpgradeOptions:
     image_repository: str | None = None
     image_tag_prefix_v: bool = False
     runtime_build: bool = False
-    runtime_version: str | None = None
     runtime_image_tag: str | None = None
     tag: bool = False
     push_tag: bool = False
@@ -319,7 +319,10 @@ class ReleaseUpgradeOptions:
         return self.apply if self.status is None else self.status
 
     def is_versioned_release(self) -> bool:
-        return bool(self.version or self.bump_patch or self.bump_minor or self.bump_major)
+        return bool(self.version or self.runtime_version or self.runtime_build or self.bump_patch or self.bump_minor or self.bump_major)
+
+    def annotation_version(self) -> str | None:
+        return self.runtime_version or self.version
 
     def effective_verify_image(self) -> bool:
         if self.verify_image is not None:
@@ -405,6 +408,8 @@ class ReleaseUpgradeOptions:
         ]
         if self.version:
             command.extend(["--version", self.version])
+        if self.runtime_version:
+            command.extend(["--runtime-version", self.runtime_version])
         if self.apply:
             command.append("--apply")
         if self.effective_preserve_cluster_config():
@@ -536,7 +541,10 @@ class ReleaseUpgrader:
             report.steps.append(ReleaseStep(name="Resolve release", status="failed", detail=str(exc)))
             raise ReleaseUpgradeError("Release version resolution failed.", report) from exc
         options.image = resolved.image
-        options.version = resolved.release_version
+        if options.runtime_build or options.runtime_version:
+            options.runtime_version = resolved.release_version
+        else:
+            options.version = resolved.release_version
         report.image = resolved.image
         report.current_version = resolved.current_version
         report.new_version = resolved.release_version
@@ -607,8 +615,8 @@ class ReleaseUpgrader:
             "show_status": options.effective_status(),
             "cleanup_failed": options.effective_cleanup_failed(),
         }
-        if options.version:
-            upgrade_kwargs["version"] = options.version
+        if options.annotation_version():
+            upgrade_kwargs["version"] = options.annotation_version()
         try:
             upgrade_report = operator.upgrade(**upgrade_kwargs)
         except K8sOperatorError as exc:
@@ -718,7 +726,7 @@ class ReleaseUpgrader:
         if not options.push_tag:
             steps["git_tag_push"] = "skipped"
         state = ReleaseState(
-            version=options.version or "",
+            version=options.annotation_version() or "",
             image=options.required_image(),
             repo=str(cwd),
             commit=commit,
@@ -783,6 +791,7 @@ class ReleaseUpgrader:
             for name, enabled in (
                 ("--image", bool(options.image)),
                 ("--version", bool(options.version)),
+                ("--runtime-version", bool(options.runtime_version and not options.runtime_build)),
                 ("--runtime-build", options.runtime_build),
                 *bump_modes,
             )
@@ -797,6 +806,22 @@ class ReleaseUpgrader:
             detail = "--runtime-build cannot be combined with --image, --version, or --bump-*."
             report.steps.append(ReleaseStep(name="Validate options", status="failed", detail=detail))
             raise ReleaseUpgradeError(detail, report)
+        if options.version and options.runtime_version:
+            detail = "Choose either --version or --runtime-version, not both."
+            report.steps.append(ReleaseStep(name="Validate options", status="failed", detail=detail))
+            raise ReleaseUpgradeError(detail, report)
+        if options.runtime_version is not None and not options.runtime_version.strip():
+            detail = "--runtime-version must not be empty."
+            report.steps.append(ReleaseStep(name="Validate options", status="failed", detail=detail))
+            raise ReleaseUpgradeError(detail, report)
+        if options.runtime_version and not options.image and not options.runtime_build:
+            detail = "--runtime-version requires --image or runtime update mode."
+            report.steps.append(ReleaseStep(name="Validate options", status="failed", detail=detail))
+            raise ReleaseUpgradeError(detail, report)
+        if options.runtime_version and selected_bumps:
+            detail = "--runtime-version cannot be combined with --bump-*."
+            report.steps.append(ReleaseStep(name="Validate options", status="failed", detail=detail))
+            raise ReleaseUpgradeError(detail, report)
         if options.image and selected_bumps:
             detail = "--image cannot be combined with --bump-*; use --image alone for manual deploys or --version with --image to write a release annotation."
             report.steps.append(ReleaseStep(name="Validate options", status="failed", detail=detail))
@@ -806,7 +831,7 @@ class ReleaseUpgrader:
             report.steps.append(ReleaseStep(name="Validate options", status="failed", detail=detail))
             raise ReleaseUpgradeError(detail, report)
         if not options.image and not options.version and not selected_bumps and not options.runtime_build:
-            detail = "Choose a release selection mode: --image, --version, --bump-patch, --bump-minor, or --bump-major."
+            detail = "Choose a release selection mode: --image, --version, --runtime-version, --bump-patch, --bump-minor, or --bump-major."
             report.steps.append(ReleaseStep(name="Validate options", status="failed", detail=detail))
             raise ReleaseUpgradeError(detail, report)
         if options.runtime_build and (options.tag or options.push_tag or options.github_release):
@@ -882,12 +907,14 @@ class ReleaseUpgrader:
             )
 
         if options.image:
-            release_version = parse_release_version(options.version).tag if options.version else None
+            release_version = options.runtime_version or (parse_release_version(options.version).tag if options.version else None)
             return ResolvedRelease(
                 image=options.image,
                 release_version=release_version,
                 image_repository=image_repository_from_image(options.image),
-                version_source="--image + --version" if release_version else "explicit image",
+                version_source="--image + --runtime-version"
+                if options.runtime_version
+                else ("--image + --version" if release_version else "explicit image"),
             )
         current_version: ReleaseVersion | None = None
         current_version_source = ""
@@ -1210,7 +1237,7 @@ class ReleaseResumer:
                     report,
                     "Kubernetes upgrade",
                     "passed",
-                    command=["agentlab", "k8s", "upgrade", "--image", state.image, "--version", state.version, "--apply"],
+                    command=_state_k8s_upgrade_command(state),
                     stdout=format_upgrade_report(upgrade_report),
                 )
                 if getattr(upgrade_report, "image_drift", []):
@@ -1254,7 +1281,7 @@ class ReleaseResumer:
             ("Docker build", "docker_build", [docker_bin, "build", "-t", state.image, "."]),
             ("Docker push", "docker_push", [docker_bin, "push", state.image]),
             ("Image verify", "image_verify", _verify_command(docker_bin, state.image, verify_method)),
-            ("Kubernetes upgrade", "k8s_upgrade", ["agentlab", "k8s", "upgrade", "--image", state.image, "--version", state.version, "--apply"]),
+            ("Kubernetes upgrade", "k8s_upgrade", _state_k8s_upgrade_command(state)),
             ("Status", "status", ["agentlab", "k8s", "status", "--namespace", state.namespace, "--manifest-dir", state.manifest_dir]),
             ("Git tag push", "git_tag_push", ["git", "push", "origin", state.version]),
         ]
@@ -1375,9 +1402,15 @@ def format_release_report(report: ReleaseUpgradeReport) -> str:
             lines.append(f"- command: {_format_command(failed.command)}")
         if failed.returncode is not None:
             lines.append(f"- exit code: {failed.returncode}")
-        snippet = _stderr_snippet(failed.stderr or failed.detail)
-        if snippet:
-            lines.append(f"- stderr: {snippet}")
+        stdout = _output_snippet(failed.stdout)
+        stderr = _output_snippet(failed.stderr)
+        detail = _output_snippet(failed.detail)
+        if stdout:
+            lines.append(f"- stdout: {stdout}")
+        if stderr:
+            lines.append(f"- stderr: {stderr}")
+        if detail and not stderr:
+            lines.append(f"- detail: {detail}")
     return "\n".join(lines)
 
 
@@ -1385,7 +1418,7 @@ def _format_command(command: list[str]) -> str:
     return shlex.join(str(part) for part in command)
 
 
-def _stderr_snippet(value: str, *, limit: int = 500) -> str:
+def _output_snippet(value: str, *, limit: int = 1000) -> str:
     text = " ".join(value.strip().split())
     if len(text) <= limit:
         return text
@@ -1424,6 +1457,15 @@ def _verify_command(docker_bin: str, image: str, method: str) -> list[str]:
     if method == "pull":
         return [docker_bin, "pull", image]
     return [docker_bin, "manifest", "inspect", image]
+
+
+def _state_k8s_upgrade_command(state: ReleaseState) -> list[str]:
+    command = ["agentlab", "k8s", "upgrade", "--image", state.image]
+    if state.version:
+        option = "--version" if SEMVER_RE.match(state.version) else "--runtime-version"
+        command.extend([option, state.version])
+    command.append("--apply")
+    return command
 
 
 def _state_step_passed(state: ReleaseState, step_key: str) -> bool:

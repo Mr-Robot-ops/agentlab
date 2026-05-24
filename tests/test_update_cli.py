@@ -6,8 +6,9 @@ from pathlib import Path
 from typer.testing import CliRunner
 
 import agentlab.update_cli as update_cli
+from agentlab.k8s_operator import ClusterStatus
 from agentlab.main import app
-from agentlab.release_upgrade import ReleaseCommandResult, ReleaseStep, ReleaseUpgradeReport
+from agentlab.release_upgrade import ReleaseCommandResult, ReleaseStep, ReleaseUpgradeReport, ReleaseUpgrader
 from agentlab.update_cli import UPDATE_REEXEC_ENV, UpdateError, UpdateOptions, UpdateRunner, format_update_report
 
 
@@ -99,6 +100,16 @@ class FakeReleaseResumer:
         )
 
 
+class FakeStatusOperator:
+    def __init__(self, image: str = "registry/agentlab:0.1.20") -> None:
+        self.image = image
+        self.calls: list[object] = []
+
+    def status(self, *, manifest_dir: Path):
+        self.calls.append(("status", manifest_dir))
+        return ClusterStatus(namespace="agentlab", configmap_image=self.image)
+
+
 class FakeReexecutor:
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], dict[str, str]]] = []
@@ -174,6 +185,8 @@ def test_update_dry_run_does_not_run_git_pull_or_self_install(tmp_path: Path) ->
     assert [sys.executable, "-m", "pip", "install", "-e", "."] not in commands
     assert upgrader.calls[0].dry_run is True
     assert upgrader.calls[0].runtime_build is True
+    assert upgrader.calls[0].version is None
+    assert upgrader.calls[0].runtime_version == "commit target4"
     assert upgrader.calls[0].tag is False
     assert upgrader.calls[0].push_tag is False
     assert report.release_report is not None
@@ -203,6 +216,25 @@ def test_default_update_dry_run_prints_runtime_plan_without_git_tags(tmp_path: P
     assert "docker pull registry/agentlab:new4567" in rendered
     assert "Kubernetes upgrade" in rendered
     assert "Status" in rendered
+    assert "git tag" not in rendered
+    assert "git push origin" not in rendered
+
+
+def test_default_update_dry_run_infers_image_repository_from_cluster_status(tmp_path: Path) -> None:
+    repo = write_agentlab_repo(tmp_path)
+    command_runner = FakeCommandRunner()
+    configure_git_state(command_runner, current="8f1aff3abcdef", target="8f1aff3abcdef", merge_base="8f1aff3abcdef", behind="0")
+    operator = FakeStatusOperator("10.159.21.58:5000/agentlab:0.1.20")
+    upgrader = ReleaseUpgrader(command_runner=command_runner, operator_factory=lambda namespace, manifest_dir: operator)
+    update_runner = UpdateRunner(command_runner=command_runner, release_upgrader=upgrader, release_resumer=FakeReleaseResumer())
+
+    report = update_runner.run(UpdateOptions(repo=repo, dry_run=True))
+    rendered = format_update_report(report)
+
+    assert "Image:         10.159.21.58:5000/agentlab:8f1aff3" in rendered
+    assert "Version:       commit 8f1aff3" in rendered
+    assert "--runtime-version 'commit 8f1aff3'" in rendered
+    assert "--version 'commit 8f1aff3'" not in rendered
     assert "git tag" not in rendered
     assert "git push origin" not in rendered
 

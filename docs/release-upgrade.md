@@ -120,6 +120,12 @@ For explicit image rollouts, rollback, or manual repair, use the Kubernetes reco
 agentlab k8s upgrade --image IMAGE --version VERSION --apply
 ```
 
+Use `--version` only for official SemVer release annotations such as `v0.1.18`. For commit-based runtime rollouts, use `--runtime-version`:
+
+```bash
+agentlab k8s upgrade --image IMAGE --runtime-version "commit 0ae4869" --apply
+```
+
 ## Lower-Level Release Upgrade
 
 ```bash
@@ -188,6 +194,8 @@ agentlab release upgrade \
 
 `--version` accepts `0.1.18` or `v0.1.18`. Git tags keep the leading `v`; Docker image tags omit it by default. Use `--image-tag-prefix-v` only when the registry tag should also be `v0.1.18`.
 
+`--version` is SemVer-only. Runtime update labels such as `commit 0ae4869` are not valid release versions; use `--runtime-version` for those annotations.
+
 If AgentLab cannot infer the image repository from the deployed image annotation, pass it explicitly:
 
 ```bash
@@ -220,7 +228,22 @@ agentlab release upgrade \
   --preserve-cluster-config
 ```
 
-AgentLab never infers a release version from `--image` on this path. If `--version` is omitted, Kubernetes upgrade writes only `mr-robot-ops.github.io/agentlab-image` and leaves the version annotation unchanged.
+For a manual runtime rollout using a commit-tagged image, pass `--runtime-version` instead. This writes the same Kubernetes version annotation key, but does not parse the text as SemVer and does not create or push Git tags:
+
+```bash
+agentlab release upgrade \
+  --image registry.example.com/agentlab:0ae4869 \
+  --runtime-version "commit 0ae4869" \
+  --skip-git-pull \
+  --verify-image-method pull \
+  --apply \
+  --preserve-cluster-config \
+  --run-doctor \
+  --cleanup-failed \
+  --status
+```
+
+Do not pass `--version "commit 0ae4869"`; `--version` remains reserved for official SemVer releases. AgentLab never infers a release version from `--image` on this path. If both `--version` and `--runtime-version` are omitted, Kubernetes upgrade writes only `mr-robot-ops.github.io/agentlab-image` and leaves the version annotation unchanged.
 
 ## Ordering And Safety
 
@@ -273,7 +296,7 @@ Manual fallback for older versions or unusual registry behavior:
 docker pull <image>
 agentlab release upgrade \
   --image <image> \
-  --version <version> \
+  --runtime-version "commit <sha>" \
   --skip-build \
   --skip-push \
   --no-verify-image \
@@ -283,6 +306,8 @@ agentlab release upgrade \
   --cleanup-failed \
   --status
 ```
+
+Use `--version <vMAJOR.MINOR.PATCH>` instead when the image is an official SemVer release image.
 
 ## Prepare Only
 

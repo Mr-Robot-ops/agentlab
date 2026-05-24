@@ -144,6 +144,12 @@ Optionally write the release-version annotation at the same time:
 agentlab k8s upgrade --image registry.example.com/agentlab:0.1.18 --version v0.1.18
 ```
 
+`--version` is for official SemVer release annotations. For commit-based runtime updates, write the same annotation key with arbitrary runtime text via `--runtime-version`:
+
+```bash
+agentlab k8s upgrade --image registry.example.com/agentlab:0ae4869 --runtime-version "commit 0ae4869"
+```
+
 Preserve operator-tuned config from the live cluster ConfigMap:
 
 ```bash

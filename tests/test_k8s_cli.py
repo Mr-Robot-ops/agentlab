@@ -449,6 +449,40 @@ def test_upgrade_command_passes_optional_version(monkeypatch) -> None:
     assert fake.calls[0][1]["version"] == "v0.1.18"
 
 
+def test_upgrade_command_passes_runtime_version(monkeypatch) -> None:
+    fake = FakeOperator()
+    monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
+
+    result = runner.invoke(app, ["k8s", "upgrade", "--image", "registry/agentlab:new", "--runtime-version", "commit abc123"])
+
+    assert result.exit_code == 0
+    assert "New version: commit abc123" in result.output
+    assert fake.calls[0][1]["version"] == "commit abc123"
+
+
+def test_upgrade_command_rejects_version_and_runtime_version(monkeypatch) -> None:
+    fake = FakeOperator()
+    monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
+
+    result = runner.invoke(
+        app,
+        [
+            "k8s",
+            "upgrade",
+            "--image",
+            "registry/agentlab:new",
+            "--version",
+            "v0.1.18",
+            "--runtime-version",
+            "commit abc123",
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Choose either --version or --runtime-version" in result.output
+    assert fake.calls == []
+
+
 def test_upgrade_apply_with_yes_invokes_apply_options(monkeypatch) -> None:
     fake = FakeOperator()
     monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
