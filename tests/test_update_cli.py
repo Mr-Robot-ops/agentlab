@@ -8,7 +8,11 @@ from typer.testing import CliRunner
 import agentlab.update_cli as update_cli
 from agentlab.main import app
 from agentlab.release_upgrade import ReleaseCommandResult, ReleaseStep, ReleaseUpgradeReport
-from agentlab.update_cli import UpdateError, UpdateOptions, UpdateRunner, format_update_report
+from agentlab.update_cli import UPDATE_REEXEC_ENV, UpdateError, UpdateOptions, UpdateRunner, format_update_report
+
+
+class ReexecRequested(RuntimeError):
+    pass
 
 
 class FakeCommandRunner:
@@ -77,6 +81,15 @@ class FakeReleaseResumer:
         )
 
 
+class FakeReexecutor:
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[str], dict[str, str]]] = []
+
+    def __call__(self, command: list[str], env) -> None:
+        self.calls.append((command, dict(env)))
+        raise ReexecRequested()
+
+
 def write_agentlab_repo(tmp_path: Path) -> Path:
     (tmp_path / "pyproject.toml").write_text('[project]\nname = "agentlab"\n', encoding="utf-8")
     (tmp_path / "agentlab").mkdir()
@@ -109,6 +122,21 @@ def make_update_runner(runner: FakeCommandRunner | None = None) -> tuple[UpdateR
     resumer = FakeReleaseResumer()
     return (
         UpdateRunner(command_runner=command_runner, release_upgrader=upgrader, release_resumer=resumer),
+        command_runner,
+        upgrader,
+        resumer,
+    )
+
+
+def make_update_runner_with_reexecutor(
+    reexecutor: FakeReexecutor,
+    runner: FakeCommandRunner | None = None,
+) -> tuple[UpdateRunner, FakeCommandRunner, FakeReleaseUpgrader, FakeReleaseResumer]:
+    command_runner = runner or FakeCommandRunner()
+    upgrader = FakeReleaseUpgrader()
+    resumer = FakeReleaseResumer()
+    return (
+        UpdateRunner(command_runner=command_runner, release_upgrader=upgrader, release_resumer=resumer, reexecutor=reexecutor),
         command_runner,
         upgrader,
         resumer,
@@ -255,15 +283,22 @@ def test_update_rejects_unrelated_dirty_files_unless_allowed(tmp_path: Path) -> 
     assert report.steps[0].detail == "dirty allowed"
 
 
-def test_real_update_runs_pull_self_install_then_release_deploy(tmp_path: Path) -> None:
+def test_real_update_runs_pull_self_install_then_reexec_before_release_deploy(tmp_path: Path, monkeypatch) -> None:
     repo = write_agentlab_repo(tmp_path)
-    update_runner, runner, upgrader, _resumer = make_update_runner()
+    reexecutor = FakeReexecutor()
+    update_runner, runner, upgrader, _resumer = make_update_runner_with_reexecutor(reexecutor)
+    monkeypatch.setattr(sys, "argv", ["agentlab", "update", "--current-version", "0.1.19"])
     runner.responses[("git", "status", "--porcelain")] = [
         ReleaseCommandResult(args=["git", "status", "--porcelain"], stdout=""),
         ReleaseCommandResult(args=["git", "status", "--porcelain"], stdout=""),
     ]
 
-    update_runner.run(UpdateOptions(repo=repo, current_version="0.1.19", image_repository="registry/agentlab"))
+    try:
+        update_runner.run(UpdateOptions(repo=repo, current_version="0.1.19", image_repository="registry/agentlab"))
+    except ReexecRequested:
+        pass
+    else:
+        raise AssertionError("expected update re-exec")
 
     commands = [call[0] for call in runner.calls]
     assert commands == [
@@ -272,10 +307,57 @@ def test_real_update_runs_pull_self_install_then_release_deploy(tmp_path: Path) 
         ["git", "status", "--porcelain"],
         [sys.executable, "-m", "pip", "install", "-e", "."],
     ]
+    assert not upgrader.calls
+    assert reexecutor.calls
+    command, env = reexecutor.calls[0]
+    assert command == [sys.executable, "-m", "agentlab.main", "update", "--current-version", "0.1.19"]
+    assert env[UPDATE_REEXEC_ENV] == "1"
+
+
+def test_reexec_marker_skips_pull_and_self_install_then_release_deploy(tmp_path: Path, monkeypatch) -> None:
+    repo = write_agentlab_repo(tmp_path)
+    reexecutor = FakeReexecutor()
+    update_runner, runner, upgrader, _resumer = make_update_runner_with_reexecutor(reexecutor)
+    runner.respond(["git", "status", "--porcelain"], stdout="")
+
+    monkeypatch.setenv(UPDATE_REEXEC_ENV, "1")
+    report = update_runner.run(UpdateOptions(repo=repo, current_version="0.1.19", image_repository="registry/agentlab"))
+
+    assert [call[0] for call in runner.calls] == [["git", "status", "--porcelain"]]
+    assert not reexecutor.calls
+    assert any(step.name == "Git pull" and step.status == "skipped" for step in report.steps)
+    assert any(step.name == "Self install" and step.status == "skipped" for step in report.steps)
     assert upgrader.calls[0].workflow == "deploy"
     assert upgrader.calls[0].skip_git_pull is True
     assert upgrader.calls[0].verify_image_method == "pull"
     assert upgrader.calls[0].push_tag_after_k8s is True
+
+
+def test_update_dry_run_resume_and_no_self_install_do_not_reexec(tmp_path: Path) -> None:
+    repo = write_agentlab_repo(tmp_path)
+    reexecutor = FakeReexecutor()
+
+    dry_runner, dry_cmd, _upgrader, _resumer = make_update_runner_with_reexecutor(reexecutor)
+    configure_git_state(dry_cmd)
+    dry_runner.run(UpdateOptions(repo=repo, dry_run=True, current_version="0.1.19", image_repository="registry/agentlab"))
+    assert not reexecutor.calls
+
+    resume_runner, _resume_cmd, _upgrader, resumer = make_update_runner_with_reexecutor(reexecutor)
+    resume_runner.run(UpdateOptions(repo=repo, resume=True, dry_run=False, current_version="0.1.19", image_repository="registry/agentlab"))
+    assert resumer.calls
+    assert not reexecutor.calls
+
+    no_install_runner, no_install_cmd, upgrader, _resumer = make_update_runner_with_reexecutor(reexecutor)
+    no_install_cmd.responses[("git", "status", "--porcelain")] = [
+        ReleaseCommandResult(args=["git", "status", "--porcelain"], stdout=""),
+        ReleaseCommandResult(args=["git", "status", "--porcelain"], stdout=""),
+    ]
+    no_install_runner.run(
+        UpdateOptions(repo=repo, current_version="0.1.19", image_repository="registry/agentlab", no_self_install=True)
+    )
+    assert [sys.executable, "-m", "pip", "install", "-e", "."] not in [call[0] for call in no_install_cmd.calls]
+    assert upgrader.calls
+    assert not reexecutor.calls
 
 
 def test_update_refuses_existing_incomplete_release_state(tmp_path: Path) -> None:

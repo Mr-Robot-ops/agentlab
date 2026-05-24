@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import os
 import shlex
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Sequence
+from typing import Callable, Mapping, Sequence
 
 import typer
 
@@ -26,6 +27,8 @@ from agentlab.release_upgrade import (
     format_release_report,
 )
 
+UPDATE_REEXEC_ENV = "AGENTLAB_UPDATE_REEXEC"
+
 
 @dataclass
 class UpdateOptions:
@@ -44,6 +47,7 @@ class UpdateOptions:
     namespace: str = DEFAULT_NAMESPACE
     manifest_dir: Path = DEFAULT_MANIFEST_DIR
     state_file: Path = DEFAULT_RELEASE_STATE_FILE
+    reexeced: bool = field(default_factory=lambda: os.environ.get(UPDATE_REEXEC_ENV) == "1")
 
     def resolved_repo(self) -> Path:
         return self.repo.resolve()
@@ -84,10 +88,12 @@ class UpdateRunner:
         command_runner: ReleaseCommandRunner | None = None,
         release_upgrader: ReleaseUpgrader | None = None,
         release_resumer: ReleaseResumer | None = None,
+        reexecutor: Callable[[list[str], Mapping[str, str]], None] | None = None,
     ) -> None:
         self.command_runner = command_runner or SubprocessReleaseCommandRunner()
         self.release_upgrader = release_upgrader or ReleaseUpgrader()
         self.release_resumer = release_resumer or ReleaseResumer()
+        self.reexecutor = reexecutor or reexec_update_process
 
     def run(self, options: UpdateOptions) -> UpdateReport:
         repo = options.resolved_repo()
@@ -110,15 +116,20 @@ class UpdateRunner:
         if options.dry_run:
             self._dry_run(options, report, repo=repo)
             return report
-        if options.no_git_pull:
+        if options.reexeced:
+            report.steps.append(ReleaseStep(name="Git pull", status="skipped", detail="already completed before re-exec"))
+        elif options.no_git_pull:
             report.steps.append(ReleaseStep(name="Git pull", status="skipped", detail="--no-git-pull"))
         else:
             self._run_command(report, "Git pull", ["git", "pull", "--ff-only", "origin", "main"], cwd=repo)
             self._check_git_status(options, report, "Git status after pull", cwd=repo)
-        if options.no_self_install:
+        if options.reexeced:
+            report.steps.append(ReleaseStep(name="Self install", status="skipped", detail="already completed before re-exec"))
+        elif options.no_self_install:
             report.steps.append(ReleaseStep(name="Self install", status="skipped", detail="--no-self-install"))
         else:
             self._run_command(report, "Self install", self_install_command(), cwd=repo)
+            self._reexec_update(report)
         release_report = self.release_upgrader.run(self._release_options(options, dry_run=False, skip_git_pull=True))
         report.release_report = release_report
         return report
@@ -283,6 +294,20 @@ class UpdateRunner:
             return "0"
         return result.stdout.strip() or "0"
 
+    def _reexec_update(self, report: UpdateReport) -> None:
+        command = reexec_update_command()
+        env = dict(os.environ)
+        env[UPDATE_REEXEC_ENV] = "1"
+        report.steps.append(
+            ReleaseStep(
+                name="Re-exec update",
+                status="handoff",
+                command=command,
+                detail=f"reload updated code with {UPDATE_REEXEC_ENV}=1",
+            )
+        )
+        self.reexecutor(command, env)
+
 
 @dataclass
 class _GitComparison:
@@ -295,6 +320,14 @@ class _GitComparison:
 
 def self_install_command() -> list[str]:
     return [sys.executable, "-m", "pip", "install", "-e", "."]
+
+
+def reexec_update_command() -> list[str]:
+    return [sys.executable, "-m", "agentlab.main", *sys.argv[1:]]
+
+
+def reexec_update_process(command: list[str], env: Mapping[str, str]) -> None:
+    os.execvpe(command[0], command, dict(env))
 
 
 def format_update_report(report: UpdateReport) -> str:

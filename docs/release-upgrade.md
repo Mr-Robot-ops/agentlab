@@ -18,7 +18,7 @@ Run the update:
 agentlab update
 ```
 
-`agentlab update` defaults to the current working directory, checks `git status`, allows only generated manifest dirtiness under `deploy/kubernetes/generated/**`, pulls `origin/main` with `git pull --ff-only`, re-checks `git status`, refreshes the editable install with the current Python interpreter, then runs the release deploy workflow with patch bump, pull-based image verification, Kubernetes apply, cluster config preservation, doctor, failed-resource cleanup, status, local tag creation, and remote tag push after Kubernetes upgrade/status succeeds.
+`agentlab update` defaults to the current working directory, checks `git status`, allows only generated manifest dirtiness under `deploy/kubernetes/generated/**`, pulls `origin/main` with `git pull --ff-only`, re-checks `git status`, refreshes the editable install with the current Python interpreter, then re-execs itself so the deploy phase uses freshly installed code. It then runs the release deploy workflow with patch bump, pull-based image verification, Kubernetes apply, cluster config preservation, doctor, failed-resource cleanup, status, local tag creation, and remote tag push after Kubernetes upgrade/status succeeds.
 
 If a previous release left `.agentlab/release-state.json` incomplete, `agentlab update` refuses to start a fresh release and tells you to resume:
 
