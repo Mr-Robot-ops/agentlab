@@ -35,9 +35,13 @@ class UpdateOptions:
     repo: Path = field(default_factory=Path.cwd)
     dry_run: bool = False
     resume: bool = False
+    release: bool = False
+    version: str | None = None
     patch: bool = False
     minor: bool = False
     major: bool = False
+    tag: bool = False
+    push_tag: bool = False
     current_version: str | None = None
     image_repository: str | None = None
     allow_dirty: bool = False
@@ -69,6 +73,7 @@ class UpdateReport:
     self_install_command: list[str] | None = None
     release_report: object | None = None
     steps: list[ReleaseStep] = field(default_factory=list)
+    runtime_version: str | None = None
 
     @property
     def failed_step(self) -> ReleaseStep | None:
@@ -141,6 +146,7 @@ class UpdateRunner:
             report.target_head = report.current_head
             report.git_state = "git pull disabled"
             report.planned_update = "none"
+            report.runtime_version = _commit_runtime_version(report.current_head)
         else:
             self._run_command(report, "Git fetch", ["git", "fetch", "origin"], cwd=repo)
             comparison = self._compare_origin_main(repo)
@@ -148,6 +154,7 @@ class UpdateRunner:
             report.target_head = comparison.target_head
             report.git_state = comparison.state
             report.planned_update = comparison.planned_update
+            report.runtime_version = _commit_runtime_version(comparison.runtime_head)
             if comparison.diverged:
                 step = ReleaseStep(name="Git state", status="failed", detail=comparison.state)
                 report.steps.append(step)
@@ -158,29 +165,64 @@ class UpdateRunner:
             command = self_install_command()
             report.self_install_command = command
             report.steps.append(ReleaseStep(name="Self install", status="planned", command=command))
-        release_report = self.release_upgrader.run(self._release_options(options, dry_run=True, skip_git_pull=True))
+        release_report = self.release_upgrader.run(
+            self._release_options(options, dry_run=True, skip_git_pull=True, runtime_head=report.runtime_version)
+        )
         report.release_report = release_report
 
-    def _release_options(self, options: UpdateOptions, *, dry_run: bool, skip_git_pull: bool) -> ReleaseUpgradeOptions:
-        patch = options.patch
-        if not options.patch and not options.minor and not options.major:
-            patch = True
+    def _release_options(
+        self,
+        options: UpdateOptions,
+        *,
+        dry_run: bool,
+        skip_git_pull: bool,
+        runtime_head: str | None = None,
+    ) -> ReleaseUpgradeOptions:
+        if options.release:
+            return ReleaseUpgradeOptions(
+                version=options.version,
+                current_version=options.current_version,
+                bump_patch=options.patch,
+                bump_minor=options.minor,
+                bump_major=options.major,
+                image_repository=options.image_repository,
+                repo=options.resolved_repo(),
+                namespace=options.namespace,
+                manifest_dir=options.manifest_dir,
+                verify_image=True,
+                verify_image_method=options.verify_image_method,
+                tag=options.tag,
+                push_tag=options.push_tag,
+                push_tag_after_k8s=True,
+                state_file=None if dry_run else options.state_file,
+                workflow="release-publish",
+                skip_git_pull=skip_git_pull,
+                allow_dirty=options.allow_dirty,
+                apply=True,
+                preserve_cluster_config=True,
+                run_doctor=True,
+                cleanup_failed=True,
+                status=True,
+                dry_run=dry_run,
+            )
+        runtime_tag = _runtime_image_tag(
+            runtime_head or self._stdout_or_unknown(["git", "rev-parse", "--short", "HEAD"], cwd=options.resolved_repo())
+        )
         return ReleaseUpgradeOptions(
-            current_version=options.current_version,
-            bump_patch=patch,
-            bump_minor=options.minor,
-            bump_major=options.major,
             image_repository=options.image_repository,
+            runtime_build=True,
+            runtime_image_tag=runtime_tag,
+            runtime_version=_commit_runtime_version(runtime_tag),
             repo=options.resolved_repo(),
             namespace=options.namespace,
             manifest_dir=options.manifest_dir,
             verify_image=True,
             verify_image_method=options.verify_image_method,
-            tag=True,
-            push_tag=True,
+            tag=False,
+            push_tag=False,
             push_tag_after_k8s=True,
             state_file=None if dry_run else options.state_file,
-            workflow="deploy",
+            workflow="update-runtime",
             skip_git_pull=skip_git_pull,
             allow_dirty=options.allow_dirty,
             apply=True,
@@ -214,15 +256,27 @@ class UpdateRunner:
         selected_bumps = [
             name
             for name, enabled in (
-                ("--patch", options.patch),
-                ("--minor", options.minor),
-                ("--major", options.major),
+                ("--bump-patch", options.patch),
+                ("--bump-minor", options.minor),
+                ("--bump-major", options.major),
             )
             if enabled
         ]
         if len(selected_bumps) > 1:
-            detail = "Choose only one version bump mode: --patch, --minor, or --major."
+            detail = "Choose only one version bump mode: --bump-patch, --bump-minor, or --bump-major."
             detail += " Selected: " + ", ".join(selected_bumps)
+            report.steps.append(ReleaseStep(name="Validate options", status="failed", detail=detail))
+            raise UpdateError(detail, report)
+        if options.push_tag and not options.tag:
+            detail = "--push-tag requires --tag."
+            report.steps.append(ReleaseStep(name="Validate options", status="failed", detail=detail))
+            raise UpdateError(detail, report)
+        if not options.release and (options.version or selected_bumps or options.tag or options.push_tag):
+            detail = "Use --release when requesting version bumps, release versions, or Git tags."
+            report.steps.append(ReleaseStep(name="Validate options", status="failed", detail=detail))
+            raise UpdateError(detail, report)
+        if options.release and not options.version and not selected_bumps:
+            detail = "--release requires --version, --bump-patch, --bump-minor, or --bump-major."
             report.steps.append(ReleaseStep(name="Validate options", status="failed", detail=detail))
             raise UpdateError(detail, report)
 
@@ -317,6 +371,12 @@ class _GitComparison:
     planned_update: str
     diverged: bool = False
 
+    @property
+    def runtime_head(self) -> str:
+        if self.state.startswith("behind origin/main"):
+            return self.target_head
+        return self.current_head
+
 
 def self_install_command() -> list[str]:
     return [sys.executable, "-m", "pip", "install", "-e", "."]
@@ -328,6 +388,16 @@ def reexec_update_command() -> list[str]:
 
 def reexec_update_process(command: list[str], env: Mapping[str, str]) -> None:
     os.execvpe(command[0], command, dict(env))
+
+
+def _runtime_image_tag(value: str) -> str:
+    if value.startswith("commit "):
+        value = value.split(maxsplit=1)[1]
+    return value[:7] if len(value) > 7 else value
+
+
+def _commit_runtime_version(value: str) -> str:
+    return f"commit {_runtime_image_tag(value)}"
 
 
 def format_update_report(report: UpdateReport) -> str:
@@ -346,20 +416,33 @@ def format_update_report(report: UpdateReport) -> str:
         lines.extend(["", "Planned self install:", f"  {_format_command(report.self_install_command)}"])
     release_report = report.release_report
     if release_report is not None:
-        lines.extend(
-            [
-                "",
-                "Release:",
-                f"  Current version: {getattr(release_report, 'current_version', None) or 'unknown'}",
-                f"  New version:     {getattr(release_report, 'new_version', None) or 'not set'}",
-                f"  Current image:   {getattr(release_report, 'current_image', None) or 'unknown'}",
-                f"  New image:       {getattr(release_report, 'image', '')}",
-                f"  Image repo:      {getattr(release_report, 'image_repository', None) or 'unknown'}",
-                f"  Verify method:   {getattr(release_report, 'verify_image_method', 'unknown')}",
-                f"  Namespace:       {getattr(release_report, 'namespace', 'unknown')}",
-                f"  Manifest dir:    {getattr(release_report, 'manifest_dir', 'unknown')}",
-            ]
-        )
+        if getattr(release_report, "workflow", "") == "update-runtime":
+            lines.extend(
+                [
+                    "",
+                    "Runtime:",
+                    f"  Image:         {getattr(release_report, 'image', '')}",
+                    f"  Version:       {getattr(release_report, 'new_version', None) or report.runtime_version or 'not set'}",
+                    f"  Verify method: {getattr(release_report, 'verify_image_method', 'unknown')}",
+                    f"  Namespace:     {getattr(release_report, 'namespace', 'unknown')}",
+                    f"  Manifest dir:  {getattr(release_report, 'manifest_dir', 'unknown')}",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "Release:",
+                    f"  Current version: {getattr(release_report, 'current_version', None) or 'unknown'}",
+                    f"  New version:     {getattr(release_report, 'new_version', None) or 'not set'}",
+                    f"  Current image:   {getattr(release_report, 'current_image', None) or 'unknown'}",
+                    f"  New image:       {getattr(release_report, 'image', '')}",
+                    f"  Image repo:      {getattr(release_report, 'image_repository', None) or 'unknown'}",
+                    f"  Verify method:   {getattr(release_report, 'verify_image_method', 'unknown')}",
+                    f"  Namespace:       {getattr(release_report, 'namespace', 'unknown')}",
+                    f"  Manifest dir:    {getattr(release_report, 'manifest_dir', 'unknown')}",
+                ]
+            )
     lines.extend(["", "Steps:"])
     combined_steps = list(report.steps)
     if release_report is not None:
@@ -396,9 +479,13 @@ def update(
     repo: Path = typer.Option(Path("."), "--repo", help="AgentLab repository path."),
     dry_run: bool = typer.Option(False, "--dry-run"),
     resume: bool = typer.Option(False, "--resume"),
-    patch: bool = typer.Option(False, "--patch", help="Bump the patch release version."),
-    minor: bool = typer.Option(False, "--minor", help="Bump the minor release version."),
-    major: bool = typer.Option(False, "--major", help="Bump the major release version."),
+    release: bool = typer.Option(False, "--release", help="Run an explicit versioned release update."),
+    version: str | None = typer.Option(None, "--version", help="Explicit release version for --release."),
+    patch: bool = typer.Option(False, "--patch", "--bump-patch", help="Bump the patch release version in --release mode."),
+    minor: bool = typer.Option(False, "--minor", "--bump-minor", help="Bump the minor release version in --release mode."),
+    major: bool = typer.Option(False, "--major", "--bump-major", help="Bump the major release version in --release mode."),
+    tag: bool = typer.Option(False, "--tag", help="Create a local Git tag in --release mode."),
+    push_tag: bool = typer.Option(False, "--push-tag", help="Push the Git tag in --release mode. Requires --tag."),
     current_version: str | None = typer.Option(None, "--current-version"),
     image_repository: str | None = typer.Option(None, "--image-repository"),
     allow_dirty: bool = typer.Option(False, "--allow-dirty"),
@@ -413,9 +500,13 @@ def update(
                 repo=repo,
                 dry_run=dry_run,
                 resume=resume,
+                release=release,
+                version=version,
                 patch=patch,
                 minor=minor,
                 major=major,
+                tag=tag,
+                push_tag=push_tag,
                 current_version=current_version,
                 image_repository=image_repository,
                 allow_dirty=allow_dirty,

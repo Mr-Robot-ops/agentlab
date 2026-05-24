@@ -9,6 +9,7 @@ from agentlab.release_upgrade import (
     DEFAULT_RELEASE_STATE_FILE,
     ReleaseResumeOptions,
     ReleaseResumer,
+    ReleaseState,
     ReleaseUpgradeError,
     ReleaseUpgradeOptions,
     ReleaseUpgrader,
@@ -259,6 +260,112 @@ def resume(
         typer.echo(str(exc), err=True)
         raise typer.Exit(code=2) from exc
     typer.echo(format_release_report(report))
+
+
+@release_app.command()
+def publish(
+    version: str | None = typer.Option(None, "--version", help="Explicit release version, for example 0.1.21 or v0.1.21."),
+    current_version: str | None = typer.Option(None, "--current-version", help="Override current release version for bump calculations."),
+    bump_patch: bool = typer.Option(False, "--bump-patch", help="Bump the patch release version."),
+    bump_minor: bool = typer.Option(False, "--bump-minor", help="Bump the minor release version."),
+    bump_major: bool = typer.Option(False, "--bump-major", help="Bump the major release version."),
+    image_repository: str | None = typer.Option(None, "--image-repository", help="Docker image repository to tag for versioned releases."),
+    tag: bool = typer.Option(False, "--tag/--no-tag", help="Create a local Git tag."),
+    push_tag: bool = typer.Option(False, "--push-tag/--no-push-tag", help="Push the Git tag after Kubernetes upgrade/status succeeds."),
+    github_release: bool = typer.Option(False, "--github-release/--no-github-release", help="Create a GitHub Release after successful deploy."),
+    repo: Path = typer.Option(Path("."), "--repo", help="AgentLab repository path."),
+    namespace: str = typer.Option(DEFAULT_NAMESPACE, "--namespace"),
+    manifest_dir: Path = typer.Option(DEFAULT_MANIFEST_DIR, "--manifest-dir"),
+    verify_image_method: str = typer.Option("pull", "--verify-image-method", help="Image verification method: manifest or pull."),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    no_git_pull: bool = typer.Option(False, "--no-git-pull"),
+    no_tests: bool = typer.Option(False, "--no-tests"),
+    no_build: bool = typer.Option(False, "--no-build"),
+    no_push: bool = typer.Option(False, "--no-push"),
+    no_apply: bool = typer.Option(False, "--no-apply"),
+    no_doctor: bool = typer.Option(False, "--no-doctor"),
+    no_cleanup_failed: bool = typer.Option(False, "--no-cleanup-failed"),
+    no_status: bool = typer.Option(False, "--no-status"),
+) -> None:
+    """Publish an explicit versioned AgentLab release."""
+    if push_tag and not tag:
+        typer.echo("--push-tag requires --tag.", err=True)
+        raise typer.Exit(code=2)
+    if not version and not bump_patch and not bump_minor and not bump_major:
+        typer.echo("Choose --version, --bump-patch, --bump-minor, or --bump-major.", err=True)
+        raise typer.Exit(code=2)
+    apply = not no_apply
+    try:
+        options = ReleaseUpgradeOptions(
+            version=version,
+            current_version=current_version,
+            bump_patch=bump_patch,
+            bump_minor=bump_minor,
+            bump_major=bump_major,
+            image_repository=image_repository,
+            tag=tag,
+            push_tag=push_tag,
+            github_release=github_release,
+            verify_image=True,
+            verify_image_method=verify_image_method,
+            push_tag_after_k8s=True,
+            state_file=None if dry_run else DEFAULT_RELEASE_STATE_FILE,
+            workflow="release-publish",
+            repo=repo,
+            manifest_dir=manifest_dir,
+            namespace=namespace,
+            skip_git_pull=no_git_pull,
+            skip_tests=no_tests,
+            skip_build=no_build,
+            skip_push=no_push,
+            apply=apply,
+            preserve_cluster_config=True,
+            run_doctor=not no_doctor,
+            cleanup_failed=not no_cleanup_failed,
+            status=not no_status,
+            dry_run=dry_run,
+        )
+        report = ReleaseUpgrader().run(options)
+    except ReleaseUpgradeError as exc:
+        typer.echo(format_release_report(exc.report))
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    except ValueError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(format_release_report(report))
+
+
+@release_app.command(name="state")
+def release_state(
+    repo: Path = typer.Option(Path("."), "--repo", help="AgentLab repository path."),
+    state_file: Path = typer.Option(DEFAULT_RELEASE_STATE_FILE, "--state-file"),
+    clear: bool = typer.Option(False, "--clear", help="Delete the state file."),
+    clear_completed: bool = typer.Option(False, "--clear-completed", help="Delete the state file only when completed."),
+) -> None:
+    """Show or clear local release/update state."""
+    path = state_file if state_file.is_absolute() else repo.resolve() / state_file
+    typer.echo(f"State file: {path}")
+    if not path.exists():
+        typer.echo("No release/update state found.")
+        return
+    state = ReleaseState.from_file(path)
+    if clear_completed and not state.completed:
+        typer.echo("State is not completed; not clearing.")
+        raise typer.Exit(code=1)
+    if clear or clear_completed:
+        path.unlink()
+        typer.echo("State cleared.")
+        return
+    typer.echo(f"Workflow: {state.workflow}")
+    typer.echo(f"Target image: {state.image}")
+    typer.echo(f"Target version: {state.version or 'not set'}")
+    typer.echo(f"Commit: {state.commit}")
+    typer.echo(f"Tag enabled: {'yes' if state.tag_enabled else 'no'}")
+    typer.echo(f"Push tag enabled: {'yes' if state.push_tag_enabled else 'no'}")
+    typer.echo("Steps:")
+    for key, value in state.steps.items():
+        typer.echo(f"- {key}: {value}")
 
 
 def _effective_optional_flag(*, positive: bool, negative: bool, default: bool | None, name: str) -> bool | None:

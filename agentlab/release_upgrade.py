@@ -119,6 +119,9 @@ class ReleaseState:
     manifest_dir: str
     verify_image_method: str
     docker_bin: str = "docker"
+    workflow: str = "release-deploy"
+    tag_enabled: bool = False
+    push_tag_enabled: bool = False
     steps: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_STATE_STEPS))
     schema_version: int = 1
     completed: bool = False
@@ -138,6 +141,9 @@ class ReleaseState:
             manifest_dir=str(data.get("manifest_dir", DEFAULT_MANIFEST_DIR)),
             verify_image_method=str(data.get("verify_image_method", "manifest")),
             docker_bin=str(data.get("docker_bin", "docker")),
+            workflow=str(data.get("workflow", "release-deploy")),
+            tag_enabled=bool(data.get("tag_enabled", False)),
+            push_tag_enabled=bool(data.get("push_tag_enabled", False)),
             steps=steps,
             completed=bool(data.get("completed", False)),
         )
@@ -153,6 +159,12 @@ class ReleaseState:
             "manifest_dir": self.manifest_dir,
             "verify_image_method": self.verify_image_method,
             "docker_bin": self.docker_bin,
+            "workflow": self.workflow,
+            "tag_enabled": self.tag_enabled,
+            "push_tag_enabled": self.push_tag_enabled,
+            "image_pushed": self.steps.get("docker_push") == "passed",
+            "k8s_upgraded": self.steps.get("k8s_upgrade") == "passed",
+            "tag_pushed": self.steps.get("git_tag_push") == "passed",
             "steps": self.steps,
             "completed": self.completed,
         }
@@ -239,6 +251,9 @@ class ReleaseUpgradeOptions:
     bump_major: bool = False
     image_repository: str | None = None
     image_tag_prefix_v: bool = False
+    runtime_build: bool = False
+    runtime_version: str | None = None
+    runtime_image_tag: str | None = None
     tag: bool = False
     push_tag: bool = False
     github_release: bool = False
@@ -711,6 +726,9 @@ class ReleaseUpgrader:
             manifest_dir=str(options.manifest_dir),
             verify_image_method=options.verify_image_method,
             docker_bin=options.docker_bin,
+            workflow="release-deploy" if options.workflow == "deploy" else options.workflow,
+            tag_enabled=options.tag,
+            push_tag_enabled=options.push_tag,
             steps=steps,
         )
         state.write(state_path)
@@ -760,9 +778,23 @@ class ReleaseUpgrader:
             ("--bump-major", options.bump_major),
         ]
         selected_bumps = [name for name, enabled in bump_modes if enabled]
+        selected_modes = [
+            name
+            for name, enabled in (
+                ("--image", bool(options.image)),
+                ("--version", bool(options.version)),
+                ("--runtime-build", options.runtime_build),
+                *bump_modes,
+            )
+            if enabled
+        ]
         if len(selected_bumps) > 1:
             detail = "Choose only one version bump mode: --bump-patch, --bump-minor, or --bump-major."
             detail += " Selected: " + ", ".join(selected_bumps)
+            report.steps.append(ReleaseStep(name="Validate options", status="failed", detail=detail))
+            raise ReleaseUpgradeError(detail, report)
+        if options.runtime_build and len(selected_modes) > 1:
+            detail = "--runtime-build cannot be combined with --image, --version, or --bump-*."
             report.steps.append(ReleaseStep(name="Validate options", status="failed", detail=detail))
             raise ReleaseUpgradeError(detail, report)
         if options.image and selected_bumps:
@@ -773,8 +805,12 @@ class ReleaseUpgrader:
             detail = "--version cannot be combined with --bump-*; choose an explicit version or a bump mode."
             report.steps.append(ReleaseStep(name="Validate options", status="failed", detail=detail))
             raise ReleaseUpgradeError(detail, report)
-        if not options.image and not options.version and not selected_bumps:
+        if not options.image and not options.version and not selected_bumps and not options.runtime_build:
             detail = "Choose a release selection mode: --image, --version, --bump-patch, --bump-minor, or --bump-major."
+            report.steps.append(ReleaseStep(name="Validate options", status="failed", detail=detail))
+            raise ReleaseUpgradeError(detail, report)
+        if options.runtime_build and (options.tag or options.push_tag or options.github_release):
+            detail = "Runtime updates do not create or push Git tags. Use a release command or --release mode."
             report.steps.append(ReleaseStep(name="Validate options", status="failed", detail=detail))
             raise ReleaseUpgradeError(detail, report)
         if options.push_tag and not options.tag:
@@ -815,15 +851,6 @@ class ReleaseUpgrader:
                 raise ReleaseUpgradeError(detail, report)
 
     def _resolve_release(self, options: ReleaseUpgradeOptions, *, repo: Path, operator: K8sOperator) -> ResolvedRelease:
-        if options.image:
-            release_version = parse_release_version(options.version).tag if options.version else None
-            return ResolvedRelease(
-                image=options.image,
-                release_version=release_version,
-                image_repository=image_repository_from_image(options.image),
-                version_source="--image + --version" if release_version else "explicit image",
-            )
-
         current_status: ClusterStatus | None = None
 
         def status() -> ClusterStatus | None:
@@ -836,6 +863,32 @@ class ReleaseUpgrader:
                 current_status = None
             return current_status
 
+        if options.runtime_build:
+            cluster_status = status()
+            current_image = cluster_status.configmap_image if cluster_status is not None else None
+            image_repository = options.image_repository or (image_repository_from_image(current_image) if current_image else None)
+            if not image_repository:
+                raise ValueError("Unable to infer image repository. Provide --image-repository.")
+            image_tag = options.runtime_image_tag
+            if not image_tag:
+                image_tag = self._command_stdout_or_unknown(["git", "rev-parse", "--short", "HEAD"], cwd=repo)
+            runtime_version = options.runtime_version or f"commit {image_tag}"
+            return ResolvedRelease(
+                image=f"{image_repository}:{image_tag}",
+                current_image=current_image,
+                release_version=runtime_version,
+                image_repository=image_repository,
+                version_source="runtime commit",
+            )
+
+        if options.image:
+            release_version = parse_release_version(options.version).tag if options.version else None
+            return ResolvedRelease(
+                image=options.image,
+                release_version=release_version,
+                image_repository=image_repository_from_image(options.image),
+                version_source="--image + --version" if release_version else "explicit image",
+            )
         current_version: ReleaseVersion | None = None
         current_version_source = ""
         if options.current_version:
@@ -1134,34 +1187,37 @@ class ReleaseResumer:
             self._run_command(report, state, state_path, "Image verify", _verify_command(docker_bin, state.image, verify_method), cwd=repo)
         operator = self.operator_factory(state.namespace, manifest_dir)
         if not _state_step_passed(state, "k8s_upgrade"):
-            try:
-                upgrade_report = operator.upgrade(
-                    image=state.image,
-                    version=state.version,
-                    apply=True,
-                    preserve_cluster_config=True,
-                    preserve_local_config=False,
-                    run_doctor=True,
-                    show_status=True,
-                    cleanup_failed=True,
+            if self._runtime_already_matches(operator, state, manifest_dir=manifest_dir):
+                self._mark_state(state, state_path, report, "Kubernetes upgrade", "passed", detail="already satisfied")
+            else:
+                try:
+                    upgrade_report = operator.upgrade(
+                        image=state.image,
+                        version=state.version,
+                        apply=True,
+                        preserve_cluster_config=True,
+                        preserve_local_config=False,
+                        run_doctor=True,
+                        show_status=True,
+                        cleanup_failed=True,
+                    )
+                except K8sOperatorError as exc:
+                    self._mark_state(state, state_path, report, "Kubernetes upgrade", "failed", detail=str(exc))
+                    raise ReleaseUpgradeError("Kubernetes upgrade failed.", report) from exc
+                self._mark_state(
+                    state,
+                    state_path,
+                    report,
+                    "Kubernetes upgrade",
+                    "passed",
+                    command=["agentlab", "k8s", "upgrade", "--image", state.image, "--version", state.version, "--apply"],
+                    stdout=format_upgrade_report(upgrade_report),
                 )
-            except K8sOperatorError as exc:
-                self._mark_state(state, state_path, report, "Kubernetes upgrade", "failed", detail=str(exc))
-                raise ReleaseUpgradeError("Kubernetes upgrade failed.", report) from exc
-            self._mark_state(
-                state,
-                state_path,
-                report,
-                "Kubernetes upgrade",
-                "passed",
-                command=["agentlab", "k8s", "upgrade", "--image", state.image, "--version", state.version, "--apply"],
-                stdout=format_upgrade_report(upgrade_report),
-            )
-            if getattr(upgrade_report, "image_drift", []):
-                state.mark("k8s_upgrade", "failed", state_path)
-                report.steps[-1].status = "failed"
-                report.steps[-1].detail = "image drift remains"
-                raise ReleaseUpgradeError("Kubernetes upgrade reported image drift.", report)
+                if getattr(upgrade_report, "image_drift", []):
+                    state.mark("k8s_upgrade", "failed", state_path)
+                    report.steps[-1].status = "failed"
+                    report.steps[-1].detail = "image drift remains"
+                    raise ReleaseUpgradeError("Kubernetes upgrade reported image drift.", report)
         if not _state_step_passed(state, "status"):
             try:
                 cluster_status = operator.status(manifest_dir=manifest_dir)
@@ -1183,7 +1239,10 @@ class ReleaseResumer:
                 report.steps[-1].detail = "image drift remains"
                 raise ReleaseUpgradeError("Kubernetes status reported image drift.", report)
         if not _state_step_passed(state, "git_tag_push"):
-            self._run_command(report, state, state_path, "Git tag push", ["git", "push", "origin", state.version], cwd=repo)
+            if self._remote_tag_points_to_commit(state.version, state.commit, cwd=repo):
+                self._mark_state(state, state_path, report, "Git tag push", "passed", detail="remote tag already exists")
+            else:
+                self._run_command(report, state, state_path, "Git tag push", ["git", "push", "origin", state.version], cwd=repo)
         state.completed = True
         state.write(state_path)
         return report
@@ -1254,6 +1313,23 @@ class ReleaseResumer:
     def _local_tag_exists(self, tag: str, *, cwd: Path) -> bool:
         result = self.command_runner.run(["git", "rev-parse", "-q", "--verify", f"refs/tags/{tag}"], cwd=cwd)
         return result.returncode == 0
+
+    def _runtime_already_matches(self, operator: K8sOperator, state: ReleaseState, *, manifest_dir: Path) -> bool:
+        try:
+            status = operator.status(manifest_dir=manifest_dir)
+        except K8sOperatorError:
+            return False
+        if status.configmap_image != state.image:
+            return False
+        return not state.version or status.configmap_version == state.version
+
+    def _remote_tag_points_to_commit(self, tag: str, commit: str, *, cwd: Path) -> bool:
+        if not tag or not commit or commit == "unknown":
+            return False
+        result = self.command_runner.run(["git", "ls-remote", "--tags", "origin", f"refs/tags/{tag}"], cwd=cwd)
+        if result.returncode != 0:
+            return False
+        return any(line.split(maxsplit=1)[0] == commit for line in result.stdout.splitlines() if line.strip())
 
     def _command_stdout_or_unknown(self, command: list[str], *, cwd: Path) -> str:
         result = self.command_runner.run(command, cwd=cwd)
