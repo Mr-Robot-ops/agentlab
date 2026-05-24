@@ -480,6 +480,8 @@ class ReleaseStep:
     returncode: int | None = None
     stdout: str = ""
     stderr: str = ""
+    cwd: str = ""
+    log_path: str | None = None
 
 
 @dataclass
@@ -891,9 +893,11 @@ class ReleaseUpgrader:
         if options.runtime_build:
             cluster_status = status()
             current_image = cluster_status.configmap_image if cluster_status is not None else None
-            image_repository = options.image_repository or (image_repository_from_image(current_image) if current_image else None)
+            manifest_image = cluster_status.manifest_configmap_image if cluster_status is not None else None
+            source_image = current_image or manifest_image
+            image_repository = options.image_repository or (image_repository_from_image(source_image) if source_image else None)
             if not image_repository:
-                raise ValueError("Unable to infer image repository. Provide --image-repository.")
+                raise ValueError("Unable to infer image repository. Run once with --image-repository REPO.")
             image_tag = options.runtime_image_tag
             if not image_tag:
                 image_tag = self._command_stdout_or_unknown(["git", "rev-parse", "--short", "HEAD"], cwd=repo)
@@ -1057,6 +1061,7 @@ class ReleaseUpgrader:
         state_path: Path | None = None,
     ) -> ReleaseStep:
         result = self.command_runner.run(command, cwd=cwd)
+        log_path = _write_command_log(cwd, name, result) if result.returncode != 0 else None
         step = ReleaseStep(
             name=name,
             status="passed" if result.returncode == 0 else "failed",
@@ -1064,6 +1069,8 @@ class ReleaseUpgrader:
             returncode=result.returncode,
             stdout=result.stdout,
             stderr=result.stderr,
+            cwd=str(cwd),
+            log_path=log_path,
         )
         self._append_step(report, step, state=state, state_path=state_path)
         if result.returncode != 0:
@@ -1301,6 +1308,7 @@ class ReleaseResumer:
     ) -> ReleaseStep:
         result = self.command_runner.run(command, cwd=cwd)
         status = "passed" if result.returncode == 0 else "failed"
+        log_path = _write_command_log(cwd, name, result) if result.returncode != 0 else None
         step = self._mark_state(
             state,
             state_path,
@@ -1311,6 +1319,8 @@ class ReleaseResumer:
             stdout=result.stdout,
             stderr=result.stderr,
             returncode=result.returncode,
+            cwd=str(cwd),
+            log_path=log_path,
         )
         if result.returncode != 0:
             raise ReleaseUpgradeError(f"{name} failed.", report)
@@ -1329,8 +1339,20 @@ class ReleaseResumer:
         stdout: str = "",
         stderr: str = "",
         returncode: int | None = None,
+        cwd: str = "",
+        log_path: str | None = None,
     ) -> ReleaseStep:
-        step = ReleaseStep(name=name, status=status, command=command, detail=detail, stdout=stdout, stderr=stderr, returncode=returncode)
+        step = ReleaseStep(
+            name=name,
+            status=status,
+            command=command,
+            detail=detail,
+            stdout=stdout,
+            stderr=stderr,
+            returncode=returncode,
+            cwd=cwd,
+            log_path=log_path,
+        )
         report.steps.append(step)
         step_key = STATE_STEP_KEYS.get(name)
         if step_key:
@@ -1400,8 +1422,12 @@ def format_release_report(report: ReleaseUpgradeReport) -> str:
         lines.append(f"- failed step: {failed.name}")
         if failed.command:
             lines.append(f"- command: {_format_command(failed.command)}")
+        if failed.cwd:
+            lines.append(f"- cwd: {failed.cwd}")
         if failed.returncode is not None:
             lines.append(f"- exit code: {failed.returncode}")
+        if failed.log_path:
+            lines.append(f"- log: {failed.log_path}")
         stdout = _output_snippet(failed.stdout)
         stderr = _output_snippet(failed.stderr)
         detail = _output_snippet(failed.detail)
@@ -1422,7 +1448,35 @@ def _output_snippet(value: str, *, limit: int = 1000) -> str:
     text = " ".join(value.strip().split())
     if len(text) <= limit:
         return text
-    return text[: limit - 3] + "..."
+    return "..." + text[-(limit - 3) :]
+
+
+def _write_command_log(cwd: Path, step_name: str, result: ReleaseCommandResult) -> str | None:
+    log_dir = cwd / ".agentlab" / "logs"
+    log_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", step_name.strip().lower()).strip("-") or "command"
+    log_path = log_dir / f"{log_name}.log"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(
+            "\n".join(
+                [
+                    f"Command: {_format_command(result.args)}",
+                    f"Cwd: {cwd}",
+                    f"Exit code: {result.returncode}",
+                    "",
+                    "STDOUT:",
+                    result.stdout,
+                    "",
+                    "STDERR:",
+                    result.stderr,
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        return None
+    return str(log_path)
 
 
 def _dirty_paths(porcelain: str) -> list[str]:

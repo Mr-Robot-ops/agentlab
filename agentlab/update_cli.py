@@ -47,6 +47,8 @@ class UpdateOptions:
     allow_dirty: bool = False
     no_git_pull: bool = False
     no_self_install: bool = False
+    no_tests: bool = False
+    clear_state: bool = False
     verify_image_method: str = "pull"
     namespace: str = DEFAULT_NAMESPACE
     manifest_dir: Path = DEFAULT_MANIFEST_DIR
@@ -115,6 +117,9 @@ class UpdateRunner:
                 )
             )
             report.release_report = resume_report
+            return report
+        if options.clear_state:
+            self._clear_state(options, report)
             return report
         self._check_incomplete_state(options, report)
         self._check_git_status(options, report, "Git status", cwd=repo)
@@ -197,6 +202,7 @@ class UpdateRunner:
                 state_file=None if dry_run else options.state_file,
                 workflow="release-publish",
                 skip_git_pull=skip_git_pull,
+                skip_tests=options.no_tests,
                 allow_dirty=options.allow_dirty,
                 apply=True,
                 preserve_cluster_config=True,
@@ -224,6 +230,7 @@ class UpdateRunner:
             state_file=None if dry_run else options.state_file,
             workflow="update-runtime",
             skip_git_pull=skip_git_pull,
+            skip_tests=options.no_tests,
             allow_dirty=options.allow_dirty,
             apply=True,
             preserve_cluster_config=True,
@@ -243,10 +250,33 @@ class UpdateRunner:
             data = json.loads(state_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return
-        if not data.get("completed", False):
-            detail = "Existing incomplete release state found. Run `agentlab update --resume`."
-            report.steps.append(ReleaseStep(name="Release state", status="failed", detail=detail))
-            raise UpdateError(detail, report)
+        if data.get("completed", False):
+            return
+        steps = data.get("steps") or {}
+        pre_deploy_runtime_state = str(data.get("workflow") or "") == "update-runtime" and not any(
+            steps.get(key) == "passed" for key in ("docker_build", "docker_push", "k8s_upgrade")
+        )
+        if pre_deploy_runtime_state:
+            state_path.unlink()
+            report.steps.append(
+                ReleaseStep(
+                    name="Release state",
+                    status="passed",
+                    detail="cleared incomplete pre-deploy update state",
+                )
+            )
+            return
+        detail = "Existing incomplete release state found. Run `agentlab update --resume` to continue or `agentlab update --clear-state` to clear it."
+        report.steps.append(ReleaseStep(name="Release state", status="failed", detail=detail))
+        raise UpdateError(detail, report)
+
+    def _clear_state(self, options: UpdateOptions, report: UpdateReport) -> None:
+        state_path = options.resolved_state_file()
+        if not state_path.exists():
+            report.steps.append(ReleaseStep(name="Release state", status="skipped", detail="no state found"))
+            return
+        state_path.unlink()
+        report.steps.append(ReleaseStep(name="Release state", status="passed", detail="cleared"))
 
     def _validate_options(self, options: UpdateOptions, report: UpdateReport) -> None:
         if options.verify_image_method not in VERIFY_IMAGE_METHODS:
@@ -323,6 +353,11 @@ class UpdateRunner:
 
     def _run_command(self, report: UpdateReport, name: str, command: list[str], *, cwd: Path) -> ReleaseStep:
         result = self.command_runner.run(command, cwd=cwd)
+        log_path = None
+        if result.returncode != 0 and not report.dry_run:
+            from agentlab.release_upgrade import _write_command_log
+
+            log_path = _write_command_log(cwd, name, result)
         step = ReleaseStep(
             name=name,
             status="passed" if result.returncode == 0 else "failed",
@@ -330,6 +365,8 @@ class UpdateRunner:
             returncode=result.returncode,
             stdout=result.stdout,
             stderr=result.stderr,
+            cwd=str(cwd),
+            log_path=log_path,
         )
         report.steps.append(step)
         if result.returncode != 0:
@@ -422,6 +459,7 @@ def format_update_report(report: UpdateReport) -> str:
                     "",
                     "Runtime:",
                     f"  Image:         {getattr(release_report, 'image', '')}",
+                    f"  Image repo:    {getattr(release_report, 'image_repository', None) or 'unknown'}",
                     f"  Version:       {getattr(release_report, 'new_version', None) or report.runtime_version or 'not set'}",
                     f"  Verify method: {getattr(release_report, 'verify_image_method', 'unknown')}",
                     f"  Namespace:     {getattr(release_report, 'namespace', 'unknown')}",
@@ -455,9 +493,23 @@ def format_update_report(report: UpdateReport) -> str:
     failed = report.failed_step
     if failed is not None:
         lines.extend(["", "Failure:", f"- failed step: {failed.name}"])
-        snippet = " ".join((failed.stderr or failed.detail).strip().split())
-        if snippet:
-            lines.append(f"- stderr: {snippet}")
+        if failed.command:
+            lines.append(f"- command: {_format_command(failed.command)}")
+        if failed.cwd:
+            lines.append(f"- cwd: {failed.cwd}")
+        if failed.returncode is not None:
+            lines.append(f"- exit code: {failed.returncode}")
+        if failed.log_path:
+            lines.append(f"- log: {failed.log_path}")
+        stdout = _tail_snippet(failed.stdout)
+        stderr = _tail_snippet(failed.stderr)
+        detail = _tail_snippet(failed.detail)
+        if stdout:
+            lines.append(f"- stdout: {stdout}")
+        if stderr:
+            lines.append(f"- stderr: {stderr}")
+        if detail and not stderr:
+            lines.append(f"- detail: {detail}")
     return "\n".join(lines)
 
 
@@ -473,6 +525,13 @@ def _release_steps_for_update(release_report: object) -> list[ReleaseStep]:
 
 def _format_command(command: list[str]) -> str:
     return shlex.join(str(part) for part in command)
+
+
+def _tail_snippet(value: str, *, limit: int = 1000) -> str:
+    text = " ".join(value.strip().split())
+    if len(text) <= limit:
+        return text
+    return "..." + text[-(limit - 3) :]
 
 
 def update(
@@ -491,9 +550,11 @@ def update(
     allow_dirty: bool = typer.Option(False, "--allow-dirty"),
     no_git_pull: bool = typer.Option(False, "--no-git-pull"),
     no_self_install: bool = typer.Option(False, "--no-self-install"),
+    no_tests: bool = typer.Option(False, "--no-tests", help="Skip tests during the runtime deploy phase."),
+    clear_state: bool = typer.Option(False, "--clear-state", help="Clear local update/release state and exit."),
     verify_image_method: str = typer.Option("pull", "--verify-image-method", help="Image verification method: manifest or pull."),
 ) -> None:
-    """Update AgentLab from origin/main and deploy the next release."""
+    """Update AgentLab from origin/main and deploy the Kubernetes runtime."""
     try:
         report = UpdateRunner().run(
             UpdateOptions(
@@ -512,6 +573,8 @@ def update(
                 allow_dirty=allow_dirty,
                 no_git_pull=no_git_pull,
                 no_self_install=no_self_install,
+                no_tests=no_tests,
+                clear_state=clear_state,
                 verify_image_method=verify_image_method,
             )
         )

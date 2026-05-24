@@ -55,6 +55,7 @@ class FakeK8sOperator:
         self.doctor_status = "completed"
         self.status_configmap_image = "registry/agentlab:new"
         self.status_configmap_version: str | None = None
+        self.status_manifest_configmap_image: str | None = None
         self.status_image_annotation_warning: str | None = None
 
     def upgrade(self, **kwargs):
@@ -86,6 +87,7 @@ class FakeK8sOperator:
             namespace="agentlab",
             configmap_image=self.status_configmap_image,
             configmap_version=self.status_configmap_version,
+            manifest_configmap_image=self.status_manifest_configmap_image,
             image_annotation_warning=self.status_image_annotation_warning,
         )
 
@@ -433,6 +435,33 @@ def test_runtime_build_uses_commit_image_without_git_tags(tmp_path: Path) -> Non
     assert "git push origin" not in rendered
 
 
+def test_runtime_build_falls_back_to_generated_manifest_image_repo(tmp_path: Path) -> None:
+    operator = FakeK8sOperator()
+    operator.status_configmap_image = None
+    operator.status_manifest_configmap_image = "generated.local/agentlab:0.1.20"
+    upgrader, runner, _operator = make_upgrader(operator)
+    runner.respond(["git", "rev-parse", "--short", "HEAD"], stdout="abc1234\n")
+
+    report = upgrader.run(options(tmp_path, image=None, runtime_build=True, dry_run=True))
+
+    assert report.image_repository == "generated.local/agentlab"
+    assert report.image == "generated.local/agentlab:abc1234"
+
+
+def test_runtime_build_without_image_repo_has_clear_failure(tmp_path: Path) -> None:
+    operator = FakeK8sOperator()
+    operator.status_configmap_image = None
+    operator.status_manifest_configmap_image = None
+    upgrader, _runner, _operator = make_upgrader(operator)
+
+    try:
+        upgrader.run(options(tmp_path, image=None, runtime_build=True, dry_run=True))
+    except ReleaseUpgradeError as exc:
+        assert "Unable to infer image repository. Run once with --image-repository REPO." in exc.report.failed_step.detail
+    else:
+        raise AssertionError("expected runtime image repository inference failure")
+
+
 def test_runtime_build_state_records_no_tag_behavior(tmp_path: Path) -> None:
     upgrader, runner, _operator = make_upgrader()
     state_file = tmp_path / ".agentlab" / "release-state.json"
@@ -455,12 +484,15 @@ def test_runtime_build_state_records_no_tag_behavior(tmp_path: Path) -> None:
 
     data = json.loads(state_file.read_text(encoding="utf-8"))
     assert data["workflow"] == "update-runtime"
+    assert data["version"] == "commit 0ae4869"
+    assert data["image"] == "registry/agentlab:0ae4869"
     assert data["tag_enabled"] is False
     assert data["push_tag_enabled"] is False
     assert data["steps"]["git_tag"] == "skipped"
     assert data["steps"]["git_tag_push"] == "skipped"
     assert data["image_pushed"] is True
     assert data["k8s_upgraded"] is True
+    assert data["completed"] is True
 
 
 def test_release_upgrade_cli_manual_runtime_rollout_uses_runtime_version() -> None:
@@ -492,6 +524,7 @@ def test_release_upgrade_cli_manual_runtime_rollout_uses_runtime_version() -> No
 
 
 def test_failed_command_report_includes_stdout_and_stderr() -> None:
+    long_stdout = "setup line\n" * 200 + "FAILED tests/test_example.py::test_example - assert 1 == 2\nshort test summary info"
     report = release_upgrade.ReleaseUpgradeReport(
         image="registry/agentlab:abc123",
         repo="repo",
@@ -503,8 +536,10 @@ def test_failed_command_report_includes_stdout_and_stderr() -> None:
                 status="failed",
                 command=[sys.executable, "-m", "pytest"],
                 returncode=1,
-                stdout="FAILED tests/test_example.py::test_example - assert 1 == 2\nshort test summary info",
+                stdout=long_stdout,
                 stderr="pytest warning on stderr",
+                cwd="repo",
+                log_path="repo/.agentlab/logs/tests.log",
             )
         ],
     )
@@ -512,8 +547,45 @@ def test_failed_command_report_includes_stdout_and_stderr() -> None:
     rendered = format_release_report(report)
 
     assert "- failed step: Tests" in rendered
-    assert "- stdout: FAILED tests/test_example.py::test_example - assert 1 == 2 short test summary info" in rendered
+    assert "- command:" in rendered
+    assert "-m pytest" in rendered
+    assert "- cwd: repo" in rendered
+    assert "- exit code: 1" in rendered
+    assert "- log: repo/.agentlab/logs/tests.log" in rendered
+    assert "- stdout:" in rendered
+    assert "FAILED tests/test_example.py::test_example - assert 1 == 2 short test summary info" in rendered
     assert "- stderr: pytest warning on stderr" in rendered
+
+
+def test_failed_test_command_writes_log_and_reports_pytest_tail(tmp_path: Path) -> None:
+    upgrader, runner, _operator = make_upgrader()
+    stdout = "collected 1 item\n" + ("passing noise\n" * 120) + "FAILED tests/test_runtime.py::test_runtime - assert False\n"
+    runner.respond([sys.executable, "-m", "pytest"], stdout=stdout, stderr="pytest stderr", returncode=1)
+
+    try:
+        upgrader.run(
+            options(
+                tmp_path,
+                image="registry/agentlab:abc123",
+                runtime_version="commit abc123",
+                skip_tests=False,
+                skip_build=True,
+                skip_push=True,
+                verify_image=False,
+            )
+        )
+    except ReleaseUpgradeError as exc:
+        report = exc.report
+    else:
+        raise AssertionError("expected test failure")
+
+    rendered = format_release_report(report)
+    assert "FAILED tests/test_runtime.py::test_runtime - assert False" in rendered
+    assert "collected 1 item" not in rendered
+    assert "- cwd: " in rendered
+    assert "- exit code: 1" in rendered
+    assert "- log: " in rendered
+    assert (tmp_path / ".agentlab" / "logs" / "tests.log").exists()
 
 
 def test_dry_run_prints_planned_commands_and_executes_nothing(tmp_path: Path) -> None:
