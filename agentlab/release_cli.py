@@ -25,6 +25,7 @@ release_app = typer.Typer(help="Run local AgentLab release and upgrade workflows
 def upgrade(
     image: str | None = typer.Option(None, "--image", help="Container image tag to build, push, and deploy."),
     version: str | None = typer.Option(None, "--version", help="Explicit release version, for example 0.1.18 or v0.1.18."),
+    runtime_version: str | None = typer.Option(None, "--runtime-version", help="Runtime version annotation text, for example 'commit 8f1aff3'."),
     current_version: str | None = typer.Option(None, "--current-version", help="Override current release version for bump calculations."),
     bump_patch: bool = typer.Option(False, "--bump-patch", help="Bump the patch release version."),
     bump_minor: bool = typer.Option(False, "--bump-minor", help="Bump the minor release version."),
@@ -80,6 +81,7 @@ def upgrade(
         options = ReleaseUpgradeOptions(
             image=image,
             version=version,
+            runtime_version=runtime_version,
             current_version=current_version,
             bump_patch=bump_patch,
             bump_minor=bump_minor,

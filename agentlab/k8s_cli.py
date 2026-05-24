@@ -408,6 +408,7 @@ def cleanup_failed(
 def upgrade(
     image: str = typer.Option(..., "--image", help="New AgentLab container image for generated manifests."),
     version: str | None = typer.Option(None, "--version", help="AgentLab release version to write to generated manifests."),
+    runtime_version: str | None = typer.Option(None, "--runtime-version", help="Runtime version annotation text to write to generated manifests."),
     namespace: str = typer.Option(DEFAULT_NAMESPACE, "--namespace"),
     manifest_dir: Path = typer.Option(DEFAULT_MANIFEST_DIR, "--manifest-dir"),
     apply: bool = typer.Option(False, "--apply/--no-apply"),
@@ -419,6 +420,8 @@ def upgrade(
     yes: bool = typer.Option(False, "--yes", help="Skip apply confirmation when --apply is set."),
 ) -> None:
     """Upgrade generated AgentLab Kubernetes manifests to a new image."""
+    if version and runtime_version:
+        _fail("Choose either --version or --runtime-version, not both.")
     operator = _operator(namespace, manifest_dir)
     if apply and not yes:
         typer.echo(
@@ -437,8 +440,8 @@ def upgrade(
             "show_status": status,
             "cleanup_failed": cleanup_failed,
         }
-        if version:
-            kwargs["version"] = version
+        if version or runtime_version:
+            kwargs["version"] = version or runtime_version
         report = operator.upgrade(**kwargs)
     except K8sOperatorError as exc:
         _fail(str(exc))

@@ -326,6 +326,71 @@ def test_image_with_explicit_version_writes_release_annotation(tmp_path: Path) -
     )
 
 
+def test_image_with_runtime_version_writes_runtime_annotation_without_semver_parse(tmp_path: Path) -> None:
+    upgrader, _runner, operator = make_upgrader()
+
+    report = upgrader.run(
+        options(
+            tmp_path,
+            image="registry/agentlab:abc123",
+            runtime_version="commit abc123",
+            verify_image=False,
+        )
+    )
+
+    assert report.new_version == "commit abc123"
+    assert report.version_source == "--image + --runtime-version"
+    assert operator.calls[0] == (
+        "upgrade",
+        {
+            "image": "registry/agentlab:abc123",
+            "version": "commit abc123",
+            "apply": False,
+            "preserve_cluster_config": False,
+            "preserve_local_config": False,
+            "run_doctor": False,
+            "show_status": False,
+            "cleanup_failed": False,
+        },
+    )
+
+
+def test_version_and_runtime_version_conflict_cleanly(tmp_path: Path) -> None:
+    upgrader, _runner, operator = make_upgrader()
+
+    try:
+        upgrader.run(
+            options(
+                tmp_path,
+                image="registry/agentlab:abc123",
+                version="v0.1.18",
+                runtime_version="commit abc123",
+                dry_run=True,
+            )
+        )
+    except ReleaseUpgradeError as exc:
+        assert "Choose either --version or --runtime-version" in str(exc)
+    else:
+        raise AssertionError("expected version/runtime-version conflict")
+
+    assert operator.calls == []
+
+
+def test_non_semver_version_still_fails(tmp_path: Path) -> None:
+    upgrader, _runner, operator = make_upgrader()
+
+    try:
+        upgrader.run(options(tmp_path, image="registry/agentlab:abc123", version="commit abc123", dry_run=True))
+    except ReleaseUpgradeError as exc:
+        assert exc.report.failed_step is not None
+        assert exc.report.failed_step.name == "Resolve release"
+        assert "Invalid semantic version: commit abc123" in exc.report.failed_step.detail
+    else:
+        raise AssertionError("expected non-semver version failure")
+
+    assert operator.calls == []
+
+
 def test_image_without_version_does_not_invent_release_version(tmp_path: Path) -> None:
     upgrader, _runner, operator = make_upgrader()
 
@@ -362,7 +427,8 @@ def test_runtime_build_uses_commit_image_without_git_tags(tmp_path: Path) -> Non
     assert report.new_version == "commit 0ae4869"
     assert "docker build -t registry/agentlab:0ae4869 ." in rendered
     assert "agentlab k8s upgrade --image registry/agentlab:0ae4869" in rendered
-    assert "--version 'commit 0ae4869'" in rendered
+    assert "--runtime-version 'commit 0ae4869'" in rendered
+    assert "--version 'commit 0ae4869'" not in rendered
     assert "git tag" not in rendered
     assert "git push origin" not in rendered
 
@@ -395,6 +461,59 @@ def test_runtime_build_state_records_no_tag_behavior(tmp_path: Path) -> None:
     assert data["steps"]["git_tag_push"] == "skipped"
     assert data["image_pushed"] is True
     assert data["k8s_upgraded"] is True
+
+
+def test_release_upgrade_cli_manual_runtime_rollout_uses_runtime_version() -> None:
+    result = CliRunner().invoke(
+        app,
+        [
+            "release",
+            "upgrade",
+            "--image",
+            "registry/agentlab:abc123",
+            "--runtime-version",
+            "commit abc123",
+            "--skip-git-pull",
+            "--skip-tests",
+            "--skip-build",
+            "--skip-push",
+            "--verify-image-method",
+            "pull",
+            "--dry-run",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "New version:     commit abc123" in result.output
+    assert "--runtime-version 'commit abc123'" in result.output
+    assert "--version 'commit abc123'" not in result.output
+    assert "git tag" not in result.output
+    assert "git push origin" not in result.output
+
+
+def test_failed_command_report_includes_stdout_and_stderr() -> None:
+    report = release_upgrade.ReleaseUpgradeReport(
+        image="registry/agentlab:abc123",
+        repo="repo",
+        namespace="agentlab",
+        manifest_dir="deploy/kubernetes/generated",
+        steps=[
+            release_upgrade.ReleaseStep(
+                name="Tests",
+                status="failed",
+                command=[sys.executable, "-m", "pytest"],
+                returncode=1,
+                stdout="FAILED tests/test_example.py::test_example - assert 1 == 2\nshort test summary info",
+                stderr="pytest warning on stderr",
+            )
+        ],
+    )
+
+    rendered = format_release_report(report)
+
+    assert "- failed step: Tests" in rendered
+    assert "- stdout: FAILED tests/test_example.py::test_example - assert 1 == 2 short test summary info" in rendered
+    assert "- stderr: pytest warning on stderr" in rendered
 
 
 def test_dry_run_prints_planned_commands_and_executes_nothing(tmp_path: Path) -> None:
