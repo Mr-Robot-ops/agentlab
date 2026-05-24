@@ -1,8 +1,8 @@
 # AgentLab Release Upgrade
 
-`agentlab update` is the normal one-command operator workflow on a Kubernetes host. It updates the local checkout, refreshes the editable install, then runs the safe release deploy flow. Lower-level release commands remain available when you need more control.
+`agentlab update` is the normal one-command operator workflow on a Kubernetes host. It updates the local checkout, refreshes the editable install, builds a runtime image for the current `main` commit, and applies it to Kubernetes. Lower-level release and Kubernetes commands remain available when you need more control.
 
-Git tags are the source of release truth. A normal `main` commit does not bump the AgentLab version. A release version changes only when an operator intentionally runs `agentlab release deploy`, `agentlab release upgrade --bump-patch`, `--bump-minor`, `--bump-major`, or `--version`.
+Git tags are the source of official release truth. A normal `main` commit does not bump the AgentLab version, and `agentlab update` does not create or push Git tags by default. A release version changes only when a maintainer intentionally runs a release command such as `agentlab release publish --bump-patch --tag --push-tag`, or explicitly opts into release mode with `agentlab update --release`.
 
 ## Normal Update
 
@@ -18,7 +18,26 @@ Run the update:
 agentlab update
 ```
 
-`agentlab update` defaults to the current working directory, checks `git status`, allows only generated manifest dirtiness under `deploy/kubernetes/generated/**`, pulls `origin/main` with `git pull --ff-only`, re-checks `git status`, refreshes the editable install with the current Python interpreter, then re-execs itself so the deploy phase uses freshly installed code. It then runs the release deploy workflow with patch bump, pull-based image verification, Kubernetes apply, cluster config preservation, doctor, failed-resource cleanup, status, local tag creation, and remote tag push after Kubernetes upgrade/status succeeds.
+`agentlab update` defaults to the current working directory, checks `git status`, allows only generated manifest dirtiness under `deploy/kubernetes/generated/**`, pulls `origin/main` with `git pull --ff-only`, re-checks `git status`, refreshes the editable install with the current Python interpreter, then re-execs itself so the deploy phase uses freshly installed code. It then runs the runtime update workflow with a commit-based image tag, pull-based image verification, Kubernetes apply, cluster config preservation, doctor, failed-resource cleanup, and status.
+
+Default update behavior does not:
+
+- create a Git tag
+- push a Git tag
+- create a GitHub Release
+- require GitHub write credentials
+
+The default image tag is the target commit short SHA:
+
+```text
+registry.example.com/agentlab:0ae4869
+```
+
+The Kubernetes version annotation is written as a runtime commit marker:
+
+```text
+mr-robot-ops.github.io/agentlab-version=commit 0ae4869
+```
 
 If a previous release left `.agentlab/release-state.json` incomplete, `agentlab update` refuses to start a fresh release and tells you to resume:
 
@@ -30,9 +49,7 @@ agentlab update --resume
 Useful update overrides:
 
 ```bash
-agentlab update --minor
-agentlab update --major
-agentlab update --current-version v0.1.19 --image-repository registry.example.com/agentlab
+agentlab update --image-repository registry.example.com/agentlab
 agentlab update --repo /opt/agentlab
 agentlab update --no-git-pull
 agentlab update --no-self-install
@@ -41,30 +58,35 @@ agentlab update --verify-image-method manifest
 
 `agentlab update --dry-run` may run `git fetch origin` so it can compare local `HEAD` with `origin/main`, but it does not modify the working tree. The report shows whether the checkout is equal to, behind, ahead of, or diverged from `origin/main`. Diverged history fails clearly before planning a release.
 
-## Simple Deploy
+## Official Releases
 
-The recommended operator command is:
+Official version publishing is explicit maintainer work. Use:
 
 ```bash
-agentlab release deploy
+agentlab release publish --bump-patch --tag --push-tag
 ```
 
-`release deploy` is the lower-level safe release path when you want to skip checkout update or self-install. It uses the current working directory, resolves the current version from Git tags and Kubernetes release annotations, defaults to a patch bump, builds and pushes the derived image, verifies the image with `docker pull`, applies the Kubernetes upgrade while preserving cluster config, runs doctor, cleans failed jobs/pods, shows status, and pushes the Git tag only after the Kubernetes upgrade/status path succeeds.
-
-Preview the full plan without mutating Git, Docker, or Kubernetes:
+or, from the Kubernetes host only when you deliberately want update to publish a release:
 
 ```bash
-agentlab release deploy --dry-run
+agentlab update --release --bump-patch --tag --push-tag --dry-run
 ```
 
-Useful deploy overrides:
+Git tag creation only happens in release commands or `agentlab update --release --tag`. Remote tag push only happens when `--push-tag` is supplied, and `--push-tag` requires `--tag`.
+
+Preview a release publish without mutating Git, Docker, or Kubernetes:
 
 ```bash
-agentlab release deploy --bump-minor
-agentlab release deploy --version v0.2.0
-agentlab release deploy --image-repository registry.example.com/agentlab
-agentlab release deploy --no-tests --dry-run
-agentlab release deploy --no-apply --dry-run
+agentlab release publish --bump-patch --tag --push-tag --dry-run
+```
+
+Useful release overrides:
+
+```bash
+agentlab release publish --bump-minor --tag
+agentlab release publish --version v0.2.0 --tag --push-tag
+agentlab release publish --bump-patch --github-release --tag --push-tag
+agentlab update --release --bump-patch --tag --dry-run
 ```
 
 Resume the latest failed or incomplete deploy:
@@ -73,7 +95,7 @@ Resume the latest failed or incomplete deploy:
 agentlab release resume
 ```
 
-Resume reads `.agentlab/release-state.json`, refuses to continue if `HEAD` differs from the recorded commit unless `--allow-head-mismatch` is supplied, skips steps already marked passed, and pushes the Git tag only after Kubernetes upgrade/status completes.
+Resume reads `.agentlab/release-state.json`, refuses to continue if `HEAD` differs from the recorded commit unless `--allow-head-mismatch` is supplied, skips steps already marked passed, preserves whether tags were enabled in the original workflow, and pushes a Git tag only when that workflow explicitly enabled tag push.
 
 Preview only the remaining resume work:
 
@@ -81,7 +103,24 @@ Preview only the remaining resume work:
 agentlab release resume --dry-run
 ```
 
-## Recommended Release
+Inspect or clean local state:
+
+```bash
+agentlab release state
+agentlab release state --clear-completed
+```
+
+## Lower-Level Deploy
+
+`agentlab release deploy` remains available for compatibility and lower-level release deployment control. For normal Kubernetes runtime updates, prefer `agentlab update`.
+
+For explicit image rollouts, rollback, or manual repair, use the Kubernetes reconciliation command directly:
+
+```bash
+agentlab k8s upgrade --image IMAGE --version VERSION --apply
+```
+
+## Lower-Level Release Upgrade
 
 ```bash
 agentlab release upgrade \

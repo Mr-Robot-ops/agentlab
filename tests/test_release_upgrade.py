@@ -348,6 +348,55 @@ def test_image_with_explicit_version_dry_run_passes_version_to_k8s_upgrade(tmp_p
     assert "--version v0.1.18" in rendered
 
 
+def test_runtime_build_uses_commit_image_without_git_tags(tmp_path: Path) -> None:
+    operator = FakeK8sOperator()
+    operator.status_configmap_image = "registry/agentlab:0.1.19"
+    upgrader, runner, _operator = make_upgrader(operator)
+    runner.respond(["git", "rev-parse", "--short", "HEAD"], stdout="0ae4869\n")
+
+    report = upgrader.run(options(tmp_path, image=None, runtime_build=True, dry_run=True, skip_build=False, skip_push=False))
+    rendered = format_release_report(report)
+
+    assert report.workflow == "upgrade"
+    assert report.image == "registry/agentlab:0ae4869"
+    assert report.new_version == "commit 0ae4869"
+    assert "docker build -t registry/agentlab:0ae4869 ." in rendered
+    assert "agentlab k8s upgrade --image registry/agentlab:0ae4869" in rendered
+    assert "--version 'commit 0ae4869'" in rendered
+    assert "git tag" not in rendered
+    assert "git push origin" not in rendered
+
+
+def test_runtime_build_state_records_no_tag_behavior(tmp_path: Path) -> None:
+    upgrader, runner, _operator = make_upgrader()
+    state_file = tmp_path / ".agentlab" / "release-state.json"
+    runner.respond(["git", "rev-parse", "HEAD"], stdout="0ae4869abcdef\n")
+
+    upgrader.run(
+        options(
+            tmp_path,
+            image=None,
+            runtime_build=True,
+            runtime_image_tag="0ae4869",
+            runtime_version="commit 0ae4869",
+            image_repository="registry/agentlab",
+            state_file=state_file,
+            workflow="update-runtime",
+            skip_build=False,
+            skip_push=False,
+        )
+    )
+
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    assert data["workflow"] == "update-runtime"
+    assert data["tag_enabled"] is False
+    assert data["push_tag_enabled"] is False
+    assert data["steps"]["git_tag"] == "skipped"
+    assert data["steps"]["git_tag_push"] == "skipped"
+    assert data["image_pushed"] is True
+    assert data["k8s_upgraded"] is True
+
+
 def test_dry_run_prints_planned_commands_and_executes_nothing(tmp_path: Path) -> None:
     upgrader, runner, operator = make_upgrader()
 
@@ -442,7 +491,7 @@ def test_allow_dirty_allows_continuation(tmp_path: Path) -> None:
     report = upgrader.run(options(tmp_path, allow_dirty=True))
 
     assert report.steps[0].detail == "dirty allowed"
-    assert operator.calls[0][0] == "upgrade"
+    assert any(call[0] == "upgrade" for call in operator.calls)
 
 
 def test_test_failure_stops_before_docker_build(tmp_path: Path) -> None:
@@ -556,7 +605,7 @@ def test_bump_release_without_tag_does_not_create_or_push_git_tag(tmp_path: Path
     commands = [call[0] for call in runner.calls]
     assert ["git", "tag", "v0.1.18"] not in commands
     assert ["git", "push", "origin", "v0.1.18"] not in commands
-    assert operator.calls[0][0] == "upgrade"
+    assert any(call[0] == "upgrade" for call in operator.calls)
     assert report.new_version == "v0.1.18"
 
 
@@ -576,7 +625,7 @@ def test_no_verify_image_skips_verification(tmp_path: Path) -> None:
 
     assert ["docker", "manifest", "inspect", "registry/agentlab:0.1.18"] not in [call[0] for call in runner.calls]
     assert ["docker", "pull", "registry/agentlab:0.1.18"] not in [call[0] for call in runner.calls]
-    assert operator.calls[0][0] == "upgrade"
+    assert any(call[0] == "upgrade" for call in operator.calls)
     assert report.failed_step is None
 
 
@@ -816,7 +865,7 @@ def test_missing_manifest_dir_with_bootstrap_runs_before_tests(tmp_path: Path) -
     assert commands.index(opts.bootstrap_command()) < commands.index([sys.executable, "-m", "pytest"])
     assert opts.bootstrap_command()[0] == sys.executable
     assert ["python3", "scripts/bootstrap_k8s.py"] not in commands
-    assert operator.calls[0][0] == "upgrade"
+    assert any(call[0] == "upgrade" for call in operator.calls)
     assert any(step.name == "Kubernetes manifest preflight" and step.detail == "present after bootstrap" for step in report.steps)
 
 
@@ -1028,6 +1077,71 @@ def test_release_deploy_supports_manual_image_with_explicit_version() -> None:
     assert "--version v0.1.18" in result.output
 
 
+def test_release_publish_requires_explicit_tag_push_opt_in() -> None:
+    result = CliRunner().invoke(
+        app,
+        [
+            "release",
+            "publish",
+            "--dry-run",
+            "--bump-patch",
+            "--current-version",
+            "0.1.17",
+            "--image-repository",
+            "registry/agentlab",
+            "--tag",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "AgentLab release release-publish" in result.output
+    assert "git tag v0.1.18" in result.output
+    assert "git push origin v0.1.18" not in result.output
+
+    push_result = CliRunner().invoke(
+        app,
+        [
+            "release",
+            "publish",
+            "--dry-run",
+            "--bump-patch",
+            "--current-version",
+            "0.1.17",
+            "--image-repository",
+            "registry/agentlab",
+            "--tag",
+            "--push-tag",
+        ],
+    )
+
+    assert push_result.exit_code == 0
+    assert "git push origin v0.1.18" in push_result.output
+
+
+def test_release_publish_push_tag_requires_tag() -> None:
+    result = CliRunner().invoke(app, ["release", "publish", "--bump-patch", "--push-tag"])
+
+    assert result.exit_code == 2
+    assert "--push-tag requires --tag" in result.output
+
+
+def test_release_state_command_shows_and_clears_completed_state(tmp_path: Path) -> None:
+    state_file = write_release_state(tmp_path, completed=True)
+
+    result = CliRunner().invoke(app, ["release", "state", "--repo", str(tmp_path)])
+
+    assert result.exit_code == 0
+    assert f"State file: {state_file}" in result.output
+    assert "Target image: registry/agentlab:0.1.18" in result.output
+    assert "Steps:" in result.output
+
+    clear_result = CliRunner().invoke(app, ["release", "state", "--repo", str(tmp_path), "--clear-completed"])
+
+    assert clear_result.exit_code == 0
+    assert "State cleared." in clear_result.output
+    assert not state_file.exists()
+
+
 def test_release_state_file_is_written_after_major_steps(tmp_path: Path) -> None:
     upgrader, runner, operator = make_upgrader()
     state_file = tmp_path / ".agentlab" / "release-state.json"
@@ -1060,6 +1174,9 @@ def test_release_state_file_is_written_after_major_steps(tmp_path: Path) -> None
     assert data["commit"] == "abc123"
     assert data["verify_image_method"] == "pull"
     assert data["docker_bin"] == "docker"
+    assert data["workflow"] == "release-deploy"
+    assert data["tag_enabled"] is True
+    assert data["push_tag_enabled"] is True
     assert data["steps"]["docker_push"] == "passed"
     assert data["steps"]["image_verify"] == "passed"
     assert data["steps"]["k8s_upgrade"] == "passed"
@@ -1069,7 +1186,7 @@ def test_release_state_file_is_written_after_major_steps(tmp_path: Path) -> None
     step_names = [step.name for step in report.steps]
     assert step_names.index("Kubernetes upgrade") < step_names.index("Git tag push")
     assert step_names.index("Status") < step_names.index("Git tag push")
-    assert operator.calls[0][0] == "upgrade"
+    assert any(call[0] == "upgrade" for call in operator.calls)
 
 
 def test_release_state_commit_is_refreshed_after_git_pull_before_later_failure(tmp_path: Path) -> None:
@@ -1119,7 +1236,7 @@ def test_release_state_commit_is_refreshed_after_git_pull_before_later_failure(t
     assert resume_report.failed_step is None
     assert not any(step.name == "Validate state" for step in resume_report.steps)
     assert ["docker", "pull", "registry/agentlab:0.1.18"] in [call[0] for call in resume_runner.calls]
-    assert operator.calls[0][0] == "upgrade"
+    assert any(call[0] == "upgrade" for call in operator.calls)
 
 
 def test_release_state_stores_custom_docker_binary(tmp_path: Path) -> None:
@@ -1208,7 +1325,7 @@ def test_release_resume_resumes_after_docker_push_when_manifest_verify_failed(tm
     assert ["docker", "push", "registry/agentlab:0.1.18"] not in commands
     assert ["docker", "pull", "registry/agentlab:0.1.18"] in commands
     assert ["git", "push", "origin", "v0.1.18"] in commands
-    assert operator.calls[0][0] == "upgrade"
+    assert any(call[0] == "upgrade" for call in operator.calls)
     assert report.failed_step is None
 
 
@@ -1220,6 +1337,60 @@ def test_release_resume_does_not_recreate_existing_local_tag(tmp_path: Path) -> 
     resumer.run(ReleaseResumeOptions(repo=tmp_path, state_file=state_file, verify_image_method="pull"))
 
     assert ["git", "tag", "v0.1.18"] not in [call[0] for call in runner.calls]
+
+
+def test_release_resume_preserves_runtime_update_no_tag_behavior(tmp_path: Path) -> None:
+    state_file = write_release_state(
+        tmp_path,
+        workflow="update-runtime",
+        version="commit 0ae4869",
+        image="registry/agentlab:0ae4869",
+        tag_enabled=False,
+        push_tag_enabled=False,
+        steps={"git_tag": "skipped", "git_tag_push": "skipped"},
+    )
+    resumer, runner, _operator = make_resumer()
+    runner.respond(["git", "rev-parse", "HEAD"], stdout="abc123\n")
+
+    resumer.run(ReleaseResumeOptions(repo=tmp_path, state_file=state_file, verify_image_method="pull"))
+
+    commands = [call[0] for call in runner.calls]
+    assert not any(command[:2] == ["git", "tag"] for command in commands)
+    assert ["git", "push", "origin", "commit 0ae4869"] not in commands
+
+
+def test_release_resume_marks_already_upgraded_runtime_satisfied(tmp_path: Path) -> None:
+    state_file = write_release_state(
+        tmp_path,
+        version="commit 0ae4869",
+        image="registry/agentlab:0ae4869",
+        steps={"image_verify": "passed", "k8s_upgrade": "pending", "status": "pending", "git_tag_push": "skipped"},
+    )
+    operator = FakeK8sOperator()
+    operator.status_configmap_image = "registry/agentlab:0ae4869"
+    operator.status_configmap_version = "commit 0ae4869"
+    resumer, runner, operator = make_resumer(operator)
+    runner.respond(["git", "rev-parse", "HEAD"], stdout="abc123\n")
+
+    report = resumer.run(ReleaseResumeOptions(repo=tmp_path, state_file=state_file, verify_image_method="pull"))
+
+    assert not any(call[0] == "upgrade" for call in operator.calls)
+    assert any(step.name == "Kubernetes upgrade" and step.detail == "already satisfied" for step in report.steps)
+
+
+def test_release_resume_skips_remote_tag_push_when_tag_already_points_to_commit(tmp_path: Path) -> None:
+    state_file = write_release_state(
+        tmp_path,
+        steps={"image_verify": "passed", "k8s_upgrade": "passed", "status": "passed", "git_tag_push": "pending"},
+    )
+    resumer, runner, _operator = make_resumer()
+    runner.respond(["git", "rev-parse", "HEAD"], stdout="abc123\n")
+    runner.respond(["git", "ls-remote", "--tags", "origin", "refs/tags/v0.1.18"], stdout="abc123\trefs/tags/v0.1.18\n")
+
+    report = resumer.run(ReleaseResumeOptions(repo=tmp_path, state_file=state_file, verify_image_method="pull"))
+
+    assert ["git", "push", "origin", "v0.1.18"] not in [call[0] for call in runner.calls]
+    assert any(step.name == "Git tag push" and step.detail == "remote tag already exists" for step in report.steps)
 
 
 def test_release_resume_refuses_head_mismatch_without_override(tmp_path: Path) -> None:
@@ -1254,7 +1425,7 @@ def test_release_resume_allows_head_mismatch_with_override(tmp_path: Path) -> No
     )
 
     assert report.failed_step is None
-    assert operator.calls[0][0] == "upgrade"
+    assert any(call[0] == "upgrade" for call in operator.calls)
 
 
 def test_release_resume_dry_run_prints_remaining_steps_only(tmp_path: Path) -> None:

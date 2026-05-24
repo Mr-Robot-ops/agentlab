@@ -37,28 +37,46 @@ class FakeReleaseUpgrader:
 
     def run(self, options):
         self.calls.append(options)
+        image = "registry/agentlab:0.1.20"
+        workflow = options.workflow
+        new_version = "v0.1.20"
+        steps = [
+            ReleaseStep(name="Tests", status="planned"),
+            ReleaseStep(name="Docker build", status="planned", command=["docker", "build", "-t", image, "."]),
+            ReleaseStep(name="Docker push", status="planned", command=["docker", "push", image]),
+            ReleaseStep(name="Image verify", status="planned", command=["docker", "pull", image]),
+            ReleaseStep(name="Kubernetes upgrade", status="planned"),
+            ReleaseStep(name="Status", status="planned"),
+        ]
+        if getattr(options, "runtime_build", False):
+            image = f"{options.image_repository}:{options.runtime_image_tag}"
+            new_version = options.runtime_version
+            steps = [
+                ReleaseStep(name="Tests", status="planned"),
+                ReleaseStep(name="Docker build", status="planned", command=["docker", "build", "-t", image, "."]),
+                ReleaseStep(name="Docker push", status="planned", command=["docker", "push", image]),
+                ReleaseStep(name="Image verify", status="planned", command=["docker", "pull", image]),
+                ReleaseStep(name="Kubernetes upgrade", status="planned"),
+                ReleaseStep(name="Status", status="planned"),
+            ]
+        else:
+            if options.tag:
+                steps.insert(1, ReleaseStep(name="Git tag", status="planned", command=["git", "tag", new_version]))
+            if options.push_tag:
+                steps.append(ReleaseStep(name="Git tag push", status="planned", command=["git", "push", "origin", new_version]))
         return ReleaseUpgradeReport(
-            image="registry/agentlab:0.1.20",
+            image=image,
             repo=str(options.repo),
             namespace=options.namespace,
             manifest_dir=str(options.manifest_dir),
-            workflow="deploy",
+            workflow=workflow,
             dry_run=options.dry_run,
             current_version="v0.1.19",
-            new_version="v0.1.20",
+            new_version=new_version,
             current_image="registry/agentlab:0.1.19",
             image_repository="registry/agentlab",
             verify_image_method=options.verify_image_method,
-            steps=[
-                ReleaseStep(name="Tests", status="planned"),
-                ReleaseStep(name="Git tag", status="planned", command=["git", "tag", "v0.1.20"]),
-                ReleaseStep(name="Docker build", status="planned", command=["docker", "build", "-t", "registry/agentlab:0.1.20", "."]),
-                ReleaseStep(name="Docker push", status="planned", command=["docker", "push", "registry/agentlab:0.1.20"]),
-                ReleaseStep(name="Image verify", status="planned", command=["docker", "pull", "registry/agentlab:0.1.20"]),
-                ReleaseStep(name="Kubernetes upgrade", status="planned"),
-                ReleaseStep(name="Status", status="planned"),
-                ReleaseStep(name="Git tag push", status="planned", command=["git", "push", "origin", "v0.1.20"]),
-            ],
+            steps=steps,
         )
 
 
@@ -155,29 +173,38 @@ def test_update_dry_run_does_not_run_git_pull_or_self_install(tmp_path: Path) ->
     assert ["git", "pull", "--ff-only", "origin", "main"] not in commands
     assert [sys.executable, "-m", "pip", "install", "-e", "."] not in commands
     assert upgrader.calls[0].dry_run is True
+    assert upgrader.calls[0].runtime_build is True
+    assert upgrader.calls[0].tag is False
+    assert upgrader.calls[0].push_tag is False
     assert report.release_report is not None
 
 
-def test_update_dry_run_prints_heads_and_self_install_plan(tmp_path: Path) -> None:
+def test_default_update_dry_run_prints_runtime_plan_without_git_tags(tmp_path: Path) -> None:
     repo = write_agentlab_repo(tmp_path)
     update_runner, runner, _upgrader, _resumer = make_update_runner()
-    configure_git_state(runner, current="old123", target="new456", merge_base="old123", behind="2")
+    configure_git_state(runner, current="old123456789", target="new456789012", merge_base="old123456789", behind="2")
 
-    report = update_runner.run(UpdateOptions(repo=repo, dry_run=True, current_version="0.1.19", image_repository="registry/agentlab"))
+    report = update_runner.run(UpdateOptions(repo=repo, dry_run=True, image_repository="registry/agentlab"))
     rendered = format_update_report(report)
 
-    assert "Current HEAD: old123" in rendered
-    assert "Target HEAD:  new456" in rendered
+    assert "Current HEAD: old123456789" in rendered
+    assert "Target HEAD:  new456789012" in rendered
     assert "Git state:    behind origin/main by 2 commits" in rendered
     assert sys.executable in rendered
     assert "-m pip install -e ." in rendered
-    assert "Verify method:   pull" in rendered
-    assert "Current image:   registry/agentlab:0.1.19" in rendered
-    assert "New image:       registry/agentlab:0.1.20" in rendered
-    assert "Image repo:      registry/agentlab" in rendered
-    assert "Namespace:       agentlab" in rendered
-    assert "Manifest dir:    deploy" in rendered
-    assert "docker pull registry/agentlab:0.1.20" in rendered
+    assert "Runtime:" in rendered
+    assert "Image:         registry/agentlab:new4567" in rendered
+    assert "Version:       commit new4567" in rendered
+    assert "Verify method: pull" in rendered
+    assert "Namespace:     agentlab" in rendered
+    assert "Manifest dir:  deploy" in rendered
+    assert "docker build -t registry/agentlab:new4567 ." in rendered
+    assert "docker push registry/agentlab:new4567" in rendered
+    assert "docker pull registry/agentlab:new4567" in rendered
+    assert "Kubernetes upgrade" in rendered
+    assert "Status" in rendered
+    assert "git tag" not in rendered
+    assert "git push origin" not in rendered
 
 
 def test_update_dry_run_identifies_equal_ahead_and_diverged(tmp_path: Path) -> None:
@@ -252,6 +279,26 @@ def test_update_rejects_invalid_options_before_git_or_self_install(tmp_path: Pat
 
     assert runner.calls == []
 
+    update_runner, runner, _upgrader, _resumer = make_update_runner()
+    try:
+        update_runner.run(UpdateOptions(repo=repo, push_tag=True, release=True, patch=True))
+    except UpdateError as exc:
+        assert "--push-tag requires --tag" in str(exc)
+    else:
+        raise AssertionError("expected push tag without tag failure")
+
+    assert runner.calls == []
+
+    update_runner, runner, _upgrader, _resumer = make_update_runner()
+    try:
+        update_runner.run(UpdateOptions(repo=repo, patch=True))
+    except UpdateError as exc:
+        assert "Use --release" in str(exc)
+    else:
+        raise AssertionError("expected release mode failure")
+
+    assert runner.calls == []
+
 
 def test_update_allows_generated_manifest_dirtiness(tmp_path: Path) -> None:
     repo = write_agentlab_repo(tmp_path)
@@ -261,6 +308,48 @@ def test_update_allows_generated_manifest_dirtiness(tmp_path: Path) -> None:
     report = update_runner.run(UpdateOptions(repo=repo, dry_run=True, current_version="0.1.19", image_repository="registry/agentlab"))
 
     assert report.steps[0].detail == "generated manifests dirty allowed"
+
+
+def test_explicit_release_update_plans_tags_only_when_requested(tmp_path: Path) -> None:
+    repo = write_agentlab_repo(tmp_path)
+    update_runner, runner, upgrader, _resumer = make_update_runner()
+    configure_git_state(runner, current="same", target="same", merge_base="same", behind="0", ahead="0")
+
+    report = update_runner.run(
+        UpdateOptions(
+            repo=repo,
+            dry_run=True,
+            release=True,
+            patch=True,
+            tag=True,
+            current_version="0.1.19",
+            image_repository="registry/agentlab",
+        )
+    )
+    rendered = format_update_report(report)
+
+    assert upgrader.calls[0].runtime_build is False
+    assert upgrader.calls[0].tag is True
+    assert upgrader.calls[0].push_tag is False
+    assert "git tag v0.1.20" in rendered
+    assert "git push origin v0.1.20" not in rendered
+
+    push_runner, push_cmd, _upgrader, _resumer = make_update_runner()
+    configure_git_state(push_cmd, current="same", target="same", merge_base="same", behind="0", ahead="0")
+    push_report = push_runner.run(
+        UpdateOptions(
+            repo=repo,
+            dry_run=True,
+            release=True,
+            patch=True,
+            tag=True,
+            push_tag=True,
+            current_version="0.1.19",
+            image_repository="registry/agentlab",
+        )
+    )
+
+    assert "git push origin v0.1.20" in format_update_report(push_report)
 
 
 def test_update_rejects_unrelated_dirty_files_unless_allowed(tmp_path: Path) -> None:
@@ -323,11 +412,13 @@ def test_reexec_marker_skips_pull_and_self_install_then_release_deploy(tmp_path:
     monkeypatch.setenv(UPDATE_REEXEC_ENV, "1")
     report = update_runner.run(UpdateOptions(repo=repo, current_version="0.1.19", image_repository="registry/agentlab"))
 
-    assert [call[0] for call in runner.calls] == [["git", "status", "--porcelain"]]
+    assert [call[0] for call in runner.calls] == [["git", "status", "--porcelain"], ["git", "rev-parse", "--short", "HEAD"]]
     assert not reexecutor.calls
     assert any(step.name == "Git pull" and step.status == "skipped" for step in report.steps)
     assert any(step.name == "Self install" and step.status == "skipped" for step in report.steps)
-    assert upgrader.calls[0].workflow == "deploy"
+    assert upgrader.calls[0].workflow == "update-runtime"
+    assert upgrader.calls[0].tag is False
+    assert upgrader.calls[0].push_tag is False
     assert upgrader.calls[0].skip_git_pull is True
     assert upgrader.calls[0].verify_image_method == "pull"
     assert upgrader.calls[0].push_tag_after_k8s is True
