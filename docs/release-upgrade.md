@@ -1,8 +1,45 @@
 # AgentLab Release Upgrade
 
-`agentlab release upgrade` runs the local release workflow from one command: resolve the release version, pull code, run tests, build and push the image, update Kubernetes manifests, and optionally apply and verify the cluster.
+`agentlab update` is the normal one-command operator workflow on a Kubernetes host. It updates the local checkout, refreshes the editable install, then runs the safe release deploy flow. Lower-level release commands remain available when you need more control.
 
 Git tags are the source of release truth. A normal `main` commit does not bump the AgentLab version. A release version changes only when an operator intentionally runs `agentlab release deploy`, `agentlab release upgrade --bump-patch`, `--bump-minor`, `--bump-major`, or `--version`.
+
+## Normal Update
+
+Preview the full update without mutating the working tree, release state, Docker, Kubernetes, or Git tags:
+
+```bash
+agentlab update --dry-run
+```
+
+Run the update:
+
+```bash
+agentlab update
+```
+
+`agentlab update` defaults to the current working directory, checks `git status`, allows only generated manifest dirtiness under `deploy/kubernetes/generated/**`, pulls `origin/main` with `git pull --ff-only`, re-checks `git status`, refreshes the editable install with the current Python interpreter, then re-execs itself so the deploy phase uses freshly installed code. It then runs the release deploy workflow with patch bump, pull-based image verification, Kubernetes apply, cluster config preservation, doctor, failed-resource cleanup, status, local tag creation, and remote tag push after Kubernetes upgrade/status succeeds.
+
+If a previous release left `.agentlab/release-state.json` incomplete, `agentlab update` refuses to start a fresh release and tells you to resume:
+
+```bash
+agentlab update --resume --dry-run
+agentlab update --resume
+```
+
+Useful update overrides:
+
+```bash
+agentlab update --minor
+agentlab update --major
+agentlab update --current-version v0.1.19 --image-repository registry.example.com/agentlab
+agentlab update --repo /opt/agentlab
+agentlab update --no-git-pull
+agentlab update --no-self-install
+agentlab update --verify-image-method manifest
+```
+
+`agentlab update --dry-run` may run `git fetch origin` so it can compare local `HEAD` with `origin/main`, but it does not modify the working tree. The report shows whether the checkout is equal to, behind, ahead of, or diverged from `origin/main`. Diverged history fails clearly before planning a release.
 
 ## Simple Deploy
 
@@ -12,7 +49,7 @@ The recommended operator command is:
 agentlab release deploy
 ```
 
-`deploy` is the safe default path. It uses the current working directory, resolves the current version from Git tags and Kubernetes release annotations, defaults to a patch bump, builds and pushes the derived image, verifies the image with `docker pull`, applies the Kubernetes upgrade while preserving cluster config, runs doctor, cleans failed jobs/pods, shows status, and pushes the Git tag only after the Kubernetes upgrade/status path succeeds.
+`release deploy` is the lower-level safe release path when you want to skip checkout update or self-install. It uses the current working directory, resolves the current version from Git tags and Kubernetes release annotations, defaults to a patch bump, builds and pushes the derived image, verifies the image with `docker pull`, applies the Kubernetes upgrade while preserving cluster config, runs doctor, cleans failed jobs/pods, shows status, and pushes the Git tag only after the Kubernetes upgrade/status path succeeds.
 
 Preview the full plan without mutating Git, Docker, or Kubernetes:
 

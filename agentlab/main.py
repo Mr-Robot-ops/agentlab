@@ -15,10 +15,12 @@ from agentlab.preflight import PreflightChecker
 from agentlab.release_cli import release_app
 from agentlab.scheduler import Scheduler, reset_scheduler_state, scheduler_status
 from agentlab.status import TERMINAL_STATES, format_status, list_run_statuses, read_run_status
+from agentlab.update_cli import update as update_command
 
 app = typer.Typer(help="AgentLab GitLab agent orchestration CLI.")
 app.add_typer(k8s_app, name="k8s")
 app.add_typer(release_app, name="release")
+app.command(name="update")(update_command)
 
 
 def _json_echo(value: object) -> None:
