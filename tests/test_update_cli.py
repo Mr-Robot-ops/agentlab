@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 import agentlab.update_cli as update_cli
@@ -10,6 +12,11 @@ from agentlab.k8s_operator import ClusterStatus
 from agentlab.main import app
 from agentlab.release_upgrade import ReleaseCommandResult, ReleaseStep, ReleaseUpgradeError, ReleaseUpgradeReport, ReleaseUpgrader
 from agentlab.update_cli import UPDATE_REEXEC_ENV, UpdateError, UpdateOptions, UpdateRunner, format_update_report
+
+
+@pytest.fixture(autouse=True)
+def clear_update_reexec_env(monkeypatch) -> None:
+    monkeypatch.delenv(UPDATE_REEXEC_ENV, raising=False)
 
 
 class ReexecRequested(RuntimeError):
@@ -111,6 +118,29 @@ class FakeStatusOperator:
     def status(self, *, manifest_dir: Path):
         self.calls.append(("status", manifest_dir))
         return ClusterStatus(namespace="agentlab", configmap_image=self.image, manifest_configmap_image=self.manifest_image)
+
+    def upgrade(self, **kwargs):
+        self.calls.append(("upgrade", kwargs))
+        return type(
+            "Upgrade",
+            (),
+            {
+                "namespace": "agentlab",
+                "manifest_dir": "deploy/kubernetes/generated",
+                "image": kwargs["image"],
+                "version": kwargs.get("version"),
+                "updated_manifests": ["configmap.yaml"],
+                "preserved_sections": ["schedule"],
+                "apply": kwargs.get("apply", False),
+                "applied": kwargs.get("apply", False),
+                "run_doctor": kwargs.get("run_doctor", False),
+                "doctor_status": "completed" if kwargs.get("run_doctor", False) else "not requested",
+                "cleanup_failed": kwargs.get("cleanup_failed", False),
+                "cleanup_report": None,
+                "status_checked": kwargs.get("show_status", False),
+                "image_drift": [],
+            },
+        )()
 
 
 class FakeReexecutor:
@@ -514,6 +544,36 @@ def test_reexec_marker_preserves_no_tests_in_release_options(tmp_path: Path, mon
     update_runner.run(UpdateOptions(repo=repo, image_repository="registry/agentlab", no_tests=True))
 
     assert upgrader.calls[0].skip_tests is True
+
+
+def test_update_no_tests_runtime_state_records_tests_skipped(tmp_path: Path, monkeypatch) -> None:
+    repo = write_agentlab_repo(tmp_path)
+    state_file = repo / ".agentlab" / "release-state.json"
+    command_runner = FakeCommandRunner()
+    command_runner.respond(["git", "status", "--porcelain"], stdout="")
+    command_runner.respond(["git", "rev-parse", "HEAD"], stdout="8f1aff3abcdef\n")
+    command_runner.respond(["git", "rev-parse", "--short", "HEAD"], stdout="8f1aff3\n")
+    operator = FakeStatusOperator("registry/agentlab:0.1.20")
+    upgrader = ReleaseUpgrader(command_runner=command_runner, operator_factory=lambda namespace, manifest_dir: operator)
+    update_runner = UpdateRunner(command_runner=command_runner, release_upgrader=upgrader, release_resumer=FakeReleaseResumer())
+
+    monkeypatch.setenv(UPDATE_REEXEC_ENV, "1")
+    report = update_runner.run(
+        UpdateOptions(
+            repo=repo,
+            image_repository="registry/agentlab",
+            no_tests=True,
+            state_file=state_file,
+        )
+    )
+
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    assert data["workflow"] == "update-runtime"
+    assert data["version"] == "commit 8f1aff3"
+    assert data["tag_enabled"] is False
+    assert data["push_tag_enabled"] is False
+    assert data["steps"]["tests"] == "skipped"
+    assert any(step.name == "Tests" and step.status == "skipped" for step in report.release_report.steps)
 
 
 def test_update_dry_run_resume_and_no_self_install_do_not_reexec(tmp_path: Path) -> None:
