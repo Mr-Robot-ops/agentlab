@@ -145,6 +145,7 @@ def write_release_state(tmp_path: Path, **updates) -> Path:
         "namespace": "agentlab",
         "manifest_dir": "deploy/kubernetes/generated",
         "verify_image_method": "manifest",
+        "docker_bin": "docker",
         "steps": steps,
         "completed": False,
     }
@@ -1058,6 +1059,7 @@ def test_release_state_file_is_written_after_major_steps(tmp_path: Path) -> None
     assert data["image"] == "registry/agentlab:0.1.18"
     assert data["commit"] == "abc123"
     assert data["verify_image_method"] == "pull"
+    assert data["docker_bin"] == "docker"
     assert data["steps"]["docker_push"] == "passed"
     assert data["steps"]["image_verify"] == "passed"
     assert data["steps"]["k8s_upgrade"] == "passed"
@@ -1068,6 +1070,124 @@ def test_release_state_file_is_written_after_major_steps(tmp_path: Path) -> None
     assert step_names.index("Kubernetes upgrade") < step_names.index("Git tag push")
     assert step_names.index("Status") < step_names.index("Git tag push")
     assert operator.calls[0][0] == "upgrade"
+
+
+def test_release_state_commit_is_refreshed_after_git_pull_before_later_failure(tmp_path: Path) -> None:
+    upgrader, runner, _operator = make_upgrader()
+    state_file = tmp_path / ".agentlab" / "release-state.json"
+    runner.responses[("git", "rev-parse", "HEAD")] = [
+        ReleaseCommandResult(args=["git", "rev-parse", "HEAD"], stdout="old123\n"),
+        ReleaseCommandResult(args=["git", "rev-parse", "HEAD"], stdout="new456\n"),
+    ]
+    runner.respond(["docker", "pull", "registry/agentlab:0.1.18"], stderr="pull failed", returncode=1)
+
+    try:
+        upgrader.run(
+            options(
+                tmp_path,
+                image=None,
+                current_version="0.1.17",
+                bump_patch=True,
+                image_repository="registry/agentlab",
+                skip_git_pull=False,
+                verify_image_method="pull",
+                state_file=state_file,
+                workflow="deploy",
+            )
+        )
+    except ReleaseUpgradeError as exc:
+        report = exc.report
+    else:
+        raise AssertionError("expected image verification failure")
+
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    assert data["commit"] == "new456"
+    assert report.failed_step is not None
+    assert report.failed_step.name == "Image verify"
+
+    resumer, resume_runner, operator = make_resumer()
+    resume_runner.respond(["git", "rev-parse", "HEAD"], stdout="new456\n")
+
+    resume_report = resumer.run(
+        ReleaseResumeOptions(
+            repo=tmp_path,
+            state_file=state_file,
+            verify_image_method="pull",
+        )
+    )
+
+    assert resume_report.failed_step is None
+    assert not any(step.name == "Validate state" for step in resume_report.steps)
+    assert ["docker", "pull", "registry/agentlab:0.1.18"] in [call[0] for call in resume_runner.calls]
+    assert operator.calls[0][0] == "upgrade"
+
+
+def test_release_state_stores_custom_docker_binary(tmp_path: Path) -> None:
+    upgrader, runner, _operator = make_upgrader()
+    state_file = tmp_path / ".agentlab" / "release-state.json"
+    runner.respond(["git", "rev-parse", "HEAD"], stdout="abc123\n")
+
+    upgrader.run(
+        options(
+            tmp_path,
+            image=None,
+            current_version="0.1.17",
+            bump_patch=True,
+            image_repository="registry/agentlab",
+            verify_image_method="pull",
+            docker_bin="podman",
+            state_file=state_file,
+        )
+    )
+
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    assert data["docker_bin"] == "podman"
+
+
+def test_release_resume_uses_stored_custom_docker_binary(tmp_path: Path) -> None:
+    state_file = write_release_state(
+        tmp_path,
+        docker_bin="podman",
+        verify_image_method="pull",
+        steps={
+            "docker_build": "pending",
+            "docker_push": "pending",
+            "image_verify": "pending",
+        },
+    )
+    resumer, runner, _operator = make_resumer()
+    runner.respond(["git", "rev-parse", "HEAD"], stdout="abc123\n")
+
+    resumer.run(ReleaseResumeOptions(repo=tmp_path, state_file=state_file))
+
+    commands = [call[0] for call in runner.calls]
+    assert ["podman", "build", "-t", "registry/agentlab:0.1.18", "."] in commands
+    assert ["podman", "push", "registry/agentlab:0.1.18"] in commands
+    assert ["podman", "pull", "registry/agentlab:0.1.18"] in commands
+
+
+def test_release_resume_defaults_missing_docker_binary_to_docker(tmp_path: Path) -> None:
+    state_file = write_release_state(
+        tmp_path,
+        verify_image_method="pull",
+        steps={
+            "docker_build": "pending",
+            "docker_push": "pending",
+            "image_verify": "pending",
+        },
+    )
+    data = json.loads(state_file.read_text(encoding="utf-8"))
+    data.pop("docker_bin")
+    state_file.write_text(json.dumps(data), encoding="utf-8")
+    resumer, runner, _operator = make_resumer()
+    runner.respond(["git", "rev-parse", "HEAD"], stdout="abc123\n")
+
+    resumer.run(ReleaseResumeOptions(repo=tmp_path, state_file=state_file))
+
+    commands = [call[0] for call in runner.calls]
+    assert ["docker", "build", "-t", "registry/agentlab:0.1.18", "."] in commands
+    assert ["docker", "push", "registry/agentlab:0.1.18"] in commands
+    assert ["docker", "pull", "registry/agentlab:0.1.18"] in commands
 
 
 def test_release_resume_resumes_after_docker_push_when_manifest_verify_failed(tmp_path: Path) -> None:

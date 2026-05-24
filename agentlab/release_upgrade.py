@@ -118,6 +118,7 @@ class ReleaseState:
     namespace: str
     manifest_dir: str
     verify_image_method: str
+    docker_bin: str = "docker"
     steps: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_STATE_STEPS))
     schema_version: int = 1
     completed: bool = False
@@ -131,11 +132,12 @@ class ReleaseState:
             schema_version=int(data.get("schema_version", 1)),
             version=str(data["version"]),
             image=str(data["image"]),
-            repo=str(data["repo"]),
-            commit=str(data["commit"]),
+            repo=str(data.get("repo", path.parent.parent)),
+            commit=str(data.get("commit", "unknown")),
             namespace=str(data.get("namespace", DEFAULT_NAMESPACE)),
             manifest_dir=str(data.get("manifest_dir", DEFAULT_MANIFEST_DIR)),
             verify_image_method=str(data.get("verify_image_method", "manifest")),
+            docker_bin=str(data.get("docker_bin", "docker")),
             steps=steps,
             completed=bool(data.get("completed", False)),
         )
@@ -150,6 +152,7 @@ class ReleaseState:
             "namespace": self.namespace,
             "manifest_dir": self.manifest_dir,
             "verify_image_method": self.verify_image_method,
+            "docker_bin": self.docker_bin,
             "steps": self.steps,
             "completed": self.completed,
         }
@@ -534,10 +537,12 @@ class ReleaseUpgrader:
         self._check_git_status(report, options, "Git status", cwd=repo, state=state, state_path=state_path)
 
         if options.skip_git_pull:
+            self._refresh_state_commit(state=state, state_path=state_path, cwd=repo)
             self._append_step(report, ReleaseStep(name="Git pull", status="skipped", detail="--skip-git-pull"), state=state, state_path=state_path)
         else:
             self._run_command(report, "Git pull", options.git_pull_command(), cwd=repo, state=state, state_path=state_path)
             self._check_git_status(report, options, "Git status after pull", cwd=repo, state=state, state_path=state_path)
+            self._refresh_state_commit(state=state, state_path=state_path, cwd=repo)
 
         self._ensure_manifest_dir(options, report, repo=repo, manifest_dir=manifest_dir, state=state, state_path=state_path)
 
@@ -705,11 +710,24 @@ class ReleaseUpgrader:
             namespace=options.namespace,
             manifest_dir=str(options.manifest_dir),
             verify_image_method=options.verify_image_method,
+            docker_bin=options.docker_bin,
             steps=steps,
         )
         state.write(state_path)
         report.state_file = str(state_path)
         return state
+
+    def _refresh_state_commit(
+        self,
+        *,
+        state: ReleaseState | None,
+        state_path: Path | None,
+        cwd: Path,
+    ) -> None:
+        if state is None or state_path is None:
+            return
+        state.commit = self._command_stdout_or_unknown(["git", "rev-parse", "HEAD"], cwd=cwd)
+        state.write(state_path)
 
     def _append_step(
         self,
@@ -1099,6 +1117,7 @@ class ReleaseResumer:
             self._add_dry_run_steps(report, state=state, verify_method=verify_method)
             return report
 
+        docker_bin = state.docker_bin or "docker"
         manifest_dir = Path(state.manifest_dir)
         if not manifest_dir.is_absolute():
             manifest_dir = repo / manifest_dir
@@ -1108,11 +1127,11 @@ class ReleaseResumer:
             else:
                 self._run_command(report, state, state_path, "Git tag", ["git", "tag", state.version], cwd=repo)
         if not _state_step_passed(state, "docker_build"):
-            self._run_command(report, state, state_path, "Docker build", ["docker", "build", "-t", state.image, "."], cwd=repo)
+            self._run_command(report, state, state_path, "Docker build", [docker_bin, "build", "-t", state.image, "."], cwd=repo)
         if not _state_step_passed(state, "docker_push"):
-            self._run_command(report, state, state_path, "Docker push", ["docker", "push", state.image], cwd=repo)
+            self._run_command(report, state, state_path, "Docker push", [docker_bin, "push", state.image], cwd=repo)
         if not _state_step_passed(state, "image_verify"):
-            self._run_command(report, state, state_path, "Image verify", _verify_command("docker", state.image, verify_method), cwd=repo)
+            self._run_command(report, state, state_path, "Image verify", _verify_command(docker_bin, state.image, verify_method), cwd=repo)
         operator = self.operator_factory(state.namespace, manifest_dir)
         if not _state_step_passed(state, "k8s_upgrade"):
             try:
@@ -1170,11 +1189,12 @@ class ReleaseResumer:
         return report
 
     def _add_dry_run_steps(self, report: ReleaseUpgradeReport, *, state: ReleaseState, verify_method: str) -> None:
+        docker_bin = state.docker_bin or "docker"
         planned = [
             ("Git tag", "git_tag", ["git", "tag", state.version]),
-            ("Docker build", "docker_build", ["docker", "build", "-t", state.image, "."]),
-            ("Docker push", "docker_push", ["docker", "push", state.image]),
-            ("Image verify", "image_verify", _verify_command("docker", state.image, verify_method)),
+            ("Docker build", "docker_build", [docker_bin, "build", "-t", state.image, "."]),
+            ("Docker push", "docker_push", [docker_bin, "push", state.image]),
+            ("Image verify", "image_verify", _verify_command(docker_bin, state.image, verify_method)),
             ("Kubernetes upgrade", "k8s_upgrade", ["agentlab", "k8s", "upgrade", "--image", state.image, "--version", state.version, "--apply"]),
             ("Status", "status", ["agentlab", "k8s", "status", "--namespace", state.namespace, "--manifest-dir", state.manifest_dir]),
             ("Git tag push", "git_tag_push", ["git", "push", "origin", state.version]),
