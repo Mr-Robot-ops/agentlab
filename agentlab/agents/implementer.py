@@ -13,6 +13,7 @@ from agentlab.branching import agent_branch_name
 from agentlab.config import AppConfig
 from agentlab.models import AgentTask, DiffStats, FileEdit, ImplementationReport, PatchProposal, ReportStatus, StructuredEditProposal, TaskType
 from agentlab.policies.risk import assess_risk
+from agentlab.rust_crate import is_rust_integration_test, rust_crate_layout, rust_root_for_path
 from agentlab.tools.common import ToolError
 from agentlab.tools.file_tool import (
     FileTool,
@@ -143,6 +144,19 @@ class ImplementationAgent:
                 branch=branch,
                 status=ReportStatus.FAILED,
                 errors=["task is not approved for implementation"],
+                no_changes_committed=True,
+                no_branch_pushed=True,
+                implementation_mode=implementation_mode,  # type: ignore[arg-type]
+            )
+        rust_block = self._rust_smoke_task_block(task)
+        if rust_block is not None:
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                errors=[rust_block],
+                failure_stage="preflight",
+                failure_reason="rust_library_seam_required",
                 no_changes_committed=True,
                 no_branch_pushed=True,
                 implementation_mode=implementation_mode,  # type: ignore[arg-type]
@@ -506,6 +520,19 @@ class ImplementationAgent:
                 branch=branch,
                 status=ReportStatus.FAILED,
                 errors=["task is not approved for implementation"],
+                no_changes_committed=True,
+                no_branch_pushed=True,
+                implementation_mode=implementation_mode,  # type: ignore[arg-type]
+            )
+        rust_block = self._rust_smoke_task_block(task)
+        if rust_block is not None:
+            return ImplementationReport(
+                task_id=task.id,
+                branch=branch,
+                status=ReportStatus.FAILED,
+                errors=[rust_block],
+                failure_stage="preflight",
+                failure_reason="rust_library_seam_required",
                 no_changes_committed=True,
                 no_branch_pushed=True,
                 implementation_mode=implementation_mode,  # type: ignore[arg-type]
@@ -1729,6 +1756,11 @@ class ImplementationAgent:
         rust_targets = [path for path in target_files if path.replace("\\", "/").startswith("rust-backend/")]
         if not rust_targets:
             return {}
+        try:
+            all_files = [path.replace("\\", "/") for path in self.file_tool.list_files()]
+        except Exception:
+            all_files = []
+        layout = rust_crate_layout("rust-backend", all_files, self.file_tool.read_file)
         paths = [
             "rust-backend/Cargo.toml",
             "rust-backend/src/lib.rs",
@@ -1740,34 +1772,86 @@ class ImplementationAgent:
                 snippets[path] = compact_text(self.file_tool.read_file(path), 4000)
             except Exception:
                 continue
-        try:
-            rust_files = [
-                path
-                for path in self.file_tool.list_files()
-                if path.startswith("rust-backend/src/") and path.endswith(".rs")
-            ][:30]
-        except Exception:
-            rust_files = []
+        rust_files = [path for path in all_files if path.startswith("rust-backend/src/") and path.endswith(".rs")][:30]
         return {
             "target_files": rust_targets,
             "source_files": rust_files,
             "snippets": snippets,
+            "crate_layout": {
+                "root": layout.root,
+                "package_name": layout.package_name,
+                "import_name": layout.import_name,
+                "has_library": layout.has_library,
+                "has_lib_rs": layout.has_lib_rs,
+                "has_lib_section": layout.has_lib_section,
+                "has_main_rs": layout.has_main_rs,
+                "is_binary_only": layout.is_binary_only,
+            },
             "guidance": (
-                "Choose a real public module/function/route from the crate. "
-                "Do not use CARGO_PKG_NAME/CARGO_PKG_VERSION, arithmetic, parsing, or framework-only assertions as smoke behavior."
+                "For Rust integration tests under tests/, import the package crate only when has_library is true. "
+                "If the crate is binary-only, do not invent use <package>:: imports; use an approved inline unit test or "
+                "an explicit public library seam task instead. Do not use CARGO_PKG_NAME/CARGO_PKG_VERSION, arithmetic, "
+                "parsing, or framework-only assertions as smoke behavior."
             ),
         }
 
-    @staticmethod
-    def _test_task_rules(task: AgentTask) -> list[str]:
+    def _test_task_rules(self, task: AgentTask) -> list[str]:
         if task.task_type != TaskType.TESTS and "test" not in task.title.lower() and "test" not in task.id.lower():
             return []
         return [
-            "For Rust smoke tests, import and exercise actual crate behavior such as rust_backend::routes::health_path().",
+            "For Rust integration tests under tests/, import the package crate only if src/lib.rs exists or Cargo.toml has a [lib] target.",
+            "Do not infer Rust import paths solely from package names; validate the library crate exists before emitting use <crate>::...",
+            "Binary-only Rust crates need an approved inline unit test or explicit public library seam; otherwise explain that the smoke test cannot be written safely.",
             "Do not generate assert!(true), assert_eq!(1, 1), arithmetic-only checks, generic parsing/runtime checks, or CARGO_PKG_NAME/CARGO_PKG_VERSION-only checks.",
             "The test must fail if project-specific code breaks and must pass TestQualityAgent.",
             "If no public project behavior is available, explain that a testable public seam is needed instead of generating a fake baseline.",
         ]
+
+    def _rust_smoke_task_block(self, task: AgentTask) -> str | None:
+        if not self._is_test_task(task):
+            return None
+        if task.metadata.get("implementation_blocked_reason") == "rust_library_seam_required":
+            return (
+                "Rust smoke-test baseline requires a public library seam: this crate has src/main.rs but no src/lib.rs "
+                "or [lib] target, so a test-only integration test cannot import project modules."
+            )
+        try:
+            files = [path.replace("\\", "/") for path in self.file_tool.list_files()]
+        except Exception:
+            return None
+        for path in task.affected_files:
+            normalized = path.replace("\\", "/")
+            root = rust_root_for_path(normalized, files)
+            if root is None or not is_rust_integration_test(normalized, root):
+                continue
+            layout = rust_crate_layout(root, files, self.file_tool.read_file)
+            if layout.has_library or self._task_allows_rust_public_seam(task):
+                continue
+            return (
+                f"Rust integration test {normalized} cannot import package crate {layout.import_name or layout.package_name or '<unknown>'}: "
+                f"{layout.root} has no src/lib.rs or [lib] target. Add an approved public seam or inline unit test task instead."
+            )
+        return None
+
+    @staticmethod
+    def _is_test_task(task: AgentTask) -> bool:
+        return task.task_type == TaskType.TESTS or "test" in task.title.lower() or "test" in task.id.lower()
+
+    @staticmethod
+    def _task_allows_rust_public_seam(task: AgentTask) -> bool:
+        text = ImplementationAgent._task_text(task).lower()
+        return any(
+            term in text
+            for term in (
+                "inline unit test",
+                "inline unit tests",
+                "unit tests inside",
+                "public seam",
+                "library seam",
+                "src/lib.rs",
+                "lib.rs",
+            )
+        )
 
     @staticmethod
     def _task_text(task: AgentTask) -> str:

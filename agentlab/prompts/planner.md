@@ -42,7 +42,9 @@ Good task candidates:
 
 - Fix one clear TODO/FIXME when the affected file is identifiable.
 - Add or repair a minimal test baseline when manifests exist but tests are absent.
-- For Rust smoke/integration test baselines, prefer test-only files: use `rust-backend/tests/smoke.rs` and include `rust-backend/Cargo.toml` only when dev-dependencies are explicitly required.
+- For Rust smoke/integration test baselines, first inspect `rust-backend/Cargo.toml` and source layout. Integration tests under `rust-backend/tests/` may import the package crate only when `src/lib.rs` exists or `Cargo.toml` has a `[lib]` target.
+- For Rust crates with only `src/main.rs`, do not plan a test-only integration test that imports the crate. Plan an inline unit test only when explicitly allowed, or recommend/propose a minimal public `src/lib.rs` seam plus smoke test for human approval.
+- When a Rust library crate exists, prefer test-only files: use `rust-backend/tests/smoke.rs` and include `rust-backend/Cargo.toml` only when dev-dependencies are explicitly required.
 - Do not include `rust-backend/src/*.rs` for Rust smoke/test-baseline tasks unless the request explicitly asks for inline unit tests or production-code hooks. If production Rust source changes are required for testing, mark the task medium-or-higher risk and recommend propose-only/human review in metadata.
 - Update documentation when README and actual structure differ.
 - Harden a Dockerfile only when the change is small and testable.

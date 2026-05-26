@@ -21,17 +21,20 @@ def config(tmp_path: Path) -> AppConfig:
     )
 
 
-def write_rust_backend(repo: Path, test_content: str, *, package_name: str = "rust-backend") -> None:
+def write_rust_backend(repo: Path, test_content: str, *, package_name: str = "rust-backend", with_lib: bool = True) -> None:
     (repo / "rust-backend" / "tests").mkdir(parents=True)
     (repo / "rust-backend" / "src").mkdir(parents=True)
     (repo / "rust-backend" / "Cargo.toml").write_text(
         f'[package]\nname = "{package_name}"\nversion = "0.1.0"\nedition = "2021"\n',
         encoding="utf-8",
     )
-    (repo / "rust-backend" / "src" / "lib.rs").write_text(
-        "pub mod routes { pub fn health_path() -> &'static str { \"/health\" } }\n",
-        encoding="utf-8",
-    )
+    if with_lib:
+        (repo / "rust-backend" / "src" / "lib.rs").write_text(
+            "pub mod routes { pub fn health_path() -> &'static str { \"/health\" } }\n",
+            encoding="utf-8",
+        )
+    else:
+        (repo / "rust-backend" / "src" / "main.rs").write_text("fn main() {}\n", encoding="utf-8")
     (repo / "rust-backend" / "tests" / "smoke.rs").write_text(test_content, encoding="utf-8")
 
 
@@ -129,6 +132,38 @@ def test_meaningful_rust_test_is_allowed(tmp_path: Path) -> None:
     assert report.findings == []
 
 
+def test_binary_only_crate_integration_import_is_blocked(tmp_path: Path) -> None:
+    test_content = (
+        "use zfs_manager::routes::health_path;\n\n"
+        "#[test]\n"
+        "fn health_path_is_exposed() {\n"
+        "    assert_eq!(health_path(), \"/health\");\n"
+        "}\n"
+    )
+    write_rust_backend(tmp_path, test_content, package_name="zfs-manager", with_lib=False)
+
+    report = QualityAgent(FileTool(tmp_path, config(tmp_path))).run(["rust-backend/tests/smoke.rs"])
+
+    assert report.status == ReportStatus.FAILED
+    assert any(finding.reason == "missing_library_crate" for finding in report.findings)
+
+
+def test_binary_only_crate_does_not_force_integration_import(tmp_path: Path) -> None:
+    test_content = (
+        "#[test]\n"
+        "fn project_binary_is_built_for_smoke_tests() {\n"
+        "    let binary = env!(\"CARGO_BIN_EXE_zfs-manager\");\n"
+        "    assert!(binary.ends_with(\"zfs-manager\") || binary.ends_with(\"zfs-manager.exe\"));\n"
+        "}\n"
+    )
+    write_rust_backend(tmp_path, test_content, package_name="zfs-manager", with_lib=False)
+
+    report = QualityAgent(FileTool(tmp_path, config(tmp_path))).run(["rust-backend/tests/smoke.rs"])
+
+    assert report.status == ReportStatus.PASSED
+    assert report.findings == []
+
+
 def test_rust_backend_changed_test_file_triggers_cargo_test_command(tmp_path: Path) -> None:
     write_rust_backend(
         tmp_path,
@@ -152,3 +187,34 @@ def test_safe_cd_test_command_is_allowlisted_by_inner_command(tmp_path: Path) ->
     tool = AgentTestTool(tmp_path, cfg)
 
     assert tool.is_allowed("cd rust-backend && cargo test --package rust-backend")
+
+
+def test_rust_missing_library_seam_functional_failure_is_explained(tmp_path: Path) -> None:
+    write_rust_backend(tmp_path, "#[test]\nfn test_smoke() {}\n", package_name="zfs-manager", with_lib=False)
+    file_tool = FileTool(tmp_path, config(tmp_path))
+
+    class FakeTestTool:
+        def is_allowed(self, command: str) -> bool:
+            return True
+
+        def run_command(self, command: str):
+            from agentlab.models import CommandResult
+
+            return CommandResult(
+                command=command,
+                cwd=str(tmp_path),
+                exit_code=101,
+                stderr=(
+                    "error[E0433]: failed to resolve: use of unresolved module or unlinked crate `zfs_manager`\n"
+                    " --> tests/smoke.rs:1:5\n"
+                ),
+            )
+
+    report = FunctionalTestAgent(
+        file_tool,
+        FakeTestTool(),  # type: ignore[arg-type]
+        changed_files=["rust-backend/tests/smoke.rs"],
+    ).run()
+
+    assert report.status == ReportStatus.FAILED
+    assert "Binary-only crates need inline unit tests" in report.recommendation

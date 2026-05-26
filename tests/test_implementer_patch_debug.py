@@ -181,11 +181,13 @@ class ValidatingFakeFileTool(FakeFileTool):
 
 class RustPlaceholderFileTool(FakeFileTool):
     def list_files(self) -> list[str]:
-        return ["rust-backend/Cargo.toml", "rust-backend/tests/smoke.rs"]
+        return ["rust-backend/Cargo.toml", "rust-backend/src/lib.rs", "rust-backend/tests/smoke.rs"]
 
     def read_file(self, path: str) -> str:
         if path == "rust-backend/Cargo.toml":
             return '[package]\nname = "rust-backend"\nversion = "0.1.0"\nedition = "2021"\n'
+        if path == "rust-backend/src/lib.rs":
+            return 'pub mod routes { pub fn health_path() -> &\'static str { "/health" } }\n'
         if path == "rust-backend/tests/smoke.rs":
             return "#[test]\nfn test_smoke() {\n    assert!(true);\n}\n"
         return super().read_file(path)
@@ -245,6 +247,21 @@ class RustContextCorruptFileTool(FakeFileTool):
                 check=True,
             )
         return DiffStats(changed_files=["rust-backend/tests/smoke.rs"], added_lines=6)
+
+
+class RustBinaryOnlyFileTool(FakeFileTool):
+    def list_files(self) -> list[str]:
+        return [
+            "rust-backend/Cargo.toml",
+            "rust-backend/src/main.rs",
+        ]
+
+    def read_file(self, path: str) -> str:
+        if path == "rust-backend/Cargo.toml":
+            return '[package]\nname = "zfs-manager"\nversion = "0.1.0"\nedition = "2021"\n'
+        if path == "rust-backend/src/main.rs":
+            return "fn main() {}\n"
+        return ""
 
 
 class FakeOllama:
@@ -1336,6 +1353,30 @@ def test_incomplete_rust_smoke_test_blocks_commit_and_push(tmp_path: Path) -> No
     assert quality["findings"][0]["reason"] == "rust_syntax_incomplete"
 
 
+def test_binary_only_rust_smoke_task_blocks_before_patch_generation(tmp_path: Path) -> None:
+    git = FakeGitTool()
+    store = ArtifactStore(tmp_path / "run", "run-1")
+    ollama = FakeOllama([rust_proposal_with_patch()])
+
+    report = ImplementationAgent(
+        config(tmp_path).model_copy(update={"push_agent_branches_enabled": True}),
+        git,
+        RustBinaryOnlyFileTool(),
+        ollama,
+        artifacts=store,
+        run_id="run-1",
+    ).implement(rust_test_task())
+
+    assert report.status == ReportStatus.FAILED
+    assert report.failure_stage == "preflight"
+    assert report.failure_reason == "rust_library_seam_required"
+    assert "no src/lib.rs or [lib] target" in report.errors[0]
+    assert git.created_branch is None
+    assert git.committed is False
+    assert git.pushed is False
+    assert ollama.calls == 0
+
+
 def test_corrupt_patch_for_docs_task_can_fallback_to_structured_edit(tmp_path: Path) -> None:
     repo = init_repo(tmp_path)
     store = ArtifactStore(tmp_path / "run", "run")
@@ -1468,6 +1509,7 @@ def test_corrupt_patch_repair_prompt_includes_stderr_excerpt_and_rust_context(tm
     assert "6: +use rust_backend::routes;" in repair_prompt
     assert "rust-backend/tests/smoke.rs" in repair_prompt
     assert "rust-backend/src/lib.rs" in repair_prompt
+    assert '"has_library": true' in repair_prompt
     assert "health_path" in repair_prompt
     assert "CARGO_PKG_NAME/CARGO_PKG_VERSION" in repair_prompt
     assert git.committed is False
