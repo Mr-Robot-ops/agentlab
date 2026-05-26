@@ -10,8 +10,14 @@ def test_runtime_dockerfile_installs_rust_toolchain() -> None:
     content = dockerfile.read_text(encoding="utf-8")
     install_block = content.split("apt-get install -y --no-install-recommends", 1)[1].split("&& rm -rf /var/lib/apt/lists/*", 1)[0]
 
-    assert "cargo" in install_block
-    assert "rustc" in install_block
+    assert "FROM rust:1-slim-bookworm AS rust-toolchain" in content
+    assert "COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup" in content
+    assert "COPY --from=rust-toolchain /usr/local/cargo/bin /usr/local/cargo/bin" in content
+    assert "build-essential" in install_block
+    assert "cargo" not in install_block
+    assert "rustc" not in install_block
+    assert "cargo --version" in content
+    assert "rustc --version" in content
     assert "rm -rf /var/lib/apt/lists/*" in content
 
 
@@ -26,6 +32,7 @@ def test_runtime_rust_toolchain_smoke_checks_are_documented() -> None:
 
     assert "docker run --rm <image> cargo --version" in docs
     assert "docker run --rm <image> rustc --version" in docs
+    assert "Cargo.lock version 4" in docs
 
 
 def test_docker_safety_scanner_blocks_unsafe_compose_settings(tmp_path: Path) -> None:

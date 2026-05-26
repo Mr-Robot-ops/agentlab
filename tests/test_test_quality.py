@@ -83,6 +83,22 @@ def test_rust_test_without_project_specific_behavior_is_blocked(tmp_path: Path) 
     assert any(finding.reason == "no_project_behavior" for finding in report.findings)
 
 
+def test_rust_test_missing_closing_brace_is_blocked(tmp_path: Path) -> None:
+    report = report_for(
+        tmp_path,
+        "use rust_backend::routes;\n\n"
+        "#[test]\n"
+        "fn test_health_path_is_valid() {\n"
+        "    let path = routes::health_path();\n"
+        "    assert!(!path.is_empty());\n",
+    )
+
+    assert report.status == ReportStatus.FAILED
+    assert report.findings[0].path == "rust-backend/tests/smoke.rs"
+    assert report.findings[0].line == 4
+    assert report.findings[0].reason == "rust_syntax_incomplete"
+
+
 def test_rust_cargo_package_metadata_only_smoke_is_blocked(tmp_path: Path) -> None:
     report = report_for(
         tmp_path,

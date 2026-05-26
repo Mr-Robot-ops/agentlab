@@ -10,6 +10,7 @@ from agentlab.models import (
     Finding,
     FindingSeverity,
     ReportStatus,
+    ReviewComment,
     ReviewReport,
     RiskAssessment,
     RiskLevel,
@@ -130,6 +131,30 @@ def test_critical_findings_block() -> None:
     )  # type: ignore[arg-type]
     assert decision.allowed is False
     assert "critical or blocking security findings present" in decision.blockers
+
+
+def test_critical_quality_syntax_review_blocks_gate() -> None:
+    quality = ReviewReport(
+        reviewer="quality",
+        verdict=Verdict.CHANGES_REQUESTED,
+        summary="Rust test has a syntax error.",
+        comments=[
+            ReviewComment(
+                path="rust-backend/tests/smoke.rs",
+                line=4,
+                body="Rust test function is missing a closing brace.",
+                severity=FindingSeverity.CRITICAL,
+            )
+        ],
+    )
+
+    decision = PolicyEngine(config(auto_merge_enabled=True)).evaluate(
+        **inputs(quality_review=quality)
+    )  # type: ignore[arg-type]
+
+    assert decision.allowed is False
+    assert decision.policy_checks["quality_review_approved"] is False
+    assert "quality review is not approved" in decision.blockers
 
 
 def test_missing_rollback_plan_blocks() -> None:
