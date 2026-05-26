@@ -19,6 +19,8 @@ PLACEHOLDER_PATTERNS = (
 )
 RUST_ASSERTION_RE = re.compile(r"\b(?:assert|assert_eq|assert_ne|debug_assert|debug_assert_eq|debug_assert_ne|matches)!\s*\(")
 COMMENT_RE = re.compile(r"//.*?$|/\*.*?\*/", re.MULTILINE | re.DOTALL)
+RUST_TEST_MARKER_RE = re.compile(r"#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*test(?:\s*\([^]]*\))?\s*\]")
+RUST_FN_RE = re.compile(r"\b(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)\s*(?:->[^{]+)?\{")
 
 
 class TestQualityError(RuntimeError):
@@ -103,6 +105,10 @@ def _rust_findings(
     file_tool: FileTool,
 ) -> list[TestQualityFinding]:
     findings: list[TestQualityFinding] = []
+    syntax_findings = _rust_syntax_findings(path, content)
+    if syntax_findings:
+        return syntax_findings
+
     markers = _rust_project_markers(path, all_files, file_tool)
     file_has_project_reference = _has_project_reference(content, markers)
     for test in _rust_test_functions(content):
@@ -155,10 +161,8 @@ def _rust_findings(
 
 def _rust_test_functions(content: str) -> list[RustTestFunction]:
     tests: list[RustTestFunction] = []
-    marker_re = re.compile(r"#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*test(?:\s*\([^]]*\))?\s*\]")
-    fn_re = re.compile(r"\b(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)\s*(?:->[^{]+)?\{")
-    for marker in marker_re.finditer(content):
-        fn_match = fn_re.search(content, marker.end())
+    for marker in RUST_TEST_MARKER_RE.finditer(content):
+        fn_match = RUST_FN_RE.search(content, marker.end())
         if not fn_match:
             continue
         open_brace = fn_match.end() - 1
@@ -173,6 +177,25 @@ def _rust_test_functions(content: str) -> list[RustTestFunction]:
             )
         )
     return tests
+
+
+def _rust_syntax_findings(path: str, content: str) -> list[TestQualityFinding]:
+    findings: list[TestQualityFinding] = []
+    for marker in RUST_TEST_MARKER_RE.finditer(content):
+        fn_match = RUST_FN_RE.search(content, marker.end())
+        if not fn_match:
+            continue
+        open_brace = fn_match.end() - 1
+        if _matching_brace(content, open_brace) is None:
+            findings.append(
+                TestQualityFinding(
+                    path=path,
+                    line=_line_for_offset(content, fn_match.start()),
+                    reason="rust_syntax_incomplete",
+                    description="Rust test function has unbalanced braces or is missing a closing brace.",
+                )
+            )
+    return findings
 
 
 def _matching_brace(content: str, open_brace: int) -> int | None:

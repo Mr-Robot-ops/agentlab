@@ -475,7 +475,7 @@ Gemeinsame Sicherheitsvorgaben:
 
 Docker Build Checks im AgentLab-Container bleiben default `false`. Wenn Build Checks gebraucht werden, nutze GitLab CI, externe Runner, Kaniko oder rootless BuildKit statt Docker-Socket-Mount.
 
-Das AgentLab-Runtime-Image enthaelt Git, OpenSSH sowie eine minimale Rust-Toolchain (`cargo` und `rustc`). Damit koennen Kubernetes Jobs funktionale Rust-Tests ausfuehren, wenn AgentLab Rust-Testaenderungen erkennt, zum Beispiel:
+Das AgentLab-Runtime-Image enthaelt Git, OpenSSH sowie eine moderne minimale Rust-Toolchain (`cargo` und `rustc`) aus dem offiziellen Rust-Stable-Image. Damit koennen Kubernetes Jobs funktionale Rust-Tests ausfuehren, wenn AgentLab Rust-Testaenderungen erkennt, zum Beispiel:
 
 ```bash
 cd rust-backend && cargo test --package zfs-manager
@@ -487,6 +487,8 @@ Nach einem Runtime-Image-Build kann die Toolchain so geprueft werden:
 docker run --rm <image> cargo --version
 docker run --rm <image> rustc --version
 ```
+
+Die Toolchain ist bewusst nicht das alte Debian-`cargo`-Paket, damit moderne Repositories mit Cargo.lock version 4 getestet werden koennen.
 
 ## Komodo optional
 

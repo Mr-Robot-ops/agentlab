@@ -177,6 +177,19 @@ class RustPlaceholderFileTool(FakeFileTool):
         return DiffStats(changed_files=["rust-backend/tests/smoke.rs"], added_lines=4)
 
 
+class RustIncompleteSyntaxFileTool(RustPlaceholderFileTool):
+    def read_file(self, path: str) -> str:
+        if path == "rust-backend/tests/smoke.rs":
+            return (
+                "use rust_backend::routes;\n\n"
+                "#[test]\n"
+                "fn test_health_path_is_valid() {\n"
+                "    let path = routes::health_path();\n"
+                "    assert!(!path.is_empty());\n"
+            )
+        return super().read_file(path)
+
+
 class FakeOllama:
     def __init__(self, proposals: list[PatchProposal | StructuredEditProposal]) -> None:
         self.proposals = proposals
@@ -1208,6 +1221,38 @@ def test_placeholder_test_quality_blocks_commit_and_push(tmp_path: Path) -> None
     quality = json.loads(read_artifact(store, "test_quality_report.json"))
     assert quality["reason"] == "placeholder_test_detected"
     assert quality["findings"][0]["reason"] == "assert_true"
+
+
+def test_incomplete_rust_smoke_test_blocks_commit_and_push(tmp_path: Path) -> None:
+    git = FakeGitTool()
+    store = ArtifactStore(tmp_path / "run", "run-1")
+    proposal = PatchProposal(
+        task_id="tests-02-smoke-baseline",
+        summary="add smoke test",
+        patch="diff --git a/rust-backend/tests/smoke.rs b/rust-backend/tests/smoke.rs\n",
+        affected_files=["rust-backend/tests/smoke.rs"],
+        expected_tests=["cd rust-backend && cargo test --package rust-backend"],
+        rollback="Revert rust-backend/tests/smoke.rs.",
+    )
+
+    report = ImplementationAgent(
+        config(tmp_path).model_copy(update={"push_agent_branches_enabled": True}),
+        git,
+        RustIncompleteSyntaxFileTool(),
+        FakeOllama([proposal]),
+        artifacts=store,
+        run_id="run-1",
+    ).implement(rust_test_task())
+
+    assert report.status == ReportStatus.FAILED
+    assert report.failure_stage == "test_quality"
+    assert report.failure_reason == "placeholder_test_detected"
+    assert git.committed is False
+    assert git.pushed is False
+    assert report.no_changes_committed is True
+    assert report.no_branch_pushed is True
+    quality = json.loads(read_artifact(store, "test_quality_report.json"))
+    assert quality["findings"][0]["reason"] == "rust_syntax_incomplete"
 
 
 def test_corrupt_patch_for_docs_task_can_fallback_to_structured_edit(tmp_path: Path) -> None:
