@@ -102,6 +102,7 @@ def test_kubernetes_configmap_safe_defaults_and_connection_values(tmp_path):
     assert config["auto_merge_enabled"] is False
     assert config["direct_main_push_enabled"] is False
     assert config["push_agent_branches_enabled"] is False
+    assert config["functional_test_env"] == {"CARGO_BUILD_JOBS": "1"}
 
 
 def test_kubernetes_mr_flow_enables_only_branch_push(tmp_path):
@@ -154,6 +155,12 @@ def test_kubernetes_jobs_use_security_context_and_secret_env(tmp_path):
     assert container["securityContext"]["allowPrivilegeEscalation"] is False
     assert container["securityContext"]["readOnlyRootFilesystem"] is True
     assert container["securityContext"]["capabilities"]["drop"] == ["ALL"]
+    assert doctor_job["spec"]["backoffLimit"] == 0
+    assert doctor_job["spec"]["activeDeadlineSeconds"] == 3600
+    assert container["resources"] == {
+        "requests": {"cpu": "250m", "memory": "512Mi"},
+        "limits": {"cpu": "1", "memory": "2Gi"},
+    }
     assert container["command"] == ["agentlab"]
     assert container["args"] == ["doctor", "--config", "/etc/agentlab/config.yaml"]
     assert dry_run_job["spec"]["template"]["spec"]["containers"][0]["args"][0] == "dry-run"
@@ -270,8 +277,11 @@ def test_kubernetes_bootstrap_generates_scheduler_cronjobs_when_enabled(tmp_path
         assert cronjob["spec"]["concurrencyPolicy"] == "Forbid"
         assert cronjob["spec"]["successfulJobsHistoryLimit"] == 3
         assert cronjob["spec"]["failedJobsHistoryLimit"] == 5
+        assert cronjob["spec"]["jobTemplate"]["spec"]["backoffLimit"] == 0
+        assert cronjob["spec"]["jobTemplate"]["spec"]["activeDeadlineSeconds"] == 3600
         container = cronjob["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
         assert container["args"][0] == command
+        assert container["resources"]["limits"]["cpu"] == "1"
         volume_names = {volume["name"] for volume in cronjob["spec"]["jobTemplate"]["spec"]["template"]["spec"]["volumes"]}
         assert {"config", "git-netrc", "runs"}.issubset(volume_names)
 
@@ -282,6 +292,36 @@ def test_kubernetes_bootstrap_generates_scheduler_cronjobs_when_enabled(tmp_path
     assert {"cronjob-scheduler-watch.yaml", "cronjob-scheduler-plan.yaml", "cronjob-scheduler-action.yaml"}.issubset(
         set(kustomization["resources"])
     )
+
+
+def test_kubernetes_bootstrap_job_resources_are_configurable(tmp_path):
+    out = generate_k8s(
+        namespace="agentlab",
+        image="registry.local/agentlab:0.1.0",
+        gitlab_url="https://gitlab.local",
+        target_repo_url="https://gitlab.local/group/project.git",
+        ollama_url="http://ollama.local:11434",
+        output_dir=tmp_path,
+        schedule_enabled=True,
+        job_cpu_request="100m",
+        job_memory_request="256Mi",
+        job_cpu_limit="750m",
+        job_memory_limit="1Gi",
+        job_active_deadline_seconds=1800,
+    )
+
+    job = yaml.safe_load((out / "job-scheduler-action.yaml").read_text(encoding="utf-8"))
+    cronjob = yaml.safe_load((out / "cronjob-scheduler-action.yaml").read_text(encoding="utf-8"))
+    container = job["spec"]["template"]["spec"]["containers"][0]
+    cron_container = cronjob["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
+
+    assert job["spec"]["activeDeadlineSeconds"] == 1800
+    assert cronjob["spec"]["jobTemplate"]["spec"]["activeDeadlineSeconds"] == 1800
+    assert container["resources"] == {
+        "requests": {"cpu": "100m", "memory": "256Mi"},
+        "limits": {"cpu": "750m", "memory": "1Gi"},
+    }
+    assert cron_container["resources"] == container["resources"]
 
 
 def test_kubernetes_bootstrap_generates_manual_scheduler_jobs(tmp_path):
@@ -364,6 +404,25 @@ def test_kubernetes_bootstrap_generates_review_comment_cronjob_when_enabled(tmp_
     assert config["schedule"]["review_comments"]["process_history"] is False
     kustomization = yaml.safe_load((out / "kustomization.yaml").read_text(encoding="utf-8"))
     assert "cronjob-scheduler-review-comments.yaml" in kustomization["resources"]
+
+
+def test_kubernetes_bootstrap_review_comments_default_is_not_every_minute(tmp_path):
+    out = generate_k8s(
+        namespace="agentlab",
+        image="registry.local/agentlab:0.1.0",
+        gitlab_url="https://gitlab.local",
+        target_repo_url="https://gitlab.local/group/project.git",
+        ollama_url="http://ollama.local:11434",
+        output_dir=tmp_path,
+        schedule_review_comments_enabled=True,
+    )
+
+    cronjob = yaml.safe_load((out / "cronjob-scheduler-review-comments.yaml").read_text(encoding="utf-8"))
+    config = config_from_configmap(out)
+
+    assert cronjob["spec"]["schedule"] == "*/15 * * * *"
+    assert cronjob["spec"]["schedule"] != "*/1 * * * *"
+    assert config["schedule"]["review_comments"]["cron"] == "*/15 * * * *"
 
 
 def test_review_comment_cronjob_matches_other_scheduler_cronjob_pod_settings(tmp_path):

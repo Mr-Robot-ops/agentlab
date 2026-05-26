@@ -93,7 +93,7 @@ schedule:
     preferred_task_ids: []
   review_comments:
     enabled: false
-    cron: "*/10 * * * *"
+    cron: "*/15 * * * *"
     process_history: false
     max_comments_per_run: 1
     cooldown_minutes: 10
@@ -111,6 +111,9 @@ schedule:
     require_author_role:
       - owner
       - maintainer
+
+functional_test_env:
+  CARGO_BUILD_JOBS: "1"
 ```
 
 Keep `schedule.action.enabled: false` until watch, plan, and AutoApproval reports look right.
@@ -226,6 +229,25 @@ Stage 3:
 - Keep action strictly limited.
 
 CronJobs are only generated when `schedule.enabled` is true. Manual `job-scheduler-*.yaml` manifests are generated even when scheduling is disabled.
+
+## Resource Controls
+
+Generated Kubernetes Jobs include `backoffLimit: 0`, `activeDeadlineSeconds`, and container resource requests/limits. CronJobs use `concurrencyPolicy: Forbid` so a slow watch, plan, action, or review-comments run is not overlapped by the next scheduled tick.
+
+Small homelab clusters should start with conservative bootstrap defaults:
+
+```bash
+python scripts/bootstrap_k8s.py \
+  --job-cpu-request 250m \
+  --job-memory-request 512Mi \
+  --job-cpu-limit 1 \
+  --job-memory-limit 2Gi \
+  --job-active-deadline-seconds 3600
+```
+
+Rust functional tests default to `CARGO_BUILD_JOBS=1` through `functional_test_env` to keep Cargo compilation from saturating small nodes. Increase it only after observing stable CPU and memory headroom.
+
+Keep `schedule.review_comments.cron` at `*/15 * * * *` or slower unless you explicitly need faster feedback. Avoid `*/1 * * * *` on homelab clusters because review polling can overlap with action jobs and functional tests even when CronJobs themselves are serialized.
 
 ## Reports
 

@@ -144,7 +144,7 @@ class ScheduleReviewCommentsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
-    cron: str = "*/10 * * * *"
+    cron: str = "*/15 * * * *"
     process_history: bool = False
     max_comments_per_run: int = Field(default=1, ge=1)
     cooldown_minutes: int = Field(default=10, ge=0)
@@ -193,7 +193,7 @@ class ScheduleConfig(BaseModel):
             },
             "review_comments": {
                 "enabled": False,
-                "cron": "*/10 * * * *",
+                "cron": "*/15 * * * *",
                 "process_history": False,
                 "max_comments_per_run": 1,
                 "cooldown_minutes": 10,
@@ -267,6 +267,7 @@ class AppConfig(BaseModel):
     push_agent_branches_enabled: bool = False
     docker_build_enabled: bool = True
     docker_compose_enabled: bool = True
+    functional_test_env: dict[str, str] = Field(default_factory=lambda: {"CARGO_BUILD_JOBS": "1"})
     command_timeout_seconds: int = Field(default=900, ge=1)
     audit_file: str = "audit.jsonl"
 
@@ -300,6 +301,16 @@ class AppConfig(BaseModel):
     @classmethod
     def normalize_strings(cls, values: list[str]) -> list[str]:
         return [value.strip() for value in values if value.strip()]
+
+    @field_validator("functional_test_env")
+    @classmethod
+    def normalize_functional_test_env(cls, values: dict[str, str]) -> dict[str, str]:
+        normalized: dict[str, str] = {}
+        for key, value in values.items():
+            name = str(key).strip()
+            if name:
+                normalized[name] = str(value).strip()
+        return normalized
 
     def agent_model(self, agent_name: str) -> str:
         return self.ollama.model_for(agent_name)

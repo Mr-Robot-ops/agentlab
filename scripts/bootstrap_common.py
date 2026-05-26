@@ -90,7 +90,7 @@ def render_agentlab_config(
     schedule_plan_cron: str = "0 7,19 * * *",
     schedule_action_cron: str = "30 2 * * *",
     schedule_review_comments_enabled: bool = False,
-    schedule_review_comments_cron: str = "*/10 * * * *",
+    schedule_review_comments_cron: str = "*/15 * * * *",
 ) -> str:
     flags = mode_flags(mode)
     require_repo_policy = "false"
@@ -151,6 +151,8 @@ def render_agentlab_config(
         "",
         "docker_build_enabled: false",
         "docker_compose_enabled: false",
+        "functional_test_env:",
+        '  CARGO_BUILD_JOBS: "1"',
         f"require_repo_policy_for_write: {require_repo_policy}",
         "",
         "required_test_commands: []",

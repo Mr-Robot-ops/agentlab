@@ -39,6 +39,7 @@ class TestTool:
             parsed.argv,
             cwd=cwd,
             timeout_seconds=timeout_seconds or self.config.command_timeout_seconds,
+            env=self.config.functional_test_env or None,
         ).model_copy(update={"command": command, "cwd": str(cwd)})
 
     def _safe_cd_command(self, command: str) -> tuple[Path, str] | None:
