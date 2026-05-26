@@ -9,7 +9,7 @@ from typing import Any
 import pytest
 
 from agentlab.artifacts import ArtifactStore
-from agentlab.agents.implementer import ImplementationAgent
+from agentlab.agents.implementer import FileOperation, FileOperationsProposal, ImplementationAgent
 from agentlab.config import AppConfig
 from agentlab.models import (
     AgentTask,
@@ -65,6 +65,27 @@ VALID_MARKDOWN_PATCH = """diff --git a/README.md b/README.md
 +---
 +
 +## Security & Deployment Assumptions
+"""
+
+RUST_SMOKE_PATCH = """diff --git a/rust-backend/tests/smoke.rs b/rust-backend/tests/smoke.rs
+new file mode 100644
+--- /dev/null
++++ b/rust-backend/tests/smoke.rs
+@@ -0,0 +1,6 @@
++use rust_backend::routes;
++
++#[test]
++fn health_path_is_exposed() {
++    assert_eq!(routes::health_path(), "/health");
++}
+"""
+
+MEANINGFUL_RUST_SMOKE = """use rust_backend::routes;
+
+#[test]
+fn health_path_is_exposed() {
+    assert_eq!(routes::health_path(), "/health");
+}
 """
 
 
@@ -190,8 +211,44 @@ class RustIncompleteSyntaxFileTool(RustPlaceholderFileTool):
         return super().read_file(path)
 
 
+class RustContextCorruptFileTool(FakeFileTool):
+    def __init__(self, *, fail_times: int = 1, stderr: str = "error: corrupt patch at line 6\n") -> None:
+        super().__init__(fail_times=fail_times)
+        self.stderr = stderr
+
+    def list_files(self) -> list[str]:
+        return [
+            "rust-backend/Cargo.toml",
+            "rust-backend/src/lib.rs",
+            "rust-backend/tests/smoke.rs",
+        ]
+
+    def read_file(self, path: str) -> str:
+        if path == "rust-backend/Cargo.toml":
+            return '[package]\nname = "rust-backend"\nversion = "0.1.0"\nedition = "2021"\n'
+        if path == "rust-backend/src/lib.rs":
+            return 'pub mod routes { pub fn health_path() -> &\'static str { "/health" } }\n'
+        if path == "rust-backend/tests/smoke.rs":
+            return ""
+        return super().read_file(path)
+
+    def validate_patch(self, proposal: PatchProposal) -> DiffStats:
+        return DiffStats(changed_files=["rust-backend/tests/smoke.rs"], added_lines=6)
+
+    def apply_patch(self, proposal: PatchProposal) -> DiffStats:
+        self.apply_calls += 1
+        if self.apply_calls <= self.fail_times:
+            raise PatchApplyError(
+                command=["git", "apply", "--check", "--whitespace=nowarn", "-"],
+                stderr=self.stderr,
+                patch=proposal.patch,
+                check=True,
+            )
+        return DiffStats(changed_files=["rust-backend/tests/smoke.rs"], added_lines=6)
+
+
 class FakeOllama:
-    def __init__(self, proposals: list[PatchProposal | StructuredEditProposal]) -> None:
+    def __init__(self, proposals: list[Any]) -> None:
         self.proposals = proposals
         self.calls = 0
         self.prompts: list[str] = []
@@ -275,6 +332,17 @@ def proposal_with_patch(patch: str, summary: str = "docs") -> PatchProposal:
     )
 
 
+def rust_proposal_with_patch(patch: str = RUST_SMOKE_PATCH, summary: str = "add rust smoke") -> PatchProposal:
+    return PatchProposal(
+        task_id="tests-02-smoke-baseline",
+        summary=summary,
+        patch=patch,
+        affected_files=["rust-backend/tests/smoke.rs"],
+        expected_tests=["cd rust-backend && cargo test --package rust-backend"],
+        rollback="Revert rust-backend/tests/smoke.rs.",
+    )
+
+
 def rust_test_task() -> AgentTask:
     return AgentTask(
         id="tests-02-smoke-baseline",
@@ -305,6 +373,19 @@ def init_repo(tmp_path: Path, content: str = "# AgentLab\n") -> Path:
     subprocess.run(["git", "init"], cwd=repo, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     (repo / "README.md").write_text(content, encoding="utf-8")
     return repo
+
+
+def write_rust_backend(repo: Path) -> None:
+    (repo / "rust-backend" / "src").mkdir(parents=True)
+    (repo / "rust-backend" / "tests").mkdir(parents=True)
+    (repo / "rust-backend" / "Cargo.toml").write_text(
+        '[package]\nname = "rust-backend"\nversion = "0.1.0"\nedition = "2021"\n',
+        encoding="utf-8",
+    )
+    (repo / "rust-backend" / "src" / "lib.rs").write_text(
+        "pub mod routes { pub fn health_path() -> &'static str { \"/health\" } }\n",
+        encoding="utf-8",
+    )
 
 
 def commit_all(repo: Path, message: str = "initial") -> None:
@@ -1319,9 +1400,14 @@ def test_malformed_patch_writes_debug_artifacts_and_failed_report(tmp_path: Path
     assert "patch_apply_command.json" in report.patch_artifacts
     assert "patch_excerpt.txt" in report.patch_artifacts
     assert "corrupt patch at line 21" in read_artifact(store, "patch_apply_error.txt")
-    assert read_artifact(store, "patch_excerpt.txt").splitlines() == PATCH.splitlines()[:80]
+    excerpt = read_artifact(store, "patch_excerpt.txt")
+    assert "1: diff --git a/README.md b/README.md" in excerpt
+    assert "6: +More docs" in excerpt
     command = json.loads(read_artifact(store, "patch_apply_command.json"))
     assert command["command"] == ["git", "apply", "--check", "--whitespace=nowarn", "-"]
+    assert command["patch_filename"] == "raw_patch.diff"
+    assert command["failing_line"] == 21
+    assert command["stderr"] == "error: corrupt patch at line 21\n"
 
 
 def test_validation_error_writes_artifact_and_repair_prompt_gets_line_context(tmp_path: Path) -> None:
@@ -1359,6 +1445,33 @@ def test_validation_error_writes_artifact_and_repair_prompt_gets_line_context(tm
     assert "Markdown lines that should be added must start with +" in repair_prompt
     assert "Do not wrap the diff in Markdown fences." in repair_prompt
     assert "Do not include explanations outside JSON." in repair_prompt
+    assert '"failing_line_number": 6' in repair_prompt
+    assert '"patch_excerpt":' in repair_prompt
+    assert "6: ## Security & Deployment Assumptions" in repair_prompt
+    assert '"target_files": [' in repair_prompt
+
+
+def test_corrupt_patch_repair_prompt_includes_stderr_excerpt_and_rust_context(tmp_path: Path) -> None:
+    store = ArtifactStore(tmp_path / "run", "run")
+    git = FakeGitTool()
+    file_tool = RustContextCorruptFileTool(fail_times=2, stderr="error: corrupt patch at line 6\n")
+    ollama = FakeOllama([rust_proposal_with_patch(), rust_proposal_with_patch(summary="repair")])
+
+    report = ImplementationAgent(config(tmp_path), git, file_tool, ollama, artifacts=store).implement(rust_test_task())
+
+    assert report.status == ReportStatus.FAILED
+    assert report.failure_stage == "patch_apply"
+    assert report.failure_reason == "corrupt_patch"
+    repair_prompt = ollama.prompts[1]
+    assert "error: corrupt patch at line 6" in repair_prompt
+    assert '"failing_line_number": 6' in repair_prompt
+    assert "6: +use rust_backend::routes;" in repair_prompt
+    assert "rust-backend/tests/smoke.rs" in repair_prompt
+    assert "rust-backend/src/lib.rs" in repair_prompt
+    assert "health_path" in repair_prompt
+    assert "CARGO_PKG_NAME/CARGO_PKG_VERSION" in repair_prompt
+    assert git.committed is False
+    assert git.pushed is False
 
 
 def test_corrupt_patch_repair_success_continues_to_commit(tmp_path: Path) -> None:
@@ -1376,6 +1489,59 @@ def test_corrupt_patch_repair_success_continues_to_commit(tmp_path: Path) -> Non
     assert git.pushed is False
     assert file_tool.apply_calls == 2
     assert ollama.calls == 2
+
+
+def test_corrupt_patch_repair_with_file_operations_succeeds(tmp_path: Path) -> None:
+    repo = init_repo(tmp_path)
+    write_rust_backend(repo)
+    store = ArtifactStore(tmp_path / "run", "run")
+    git = FakeGitTool()
+
+    class CorruptPatchThenFileOperationsTool(FileTool):
+        def apply_patch(self, proposal: PatchProposal) -> DiffStats:
+            raise PatchApplyError(
+                command=["git", "apply", "--check", "--whitespace=nowarn", "-"],
+                stderr="error: corrupt patch at line 6\n",
+                patch=proposal.patch,
+                check=True,
+            )
+
+    ollama = FakeOllama(
+        [
+            rust_proposal_with_patch(),
+            FileOperationsProposal(
+                task_id="tests-02-smoke-baseline",
+                summary="add meaningful Rust smoke test",
+                files=[FileOperation(path="rust-backend/tests/smoke.rs", content=MEANINGFUL_RUST_SMOKE)],
+                expected_tests=["cd rust-backend && cargo test --package rust-backend"],
+                rollback="Remove rust-backend/tests/smoke.rs.",
+            ),
+        ]
+    )
+
+    report = ImplementationAgent(
+        config(repo),
+        git,
+        CorruptPatchThenFileOperationsTool(repo, config(repo)),
+        ollama,
+        artifacts=store,
+    ).implement(rust_test_task())
+
+    assert report.status == ReportStatus.PASSED
+    assert report.retry_attempted is True
+    assert report.retry_succeeded is True
+    assert report.implementation_mode == "structured_edit"
+    assert report.fallback_attempted is True
+    assert report.fallback_succeeded is True
+    assert report.fallback_reason == "corrupt_patch"
+    assert git.committed is True
+    assert git.pushed is False
+    assert (repo / "rust-backend" / "tests" / "smoke.rs").read_text(encoding="utf-8") == MEANINGFUL_RUST_SMOKE
+    assert "repair_file_operations_raw_response.json" in report.patch_artifacts
+    assert "repair_file_operations_proposal.json" in report.patch_artifacts
+    assert "test_quality_report.json" in report.patch_artifacts
+    quality = json.loads(read_artifact(store, "test_quality_report.json"))
+    assert quality["status"] == "passed"
 
 
 def test_valid_patch_behavior_still_works(tmp_path: Path) -> None:

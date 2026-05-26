@@ -99,6 +99,26 @@ def test_rust_test_missing_closing_brace_is_blocked(tmp_path: Path) -> None:
     assert report.findings[0].reason == "rust_syntax_incomplete"
 
 
+def test_rust_cargo_package_metadata_only_smoke_is_blocked(tmp_path: Path) -> None:
+    report = report_for(
+        tmp_path,
+        '#[test]\nfn package_metadata_exists() {\n    assert!(!env!("CARGO_PKG_NAME").is_empty());\n}\n',
+    )
+
+    assert report.status == ReportStatus.FAILED
+    assert any(finding.reason == "no_project_behavior" for finding in report.findings)
+
+
+def test_rust_arithmetic_only_baseline_checks_are_blocked(tmp_path: Path) -> None:
+    report = report_for(
+        tmp_path,
+        "#[test]\nfn baseline_checks() {\n    let sum = 1 + 2 + 3;\n    assert_eq!(sum, 6);\n}\n",
+    )
+
+    assert report.status == ReportStatus.FAILED
+    assert any(finding.reason == "no_project_behavior" for finding in report.findings)
+
+
 def test_meaningful_rust_test_is_allowed(tmp_path: Path) -> None:
     report = report_for(
         tmp_path,
