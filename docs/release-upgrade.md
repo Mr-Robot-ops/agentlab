@@ -20,6 +20,19 @@ agentlab update
 
 `agentlab update` defaults to the current working directory, checks `git status`, allows only generated manifest dirtiness under `deploy/kubernetes/generated/**`, pulls `origin/main` with `git pull --ff-only`, re-checks `git status`, refreshes the editable install with the current Python interpreter, then re-execs itself so the deploy phase uses freshly installed code. It then runs the runtime update workflow with a commit-based image tag, pull-based image verification, Kubernetes apply, cluster config preservation, doctor, failed-resource cleanup, and status.
 
+The runtime image includes `cargo` and `rustc` so AgentLab Kubernetes jobs can execute Rust functional tests when Rust test changes are detected, for example:
+
+```bash
+cd rust-backend && cargo test --package zfs-manager
+```
+
+After building a runtime image, verify the Rust toolchain with:
+
+```bash
+docker run --rm <image> cargo --version
+docker run --rm <image> rustc --version
+```
+
 The image repository is inferred automatically, first from the live Kubernetes ConfigMap image annotation and then from the generated `deploy/kubernetes/generated/configmap.yaml` image annotation. If neither exists, run once with:
 
 ```bash

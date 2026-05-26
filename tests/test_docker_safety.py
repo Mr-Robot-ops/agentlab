@@ -5,6 +5,29 @@ from pathlib import Path
 from agentlab.tools.docker_safety import DockerSafetyScanner
 
 
+def test_runtime_dockerfile_installs_rust_toolchain() -> None:
+    dockerfile = Path(__file__).resolve().parents[1] / "Dockerfile"
+    content = dockerfile.read_text(encoding="utf-8")
+    install_block = content.split("apt-get install -y --no-install-recommends", 1)[1].split("&& rm -rf /var/lib/apt/lists/*", 1)[0]
+
+    assert "cargo" in install_block
+    assert "rustc" in install_block
+    assert "rm -rf /var/lib/apt/lists/*" in content
+
+
+def test_runtime_rust_toolchain_smoke_checks_are_documented() -> None:
+    root = Path(__file__).resolve().parents[1]
+    docs = "\n".join(
+        [
+            (root / "README.md").read_text(encoding="utf-8"),
+            (root / "docs" / "release-upgrade.md").read_text(encoding="utf-8"),
+        ]
+    )
+
+    assert "docker run --rm <image> cargo --version" in docs
+    assert "docker run --rm <image> rustc --version" in docs
+
+
 def test_docker_safety_scanner_blocks_unsafe_compose_settings(tmp_path: Path) -> None:
     compose = tmp_path / "docker-compose.yml"
     compose.write_text(
