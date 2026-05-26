@@ -29,7 +29,7 @@ class FunctionalTestAgent:
             commands=results,
             logs_excerpt=logs[-4000:],
             coverage_note="Coverage is reported only when the project test command emits coverage output.",
-            recommendation="Proceed" if passed else "Fix failing tests before merge.",
+            recommendation="Proceed" if passed else _failure_recommendation(logs),
         )
 
     def detect_commands(self) -> list[str]:
@@ -68,3 +68,16 @@ class FunctionalTestAgent:
         package = payload.get("package") if isinstance(payload, dict) else None
         name = package.get("name") if isinstance(package, dict) else None
         return str(name) if name else None
+
+
+def _failure_recommendation(logs: str) -> str:
+    lowered = logs.lower()
+    if (
+        "error[e0433]" in lowered
+        and ("cannot find module or crate" in lowered or "unresolved module or unlinked crate" in lowered)
+    ):
+        return (
+            "Rust integration test imports a crate module that is not exposed as a library. "
+            "Binary-only crates need inline unit tests or an explicit src/lib.rs/[lib] public seam before tests/ can import project modules."
+        )
+    return "Fix failing tests before merge."
