@@ -186,6 +186,17 @@ agentlab k8s artifact b9c483f7c10f4a5b807e8d626b664574 gate_decision.json
 
 Artifact commands ensure an `artifact-shell` pod exists with `busybox:1.36` and the `agentlab-runs` PVC mounted at `/var/lib/agentlab`. If the artifact is missing, the CLI exits non-zero and lists available artifacts for that run.
 
+For failed implementer runs, start with the report and patch diagnostics:
+
+```bash
+agentlab k8s artifact <run_id> implementation_report.json --namespace agentlab
+agentlab k8s artifact <run_id> raw_patch.diff --namespace agentlab
+agentlab k8s artifact <run_id> patch_apply_stderr.txt --namespace agentlab
+agentlab k8s artifact <run_id> patch_excerpt.txt --namespace agentlab
+agentlab k8s artifact <run_id> repair_raw_patch.diff --namespace agentlab
+agentlab k8s artifact <run_id> repair_patch_apply_stderr.txt --namespace agentlab
+```
+
 ## Runs
 
 List recent AgentLab run directories:

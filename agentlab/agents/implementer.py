@@ -6,10 +6,12 @@ import re
 import uuid
 from typing import Any
 
+from pydantic import BaseModel, Field
+
 from agentlab.artifacts import ArtifactStore
 from agentlab.branching import agent_branch_name
 from agentlab.config import AppConfig
-from agentlab.models import AgentTask, DiffStats, ImplementationReport, PatchProposal, ReportStatus, StructuredEditProposal, TaskType
+from agentlab.models import AgentTask, DiffStats, FileEdit, ImplementationReport, PatchProposal, ReportStatus, StructuredEditProposal, TaskType
 from agentlab.policies.risk import assess_risk
 from agentlab.tools.common import ToolError
 from agentlab.tools.file_tool import (
@@ -37,6 +39,32 @@ ACTUAL_STRUCTURE_RE = re.compile(
 )
 PROJECT_STRUCTURE_ROOTS = (".github", "rust-backend", "web")
 PROJECT_STRUCTURE_MAX_DEPTH = 4
+
+
+class FileOperation(BaseModel):
+    path: str
+    content: str
+
+
+class FileOperationsProposal(BaseModel):
+    task_id: str
+    summary: str = "Apply full-file repair."
+    files: list[FileOperation] = Field(default_factory=list)
+    expected_tests: list[str] = Field(default_factory=list)
+    rollback: str = "Revert the file operation changes."
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RepairProposal(BaseModel):
+    task_id: str
+    summary: str = "Repair patch."
+    patch: str | None = None
+    affected_files: list[str] = Field(default_factory=list)
+    files: list[FileOperation] = Field(default_factory=list)
+    expected_tests: list[str] = Field(default_factory=list)
+    risk_score: int = Field(default=0, ge=0)
+    rollback: str = "Revert the repair."
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class StructuredEditApplyError(ToolError):
@@ -231,14 +259,33 @@ class ImplementationAgent:
                             exc.stderr if isinstance(exc, PatchApplyError) else "",
                             validation_error=exc if isinstance(exc, UnifiedDiffValidationError) else None,
                         )
-                        patch_artifacts.extend(self._persist_patch_inputs(repaired_raw, repaired, prefix="repair_"))
+                        if isinstance(repaired, PatchProposal):
+                            patch_artifacts.extend(self._persist_patch_inputs(repaired_raw, repaired, prefix="repair_"))
+                        else:
+                            patch_artifacts.extend(self._persist_file_operations_inputs(repaired_raw, repaired, prefix="repair_"))
                         try:
-                            diff_stats = self._validate_and_apply(task, repaired)
-                            proposal = repaired
+                            if isinstance(repaired, PatchProposal):
+                                diff_stats = self._validate_and_apply(task, repaired)
+                                proposal = repaired
+                            else:
+                                diff_stats = self._validate_and_apply_structured(task, repaired)
+                                implementation_mode = "structured_edit"
+                                fallback_attempted = True
+                                fallback_succeeded = True
+                                fallback_reason = "corrupt_patch" if isinstance(exc, PatchApplyError) else "patch_validation_failed"
+                                summary = repaired.summary
+                                expected_tests = repaired.expected_tests
+                                risk_input = repaired.model_dump_json()
                             retry_succeeded = True
                         except (PatchApplyError, UnifiedDiffValidationError) as retry_exc:
                             patch_artifacts.extend(self._persist_patch_failure(retry_exc, prefix="repair_"))
                             raise retry_exc
+                        except Exception as retry_exc:
+                            patch_artifacts.extend(self._persist_structured_error(retry_exc, repair=True))
+                            raise StructuredEditApplyError(
+                                self._structured_failure_reason(retry_exc),
+                                self._structured_apply_failure_message(retry_exc),
+                            ) from retry_exc
                 if implementation_mode == "patch":
                     summary = proposal.summary
                     expected_tests = proposal.expected_tests
@@ -807,6 +854,7 @@ class ImplementationAgent:
                 "scope": "Only touch files needed for this task.",
                 "forbidden_actions": task.forbidden_actions,
                 "whole_repo_awareness": "Use repo_context to respect architecture, test strategy, ownership boundaries, and deployment signals.",
+                "valid_smoke_tests": self._test_task_rules(task),
             },
         }
         proposal, raw_response = self._chat_patch_proposal(
@@ -930,50 +978,114 @@ class ImplementationAgent:
         stderr: str,
         *,
         validation_error: UnifiedDiffValidationError | None = None,
-    ) -> tuple[PatchProposal, str]:
+    ) -> tuple[PatchProposal | StructuredEditProposal, str]:
         validation_payload = validation_error.to_dict() if validation_error is not None else None
+        failing_line = validation_error.line_number if validation_error is not None else _corrupt_patch_line(stderr)
+        patch_excerpt = _patch_excerpt(original_patch, center_line=failing_line)
+        target_files = _patch_target_files(original_patch) or task.affected_files
         payload = {
             "task": task.model_dump(mode="json"),
             "original_patch": original_patch,
             "git_apply_stderr": stderr,
+            "failing_line_number": failing_line,
+            "patch_excerpt": patch_excerpt,
+            "target_files": target_files,
+            "repository_context_for_target_crate": self._rust_crate_context(target_files),
             "patch_validation_error": validation_payload,
             "rules": {
-                "repair_only": "Repair only unified diff syntax/format so git apply can parse it.",
+                "repair_only": "Repair only unified diff syntax/format or return full-file operations for the same target files.",
                 "hunk_prefix_rule": "Every line inside a unified diff hunk must start with space, +, -, or backslash.",
                 "markdown_lines": "Markdown lines that should be added must start with +, for example +--- or +## Heading.",
+                "file_creation": "For new files, hunk headers and added line counts must match exactly and the patch must end with a final newline.",
                 "scope": "Do not change task scope or intent.",
                 "allowed_files": task.affected_files,
                 "forbidden_actions": task.forbidden_actions,
-                "output": "Return only one PatchProposal JSON object with the repaired patch.",
+                "output": "Return either one PatchProposal JSON object with a valid unified diff or one JSON object with a files array.",
+                "file_operations_shape": {
+                    "task_id": task.id,
+                    "summary": "Write full file content.",
+                    "files": [{"path": "relative/path", "content": "complete file content with final newline"}],
+                    "expected_tests": ["test command"],
+                    "rollback": "Revert the file changes.",
+                },
                 "no_markdown_fences": "Do not wrap the diff in Markdown fences.",
                 "no_explanations": "Do not include explanations outside JSON.",
+                "valid_smoke_tests": self._test_task_rules(task),
             },
         }
-        proposal, raw_response = self._chat_patch_proposal(
+        proposal, raw_response = self._chat_patch_or_file_operations(
             system_prompt=load_prompt("implementer.md"),
             user_prompt=json.dumps(payload, indent=2),
         )
         if proposal.task_id != task.id:
-            raise ToolError("Repaired PatchProposal.task_id does not match task id")
+            raise ToolError("Repaired proposal task_id does not match task id")
+        if isinstance(proposal, FileOperationsProposal):
+            return self._file_operations_to_structured(task, proposal), raw_response
         return proposal, raw_response
 
     def _chat_patch_proposal(self, *, system_prompt: str, user_prompt: str) -> tuple[PatchProposal, str]:
         if self.ollama is None:
             raise ToolError("OllamaClient is required for active implementation patches")
         if hasattr(self.ollama, "chat_json_with_raw"):
-            return self.ollama.chat_json_with_raw(
+            proposal, raw = self.ollama.chat_json_with_raw(
                 model=self.config.agent_model("implementer"),
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 response_model=PatchProposal,
             )
+            return _normalize_patch_proposal(proposal), raw
         proposal = self.ollama.chat_json(
             model=self.config.agent_model("implementer"),
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             response_model=PatchProposal,
         )
-        return proposal, proposal.model_dump_json()
+        return _normalize_patch_proposal(proposal), proposal.model_dump_json()
+
+    def _chat_patch_or_file_operations(self, *, system_prompt: str, user_prompt: str) -> tuple[PatchProposal | FileOperationsProposal, str]:
+        if self.ollama is None:
+            raise ToolError("OllamaClient is required for active implementation patch repair")
+        if hasattr(self.ollama, "chat_json_with_raw"):
+            proposal, raw = self.ollama.chat_json_with_raw(
+                model=self.config.agent_model("implementer"),
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                response_model=RepairProposal,
+            )
+        else:
+            proposal = self.ollama.chat_json(
+                model=self.config.agent_model("implementer"),
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                response_model=RepairProposal,
+            )
+            raw = proposal.model_dump_json()
+        if isinstance(proposal, PatchProposal):
+            return _normalize_patch_proposal(proposal), raw
+        if isinstance(proposal, FileOperationsProposal):
+            return proposal, raw
+        if isinstance(proposal, RepairProposal):
+            if proposal.files:
+                return FileOperationsProposal(
+                    task_id=proposal.task_id,
+                    summary=proposal.summary,
+                    files=proposal.files,
+                    expected_tests=proposal.expected_tests,
+                    rollback=proposal.rollback,
+                    metadata=proposal.metadata,
+                ), raw
+            if proposal.patch:
+                return _normalize_patch_proposal(PatchProposal(
+                    task_id=proposal.task_id,
+                    summary=proposal.summary,
+                    patch=proposal.patch,
+                    affected_files=proposal.affected_files,
+                    expected_tests=proposal.expected_tests,
+                    risk_score=proposal.risk_score,
+                    rollback=proposal.rollback,
+                    metadata=proposal.metadata,
+                )), raw
+        raise ToolError("repair response must include either patch or files")
 
     def _chat_structured_proposal(self, *, system_prompt: str, user_prompt: str) -> tuple[StructuredEditProposal, str]:
         if self.ollama is None:
@@ -1003,9 +1115,20 @@ class ImplementationAgent:
         ]
         return [record.name for record in records]
 
+    def _persist_file_operations_inputs(self, raw_response: str, proposal: StructuredEditProposal, *, prefix: str = "") -> list[str]:
+        if self.artifacts is None:
+            return []
+        records = [
+            self.artifacts.write_text(f"{prefix}file_operations_raw_response.json", raw_response),
+            self.artifacts.write_json(f"{prefix}file_operations_proposal", proposal),
+        ]
+        return [record.name for record in records]
+
     def _persist_patch_apply_error(self, exc: PatchApplyError, *, prefix: str = "") -> list[str]:
         if self.artifacts is None:
             return []
+        failing_line = _corrupt_patch_line(exc.stderr)
+        patch_filename = f"{prefix}raw_patch.diff"
         records = [
             self.artifacts.write_text(f"{prefix}patch_apply_error.txt", str(exc)),
             self.artifacts.write_text(f"{prefix}patch_apply_stderr.txt", exc.stderr),
@@ -1015,9 +1138,12 @@ class ImplementationAgent:
                     "command": exc.command,
                     "stdin": "<patch via stdin>",
                     "check": exc.check,
+                    "patch_filename": patch_filename,
+                    "failing_line": failing_line,
+                    "stderr": exc.stderr,
                 },
             ),
-            self.artifacts.write_text(f"{prefix}patch_excerpt.txt", "\n".join(exc.patch.splitlines()[:80])),
+            self.artifacts.write_text(f"{prefix}patch_excerpt.txt", _patch_excerpt(exc.patch, center_line=failing_line)),
         ]
         return [record.name for record in records]
 
@@ -1589,6 +1715,60 @@ class ImplementationAgent:
                 snippets[path] = f"<unreadable: {exc}>"
         return snippets
 
+    def _file_operations_to_structured(self, task: AgentTask, proposal: FileOperationsProposal) -> StructuredEditProposal:
+        return StructuredEditProposal(
+            task_id=proposal.task_id,
+            summary=proposal.summary,
+            edits=[FileEdit(path=item.path, operation="replace_file", content=_ensure_final_newline(item.content)) for item in proposal.files],
+            expected_tests=proposal.expected_tests,
+            rollback=proposal.rollback,
+            metadata={**proposal.metadata, "source": "file_operations_repair", "allowed_files": task.affected_files},
+        )
+
+    def _rust_crate_context(self, target_files: list[str]) -> dict[str, object]:
+        rust_targets = [path for path in target_files if path.replace("\\", "/").startswith("rust-backend/")]
+        if not rust_targets:
+            return {}
+        paths = [
+            "rust-backend/Cargo.toml",
+            "rust-backend/src/lib.rs",
+            "rust-backend/src/main.rs",
+        ]
+        snippets: dict[str, str] = {}
+        for path in paths:
+            try:
+                snippets[path] = compact_text(self.file_tool.read_file(path), 4000)
+            except Exception:
+                continue
+        try:
+            rust_files = [
+                path
+                for path in self.file_tool.list_files()
+                if path.startswith("rust-backend/src/") and path.endswith(".rs")
+            ][:30]
+        except Exception:
+            rust_files = []
+        return {
+            "target_files": rust_targets,
+            "source_files": rust_files,
+            "snippets": snippets,
+            "guidance": (
+                "Choose a real public module/function/route from the crate. "
+                "Do not use CARGO_PKG_NAME/CARGO_PKG_VERSION, arithmetic, parsing, or framework-only assertions as smoke behavior."
+            ),
+        }
+
+    @staticmethod
+    def _test_task_rules(task: AgentTask) -> list[str]:
+        if task.task_type != TaskType.TESTS and "test" not in task.title.lower() and "test" not in task.id.lower():
+            return []
+        return [
+            "For Rust smoke tests, import and exercise actual crate behavior such as rust_backend::routes::health_path().",
+            "Do not generate assert!(true), assert_eq!(1, 1), arithmetic-only checks, generic parsing/runtime checks, or CARGO_PKG_NAME/CARGO_PKG_VERSION-only checks.",
+            "The test must fail if project-specific code breaks and must pass TestQualityAgent.",
+            "If no public project behavior is available, explain that a testable public seam is needed instead of generating a fake baseline.",
+        ]
+
     @staticmethod
     def _task_text(task: AgentTask) -> str:
         return json.dumps(task.model_dump(mode="json"), ensure_ascii=False)
@@ -1786,3 +1966,45 @@ class ImplementationAgent:
     @staticmethod
     def _is_corrupt_patch(stderr: str) -> bool:
         return "corrupt patch" in stderr.lower()
+
+
+def _corrupt_patch_line(stderr: str) -> int | None:
+    match = re.search(r"corrupt patch at line (\d+)", stderr, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _patch_excerpt(patch: str, *, center_line: int | None = None, context: int = 8) -> str:
+    lines = patch.splitlines()
+    if not lines:
+        return ""
+    if center_line is None or center_line < 1:
+        return "\n".join(lines[:80])
+    index = min(center_line - 1, len(lines) - 1)
+    start = max(0, index - context)
+    end = min(len(lines), index + context + 1)
+    return "\n".join(f"{line_no}: {lines[line_no - 1]}" for line_no in range(start + 1, end + 1))
+
+
+def _patch_target_files(patch: str) -> list[str]:
+    files: list[str] = []
+    for line in patch.splitlines():
+        if line.startswith("diff --git "):
+            parts = line.split()
+            if len(parts) >= 4:
+                target = parts[3]
+                files.append(target[2:] if target.startswith("b/") else target)
+        elif line.startswith("+++ "):
+            target = line[4:].strip()
+            if target != "/dev/null":
+                files.append(target[2:] if target.startswith("b/") else target)
+    return list(dict.fromkeys(files))
+
+
+def _ensure_final_newline(content: str) -> str:
+    return content if content.endswith("\n") else f"{content}\n"
+
+
+def _normalize_patch_proposal(proposal: PatchProposal) -> PatchProposal:
+    if proposal.patch.endswith("\n"):
+        return proposal
+    return proposal.model_copy(update={"patch": f"{proposal.patch}\n"})
