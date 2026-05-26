@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import re
-import tomllib
 from dataclasses import dataclass
-from pathlib import Path
 
 from agentlab.models import ReportStatus, TestQualityFinding, TestQualityReport
+from agentlab.rust_crate import RustCrateLayout, is_rust_integration_test, rust_crate_layout
 from agentlab.tools.file_tool import FileTool
 
 
@@ -109,7 +108,9 @@ def _rust_findings(
     if syntax_findings:
         return syntax_findings
 
-    markers = _rust_project_markers(path, all_files, file_tool)
+    layouts = _rust_layouts_for_test(path, all_files, file_tool)
+    findings.extend(_rust_missing_library_import_findings(path, content, layouts))
+    markers = _rust_project_markers(path, layouts)
     file_has_project_reference = _has_project_reference(content, markers)
     for test in _rust_test_functions(content):
         body_without_comments = COMMENT_RE.sub("", test.body).strip()
@@ -211,18 +212,67 @@ def _matching_brace(content: str, open_brace: int) -> int | None:
     return None
 
 
-def _rust_project_markers(path: str, all_files: set[str], file_tool: FileTool) -> set[str]:
+def _rust_layouts_for_test(path: str, all_files: set[str], file_tool: FileTool) -> list[RustCrateLayout]:
     normalized = path.replace("\\", "/")
     roots = _candidate_rust_roots(normalized, all_files)
-    markers: set[str] = {"crate::", "super::", "CARGO_BIN_EXE_"}
+    layouts: list[RustCrateLayout] = []
     for root in roots:
-        cargo_path = f"{root}/Cargo.toml" if root else "Cargo.toml"
-        package = _cargo_package_name(cargo_path, file_tool)
-        if package:
-            markers.add(package)
-            markers.add(package.replace("-", "_"))
-            markers.add(f"CARGO_BIN_EXE_{package}")
+        layouts.append(rust_crate_layout(root or ".", all_files, file_tool.read_file))
+    return layouts
+
+
+def _rust_project_markers(path: str, layouts: list[RustCrateLayout]) -> set[str]:
+    normalized = path.replace("\\", "/")
+    markers: set[str] = {"CARGO_BIN_EXE_"}
+    if not any(is_rust_integration_test(normalized, layout.root) for layout in layouts):
+        markers.update({"crate::", "super::"})
+    for layout in layouts:
+        if layout.package_name:
+            markers.add(f"CARGO_BIN_EXE_{layout.package_name}")
+        if layout.has_library:
+            if layout.package_name:
+                markers.add(layout.package_name)
+            if layout.import_name:
+                markers.add(layout.import_name)
     return {marker for marker in markers if marker}
+
+
+def _rust_missing_library_import_findings(
+    path: str,
+    content: str,
+    layouts: list[RustCrateLayout],
+) -> list[TestQualityFinding]:
+    findings: list[TestQualityFinding] = []
+    for layout in layouts:
+        if layout.has_library or not is_rust_integration_test(path, layout.root) or not layout.import_name:
+            continue
+        match = _crate_module_import_match(content, layout.import_name)
+        if match is None:
+            continue
+        findings.append(
+            TestQualityFinding(
+                path=path,
+                line=_line_for_offset(content, match.start()),
+                reason="missing_library_crate",
+                description=(
+                    "Rust integration test imports the package crate, but this package has no src/lib.rs or [lib] target. "
+                    "Binary-only crates need inline unit tests or an explicit public library seam."
+                ),
+            )
+        )
+    return findings
+
+
+def _crate_module_import_match(content: str, import_name: str) -> re.Match[str] | None:
+    patterns = (
+        re.compile(rf"(?m)^\s*use\s+{re.escape(import_name)}\s*::"),
+        re.compile(rf"(?<![A-Za-z0-9_]){re.escape(import_name)}\s*::"),
+    )
+    for pattern in patterns:
+        match = pattern.search(content)
+        if match:
+            return match
+    return None
 
 
 def _candidate_rust_roots(path: str, all_files: set[str]) -> list[str]:
@@ -238,16 +288,6 @@ def _candidate_rust_roots(path: str, all_files: set[str]) -> list[str]:
     if "Cargo.toml" in all_files and "" not in roots:
         roots.append("")
     return roots
-
-
-def _cargo_package_name(path: str, file_tool: FileTool) -> str | None:
-    try:
-        payload = tomllib.loads(file_tool.read_file(path))
-    except Exception:
-        return None
-    package = payload.get("package") if isinstance(payload, dict) else None
-    name = package.get("name") if isinstance(package, dict) else None
-    return str(name) if name else None
 
 
 def _has_project_reference(text: str, markers: set[str]) -> bool:

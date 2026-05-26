@@ -285,6 +285,18 @@ AutoApproval rejection details include concrete files. For example, `path_not_al
 
 This means `rust-backend/Cargo.toml` was allowed by policy, but `rust-backend/src/error.rs` was not. Extend `allowed_paths` only when that file class is safe for autonomous work. Dependency files and CI/deployment files should normally stay blocked or require manual review because they are supply-chain relevant.
 
+## Rust Smoke Tests
+
+Rust integration tests under `rust-backend/tests/` can import the package crate only when the package exposes a library target, either through `rust-backend/src/lib.rs` or a `[lib]` section in `rust-backend/Cargo.toml`.
+
+Binary-only crates that only have `src/main.rs` need one of these explicit strategies:
+
+- an inline unit test inside approved Rust source,
+- an approved public library seam such as a minimal `src/lib.rs` plus an integration smoke test, or
+- a clear skipped/failed implementation explaining that no meaningful project-specific test can be written as test-only.
+
+AgentLab must not invent `use <package>::...` imports for binary-only crates and must not replace that with placeholder checks such as arithmetic, `CARGO_PKG_NAME`, or framework-only assertions.
+
 ## Troubleshooting
 
 - `ContainerCreating`: wait briefly, then fetch logs again.

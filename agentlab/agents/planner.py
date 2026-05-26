@@ -6,6 +6,7 @@ from pathlib import Path
 from agentlab.config import AppConfig
 from agentlab.models import AgentTask, ArchitectureSummary, RepoIndex, RiskLevel, TaskPlan, TaskType
 from agentlab.policies.risk import assess_risk
+from agentlab.rust_crate import RustCrateLayout, rust_crate_layout
 from agentlab.tools.file_tool import FileTool
 from agentlab.tools.ollama_client import OllamaClient
 
@@ -161,11 +162,11 @@ class PlanningAgent:
         return TaskPlan(summary="Heuristic local plan generated without Ollama.", tasks=tasks, source_signals=["files", "readme", "todos", "tests"])
 
     def _normalize_plan(self, plan: TaskPlan, context: dict[str, object]) -> TaskPlan:
-        tasks = [_normalize_rust_smoke_test_task(task, context) for task in plan.tasks]
+        tasks = [_normalize_rust_smoke_test_task(task, context, self.file_tool) for task in plan.tasks]
         return plan.model_copy(update={"tasks": tasks})
 
 
-def _normalize_rust_smoke_test_task(task: AgentTask, context: dict[str, object]) -> AgentTask:
+def _normalize_rust_smoke_test_task(task: AgentTask, context: dict[str, object], file_tool: FileTool) -> AgentTask:
     if task.task_type != TaskType.TESTS or not _rust_roots(context, task):
         return task
 
@@ -195,7 +196,36 @@ def _normalize_rust_smoke_test_task(task: AgentTask, context: dict[str, object])
     if not _is_rust_smoke_test_task(task, context):
         return task
 
-    preferred_files = _rust_test_baseline_files(context, task=task)
+    layout = _primary_rust_layout(context, task, file_tool)
+    if layout is not None and layout.is_binary_only and not _explicitly_allows_rust_production_test_touch(task):
+        metadata = {
+            **task.metadata,
+            "planning_note": (
+                "Rust smoke/integration test baseline cannot be safely implemented as test-only: "
+                f"{layout.root} has src/main.rs but no src/lib.rs or [lib] target, so integration tests cannot import the crate."
+            ),
+            "implementation_blocked_reason": "rust_library_seam_required",
+            "requires_public_library_seam": True,
+            "rust_crate_layout": _layout_metadata(layout),
+        }
+        forbidden_actions = _dedupe_strings(
+            [
+                *task.forbidden_actions,
+                "Do not create a Rust integration test that imports the package crate unless src/lib.rs or a [lib] target exists.",
+                "Do not edit rust-backend/src/*.rs for a smoke-test baseline unless explicitly asked for inline unit tests or a public library seam.",
+            ]
+        )
+        return task.model_copy(
+            update={
+                "affected_files": [],
+                "risk_level": RiskLevel.MEDIUM,
+                "risk_score": max(task.risk_score, 10),
+                "forbidden_actions": forbidden_actions,
+                "metadata": metadata,
+            }
+        )
+
+    preferred_files = _rust_test_baseline_files(context, task=task, file_tool=file_tool)
     if not preferred_files:
         return task
 
@@ -209,12 +239,18 @@ def _normalize_rust_smoke_test_task(task: AgentTask, context: dict[str, object])
         **task.metadata,
         "planning_note": "Rust smoke/integration test baseline affected_files were constrained to test-only files.",
         "removed_production_files": production_files,
+        "rust_crate_layout": _layout_metadata(layout) if layout is not None else None,
     }
+    planned_production_files = [path for path in preferred_files if _is_rust_production_source(path)]
+    if planned_production_files:
+        metadata["production_test_change"] = True
+        metadata["propose_only_recommended"] = True
+        metadata["planning_note"] = "Rust smoke-test baseline requires an explicit public library seam plus integration test."
     return task.model_copy(
         update={
             "affected_files": preferred_files,
-            "risk_level": RiskLevel.LOW,
-            "risk_score": min(task.risk_score or 3, 3),
+            "risk_level": RiskLevel.MEDIUM if planned_production_files else RiskLevel.LOW,
+            "risk_score": max(task.risk_score, 10) if planned_production_files else min(task.risk_score or 3, 3),
             "forbidden_actions": forbidden_actions,
             "metadata": metadata,
         }
@@ -228,12 +264,26 @@ def _is_rust_smoke_test_task(task: AgentTask, context: dict[str, object]) -> boo
     return bool(_rust_roots(context, task))
 
 
-def _rust_test_baseline_files(context: dict[str, object], *, task: AgentTask | None = None) -> list[str]:
+def _rust_test_baseline_files(
+    context: dict[str, object],
+    *,
+    task: AgentTask | None = None,
+    file_tool: FileTool | None = None,
+) -> list[str]:
     roots = _rust_roots(context, task)
     if not roots:
         return []
     root = roots[0]
     base = f"{root}/" if root != "." else ""
+    if task is not None and file_tool is not None:
+        layout = _primary_rust_layout(context, task, file_tool)
+        if layout is not None and layout.is_binary_only:
+            if _explicitly_allows_rust_production_test_touch(task):
+                if "inline unit test" in _task_text(task) or "unit tests inside" in _task_text(task):
+                    main_path = f"{base}src/main.rs"
+                    return [main_path] if main_path in _context_files(context) else []
+                return [f"{base}src/lib.rs", f"{base}tests/smoke.rs"]
+            return []
     files = [f"{base}tests/smoke.rs"]
     if task is not None and _requires_rust_dev_dependency(task):
         cargo = f"{base}Cargo.toml"
@@ -279,6 +329,10 @@ def _explicitly_allows_rust_production_test_touch(task: AgentTask) -> bool:
             "production hook",
             "production-code hook",
             "test hook",
+            "public seam",
+            "library seam",
+            "src/lib.rs",
+            "lib.rs",
         )
     )
 
@@ -308,3 +362,34 @@ def _dedupe_strings(values: list[str]) -> list[str]:
         if value and value not in result:
             result.append(value)
     return result
+
+
+def _primary_rust_layout(context: dict[str, object], task: AgentTask | None, file_tool: FileTool) -> RustCrateLayout | None:
+    roots = _rust_roots(context, task)
+    if not roots:
+        return None
+    files = _context_files(context)
+    root = roots[0]
+    return rust_crate_layout(root, files, file_tool.read_file)
+
+
+def _context_files(context: dict[str, object]) -> set[str]:
+    files: set[str] = set()
+    for key in ("files", "manifests", "test_files"):
+        values = context.get(key)
+        if isinstance(values, list):
+            files.update(str(value).replace("\\", "/") for value in values)
+    return files
+
+
+def _layout_metadata(layout: RustCrateLayout) -> dict[str, object]:
+    return {
+        "root": layout.root,
+        "package_name": layout.package_name,
+        "import_name": layout.import_name,
+        "has_library": layout.has_library,
+        "has_lib_rs": layout.has_lib_rs,
+        "has_lib_section": layout.has_lib_section,
+        "has_main_rs": layout.has_main_rs,
+        "source_files": list(layout.source_files),
+    }
