@@ -266,6 +266,21 @@ agentlab k8s resume review-comments
 
 Supported CronJob shortcuts are `review-comments`, `action`, `plan`, and `watch`.
 
+## Job Resource Controls
+
+Generated AgentLab Jobs include CPU/memory requests and limits plus `activeDeadlineSeconds`; generated CronJobs also use `concurrencyPolicy: Forbid`. For small homelab clusters, keep review-comments at `*/15 * * * *` or slower and start with:
+
+```bash
+python scripts/bootstrap_k8s.py \
+  --job-cpu-request 250m \
+  --job-memory-request 512Mi \
+  --job-cpu-limit 1 \
+  --job-memory-limit 2Gi \
+  --job-active-deadline-seconds 3600
+```
+
+Rust functional tests default to `CARGO_BUILD_JOBS=1` via `functional_test_env` in `config.yaml`.
+
 ## TUI
 
 Open the interactive menu:

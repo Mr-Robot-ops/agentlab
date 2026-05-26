@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Sequence
 
@@ -27,8 +29,10 @@ def run_subprocess(
     cwd: str | Path,
     timeout_seconds: int,
     input_text: str | None = None,
+    env: Mapping[str, str] | None = None,
 ) -> CommandResult:
     start = time.monotonic()
+    process_env = None if env is None else {**os.environ, **{key: str(value) for key, value in env.items()}}
     try:
         completed = subprocess.run(
             list(command),
@@ -38,6 +42,7 @@ def run_subprocess(
             capture_output=True,
             timeout=timeout_seconds,
             check=False,
+            env=process_env,
         )
         exit_code = completed.returncode
         stdout = completed.stdout

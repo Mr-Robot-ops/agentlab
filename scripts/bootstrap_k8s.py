@@ -67,7 +67,12 @@ def generate_k8s(
     schedule_plan_cron: str = "0 7,19 * * *",
     schedule_action_cron: str = "30 2 * * *",
     schedule_review_comments_enabled: bool = False,
-    schedule_review_comments_cron: str = "*/10 * * * *",
+    schedule_review_comments_cron: str = "*/15 * * * *",
+    job_cpu_request: str = "250m",
+    job_memory_request: str = "512Mi",
+    job_cpu_limit: str = "1",
+    job_memory_limit: str = "2Gi",
+    job_active_deadline_seconds: int = 3600,
 ) -> Path:
     mode = validate_mode(mode, allow_dangerous_mode=allow_dangerous_mode)
     project_value = project_identifier(project=project, project_id=project_id, target_repo_url=target_repo_url)
@@ -106,6 +111,11 @@ def generate_k8s(
             command=command,
             git_author_name=git_author_name,
             git_author_email=git_author_email,
+            cpu_request=job_cpu_request,
+            memory_request=job_memory_request,
+            cpu_limit=job_cpu_limit,
+            memory_limit=job_memory_limit,
+            active_deadline_seconds=job_active_deadline_seconds,
         )
     cron_commands: dict[str, list[str]] = {}
     cron_schedules: dict[str, str] = {}
@@ -136,6 +146,11 @@ def generate_k8s(
             cron=cron_schedules[name],
             git_author_name=git_author_name,
             git_author_email=git_author_email,
+            cpu_request=job_cpu_request,
+            memory_request=job_memory_request,
+            cpu_limit=job_cpu_limit,
+            memory_limit=job_memory_limit,
+            active_deadline_seconds=job_active_deadline_seconds,
         )
     files["kustomization.yaml"] = render_kustomization(
         namespace,
@@ -247,6 +262,22 @@ def render_git_config_env(git_author_name: str, git_author_email: str) -> str:
     )
 
 
+def render_container_resources(
+    *,
+    cpu_request: str,
+    memory_request: str,
+    cpu_limit: str,
+    memory_limit: str,
+) -> str:
+    return f"""          resources:
+            requests:
+              cpu: {yaml_string(cpu_request)}
+              memory: {yaml_string(memory_request)}
+            limits:
+              cpu: {yaml_string(cpu_limit)}
+              memory: {yaml_string(memory_limit)}"""
+
+
 def render_job(
     *,
     namespace: str,
@@ -255,6 +286,11 @@ def render_job(
     command: list[str],
     git_author_name: str = "AgentLab Bot",
     git_author_email: str = "agentlab-bot@example.local",
+    cpu_request: str = "250m",
+    memory_request: str = "512Mi",
+    cpu_limit: str = "1",
+    memory_limit: str = "2Gi",
+    active_deadline_seconds: int = 3600,
 ) -> str:
     args = ", ".join(f'"{item}"' for item in command)
     task_mount = ""
@@ -281,6 +317,7 @@ metadata:
     agentlab.io/command: {job_name}
 spec:
   backoffLimit: 0
+  activeDeadlineSeconds: {active_deadline_seconds}
   ttlSecondsAfterFinished: 86400
   template:
     spec:
@@ -316,6 +353,7 @@ spec:
             readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
+{render_container_resources(cpu_request=cpu_request, memory_request=memory_request, cpu_limit=cpu_limit, memory_limit=memory_limit)}
           volumeMounts:
             - name: config
               mountPath: /etc/agentlab/config.yaml
@@ -366,6 +404,11 @@ def render_cronjob(
     cron: str,
     git_author_name: str = "AgentLab Bot",
     git_author_email: str = "agentlab-bot@example.local",
+    cpu_request: str = "250m",
+    memory_request: str = "512Mi",
+    cpu_limit: str = "1",
+    memory_limit: str = "2Gi",
+    active_deadline_seconds: int = 3600,
 ) -> str:
     job = render_job(
         namespace=namespace,
@@ -374,6 +417,11 @@ def render_cronjob(
         command=command,
         git_author_name=git_author_name,
         git_author_email=git_author_email,
+        cpu_request=cpu_request,
+        memory_request=memory_request,
+        cpu_limit=cpu_limit,
+        memory_limit=memory_limit,
+        active_deadline_seconds=active_deadline_seconds,
     )
     template = job.split("  template:\n", 1)[1]
     return f"""apiVersion: batch/v1
@@ -393,6 +441,7 @@ spec:
   jobTemplate:
     spec:
       backoffLimit: 0
+      activeDeadlineSeconds: {active_deadline_seconds}
       template:
 {indent(template, 8)}
 """
@@ -479,7 +528,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--schedule-plan-cron", default="0 7,19 * * *")
     parser.add_argument("--schedule-action-cron", default="30 2 * * *")
     parser.add_argument("--schedule-review-comments-enabled", action="store_true")
-    parser.add_argument("--schedule-review-comments-cron", default="*/10 * * * *")
+    parser.add_argument("--schedule-review-comments-cron", default="*/15 * * * *")
+    parser.add_argument("--job-cpu-request", default="250m")
+    parser.add_argument("--job-memory-request", default="512Mi")
+    parser.add_argument("--job-cpu-limit", default="1")
+    parser.add_argument("--job-memory-limit", default="2Gi")
+    parser.add_argument("--job-active-deadline-seconds", type=int, default=3600)
     return parser
 
 
@@ -511,6 +565,11 @@ def main(argv: list[str] | None = None) -> int:
             schedule_action_cron=args.schedule_action_cron,
             schedule_review_comments_enabled=args.schedule_review_comments_enabled,
             schedule_review_comments_cron=args.schedule_review_comments_cron,
+            job_cpu_request=args.job_cpu_request,
+            job_memory_request=args.job_memory_request,
+            job_cpu_limit=args.job_cpu_limit,
+            job_memory_limit=args.job_memory_limit,
+            job_active_deadline_seconds=args.job_active_deadline_seconds,
         )
     except ValueError as exc:
         parser.error(str(exc))

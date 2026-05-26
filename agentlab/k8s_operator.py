@@ -74,10 +74,17 @@ CRONJOB_MANIFESTS = {
 }
 
 CRONJOB_DEFAULT_CRONS = {
-    "review-comments": "*/10 * * * *",
+    "review-comments": "*/15 * * * *",
     "action": "30 2 * * *",
     "plan": "0 7,19 * * *",
     "watch": "*/30 * * * *",
+}
+DEFAULT_JOB_BACKOFF_LIMIT = 0
+DEFAULT_JOB_ACTIVE_DEADLINE_SECONDS = 3600
+DEFAULT_JOB_TTL_SECONDS_AFTER_FINISHED = 86400
+DEFAULT_JOB_RESOURCES = {
+    "requests": {"cpu": "250m", "memory": "512Mi"},
+    "limits": {"cpu": "1", "memory": "2Gi"},
 }
 
 CONFIG_SETTING_SPECS: dict[str, tuple[type[bool] | type[int] | type[str], int | None]] = {
@@ -1054,7 +1061,9 @@ def update_generated_manifests(
 
     for path in sorted([*manifest_dir.glob("job-*.yaml"), *manifest_dir.glob("cronjob-*.yaml")]):
         document = _load_yaml_file(path)
-        if _set_manifest_image(document, image):
+        changed = _set_manifest_image(document, image)
+        changed = _ensure_generated_job_safeguards(document) or changed
+        if changed:
             _write_yaml_file(path, document)
             if path.name not in updated_manifests:
                 updated_manifests.append(path.name)
@@ -1066,6 +1075,76 @@ def update_generated_manifests(
         "preserved_sections": preserved_sections,
         "enabled_cronjob_manifests": enabled_cronjob_manifests,
     }
+
+
+def _ensure_generated_job_safeguards(document: dict[str, Any]) -> bool:
+    kind = document.get("kind")
+    if kind == "Job":
+        changed = _ensure_job_spec_safeguards(document.setdefault("spec", {}))
+        changed = _ensure_container_resources(_job_container_specs(document)) or changed
+        return changed
+    if kind == "CronJob":
+        changed = False
+        spec = document.setdefault("spec", {})
+        if spec.get("concurrencyPolicy") != "Forbid":
+            spec["concurrencyPolicy"] = "Forbid"
+            changed = True
+        job_spec = spec.setdefault("jobTemplate", {}).setdefault("spec", {})
+        changed = _ensure_job_spec_safeguards(job_spec, ttl=False) or changed
+        changed = _ensure_container_resources(_cronjob_container_specs(document)) or changed
+        return changed
+    return False
+
+
+def _ensure_job_spec_safeguards(spec: dict[str, Any], *, ttl: bool = True) -> bool:
+    changed = False
+    if "backoffLimit" not in spec:
+        spec["backoffLimit"] = DEFAULT_JOB_BACKOFF_LIMIT
+        changed = True
+    if "activeDeadlineSeconds" not in spec:
+        spec["activeDeadlineSeconds"] = DEFAULT_JOB_ACTIVE_DEADLINE_SECONDS
+        changed = True
+    if ttl and "ttlSecondsAfterFinished" not in spec:
+        spec["ttlSecondsAfterFinished"] = DEFAULT_JOB_TTL_SECONDS_AFTER_FINISHED
+        changed = True
+    return changed
+
+
+def _ensure_container_resources(containers: list[dict[str, Any]]) -> bool:
+    changed = False
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        resources = container.get("resources")
+        if not isinstance(resources, dict):
+            resources = {}
+            container["resources"] = resources
+            changed = True
+        for section, defaults in DEFAULT_JOB_RESOURCES.items():
+            values = resources.get(section)
+            if not isinstance(values, dict):
+                values = {}
+                resources[section] = values
+                changed = True
+            for key, value in defaults.items():
+                if key not in values:
+                    values[key] = value
+                    changed = True
+    return changed
+
+
+def _job_container_specs(document: dict[str, Any]) -> list[dict[str, Any]]:
+    containers = (((document.get("spec") or {}).get("template") or {}).get("spec") or {}).get("containers")
+    return containers if isinstance(containers, list) else []
+
+
+def _cronjob_container_specs(document: dict[str, Any]) -> list[dict[str, Any]]:
+    containers = (
+        ((((document.get("spec") or {}).get("jobTemplate") or {}).get("spec") or {}).get("template") or {})
+        .get("spec", {})
+        .get("containers")
+    )
+    return containers if isinstance(containers, list) else []
 
 
 def detect_manifest_image_drift(manifest_dir: Path) -> tuple[str | None, list[ManifestImageDrift]]:

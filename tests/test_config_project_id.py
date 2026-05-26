@@ -23,6 +23,13 @@ def test_review_comment_history_processing_defaults_off() -> None:
     config = AppConfig(gitlab_url="https://gitlab.example.com", project_id=123, target_repo_path=Path("."))
 
     assert config.schedule.review_comments.process_history is False
+    assert config.schedule.review_comments.cron == "*/15 * * * *"
+
+
+def test_functional_test_env_defaults_to_single_cargo_build_job() -> None:
+    config = AppConfig(gitlab_url="https://gitlab.example.com", project_id=123, target_repo_path=Path("."))
+
+    assert config.functional_test_env == {"CARGO_BUILD_JOBS": "1"}
 
 
 def test_url_encoded_project_path_is_normalized() -> None:

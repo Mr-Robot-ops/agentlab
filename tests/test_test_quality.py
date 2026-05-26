@@ -152,3 +152,23 @@ def test_safe_cd_test_command_is_allowlisted_by_inner_command(tmp_path: Path) ->
     tool = AgentTestTool(tmp_path, cfg)
 
     assert tool.is_allowed("cd rust-backend && cargo test --package rust-backend")
+
+
+def test_functional_test_tool_sets_cargo_build_jobs_env(tmp_path: Path, monkeypatch) -> None:
+    cfg = config(tmp_path)
+    captured: dict[str, object] = {}
+
+    def fake_run_subprocess(command, **kwargs):
+        from agentlab.models import CommandResult
+
+        captured["command"] = command
+        captured.update(kwargs)
+        return CommandResult(command="cargo test", cwd=str(tmp_path), exit_code=0)
+
+    monkeypatch.setattr("agentlab.tools.test_tool.run_subprocess", fake_run_subprocess)
+
+    result = AgentTestTool(tmp_path, cfg).run_command("cargo test")
+
+    assert result.ok
+    assert captured["command"] == ["cargo", "test"]
+    assert captured["env"] == {"CARGO_BUILD_JOBS": "1"}
