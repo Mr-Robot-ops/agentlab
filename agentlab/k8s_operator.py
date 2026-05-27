@@ -462,7 +462,14 @@ class K8sOperator:
             return self._stream_with_retry(args)
         return self._logs_with_retry(args)
 
-    def run_component(self, component: str, *, follow: bool = True, task_id: str | None = None) -> str:
+    def run_component(
+        self,
+        component: str,
+        *,
+        follow: bool = True,
+        task_id: str | None = None,
+        extra_args: list[str] | None = None,
+    ) -> str:
         manifest = manifest_for_component(component, self.manifest_dir)
         if not manifest.exists():
             raise MissingManifestError(
@@ -470,10 +477,12 @@ class K8sOperator:
             )
         if task_id is not None and component != "action":
             raise K8sOperatorError("--task-id is only supported for the action component")
+        if extra_args and component != "plan":
+            raise K8sOperatorError("extra planning arguments are only supported for the plan component")
         job_name = run_job_name_for_component(component)
         self._run(["delete", "job", job_name, "--ignore-not-found=true"])
-        if task_id is not None:
-            self._run(["apply", "-f", "-"], input_text=_manifest_with_task_id(manifest, task_id))
+        if task_id is not None or extra_args:
+            self._run(["apply", "-f", "-"], input_text=_manifest_with_args(manifest, task_id=task_id, extra_args=extra_args or []))
         else:
             self._run(["apply", "-f", str(manifest)])
         if follow:
@@ -2122,7 +2131,15 @@ def _log_snippet(logs: str, *, limit: int = 500) -> str:
 
 
 def _manifest_with_task_id(path: Path, task_id: str) -> str:
-    _validate_task_id(task_id)
+    return _manifest_with_args(path, task_id=task_id, extra_args=[])
+
+
+def _manifest_with_args(path: Path, *, task_id: str | None = None, extra_args: list[str] | None = None) -> str:
+    if task_id is not None:
+        _validate_task_id(task_id)
+    for value in extra_args or []:
+        if not str(value).strip():
+            raise K8sOperatorError("extra plan arguments may not be empty")
     manifest = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     try:
         containers = manifest["spec"]["template"]["spec"]["containers"]
@@ -2130,11 +2147,19 @@ def _manifest_with_task_id(path: Path, task_id: str) -> str:
     except (KeyError, IndexError, TypeError) as exc:
         raise K8sOperatorError(f"could not add --task-id to generated Job manifest: {path}") from exc
     if not args:
-        raise K8sOperatorError(f"could not add --task-id to generated Job manifest without args: {path}")
+        raise K8sOperatorError(f"could not update generated Job manifest without args: {path}")
     if "--task-id" in args:
         index = args.index("--task-id")
         args = args[:index] + args[index + 2 :]
-    containers[0]["args"] = [*args, "--task-id", task_id]
+    for flag in ("--focus", "--prefer-task-type", "--prefer-task-id"):
+        while flag in args:
+            index = args.index(flag)
+            args = args[:index] + args[index + 2 :]
+    updated_args = list(args)
+    if task_id is not None:
+        updated_args.extend(["--task-id", task_id])
+    updated_args.extend(extra_args or [])
+    containers[0]["args"] = updated_args
     return yaml.safe_dump(manifest, sort_keys=False)
 
 

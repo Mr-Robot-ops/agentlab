@@ -32,8 +32,15 @@ class FakeOperator:
         self.calls.append(("job_logs", (job_name, follow, tail)))
         return "log output"
 
-    def run_component(self, component: str, *, follow: bool = True, task_id: str | None = None) -> str:
-        self.calls.append(("run_component", (component, follow, task_id)))
+    def run_component(
+        self,
+        component: str,
+        *,
+        follow: bool = True,
+        task_id: str | None = None,
+        extra_args: list[str] | None = None,
+    ) -> str:
+        self.calls.append(("run_component", (component, follow, task_id, extra_args)))
         return f"manifest-{component}"
 
     def config_get(self, path: str) -> ConfigValueReport:
@@ -269,8 +276,63 @@ def test_k8s_run_action_passes_task_id(monkeypatch) -> None:
 
     assert result.exit_code == 0
     assert fake.calls == [
-        ("run_component", ("action", False, "tests-02-smoke-baseline")),
+        ("run_component", ("action", False, "tests-02-smoke-baseline", [])),
     ]
+
+
+def test_k8s_run_plan_passes_focus_and_preference_args(monkeypatch) -> None:
+    fake = FakeOperator()
+    monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
+    monkeypatch.setattr(k8s_cli, "manifest_for_component", lambda component, manifest_dir: Path("job-scheduler-plan.yaml"))
+    monkeypatch.setattr(k8s_cli, "run_job_name_for_component", lambda component: "agentlab-scheduler-plan")
+
+    result = runner.invoke(
+        app,
+        [
+            "k8s",
+            "run",
+            "plan",
+            "--focus",
+            "rust smoke test",
+            "--prefer-task-type",
+            "tests",
+            "--prefer-task-id",
+            "rust-public-seam-smoke-test",
+            "--no-follow",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert fake.calls == [
+        (
+            "run_component",
+            (
+                "plan",
+                False,
+                None,
+                [
+                    "--focus",
+                    "rust smoke test",
+                    "--prefer-task-type",
+                    "tests",
+                    "--prefer-task-id",
+                    "rust-public-seam-smoke-test",
+                ],
+            ),
+        )
+    ]
+
+
+def test_k8s_run_rejects_plan_hints_for_non_plan_component(monkeypatch) -> None:
+    fake = FakeOperator()
+    monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
+    monkeypatch.setattr(k8s_cli, "manifest_for_component", lambda component, manifest_dir: Path("job-scheduler-action.yaml"))
+    monkeypatch.setattr(k8s_cli, "run_job_name_for_component", lambda component: "agentlab-scheduler-action")
+
+    result = runner.invoke(app, ["k8s", "run", "action", "--focus", "rust smoke test", "--no-follow"])
+
+    assert result.exit_code == 1
+    assert "--focus, --prefer-task-type, and --prefer-task-id are only valid" in result.output
 
 
 def test_k8s_config_get_invokes_operator(monkeypatch) -> None:

@@ -69,7 +69,10 @@ class AutoApprovalPolicy:
                 rejected.append({"task_id": task.id, "reasons": reasons, "details": details})
 
         approved_tasks = [task for task in updated_tasks if task.approved]
+        blocked_priority_task = self._blocked_priority_task(updated_tasks, rejected)
         selected = self.select_task(approved_tasks)
+        if blocked_priority_task is not None:
+            selected = None
         report = {
             "enabled": self.policy.enabled,
             "policy_name": POLICY_NAME,
@@ -80,6 +83,8 @@ class AutoApprovalPolicy:
             "selected_task_id": selected.id if selected else None,
             "policy_config": self.policy.model_dump(mode="json"),
         }
+        if blocked_priority_task is not None:
+            report["blocked_priority_task"] = blocked_priority_task
         return plan.model_copy(update={"tasks": updated_tasks}), report
 
     @staticmethod
@@ -89,6 +94,7 @@ class AutoApprovalPolicy:
         return sorted(
             tasks,
             key=lambda task: (
+                _planner_priority(task),
                 task.risk_score,
                 RISK_ORDER.get(task.risk_level, 99),
                 TYPE_ORDER.get(task.task_type, 99),
@@ -153,6 +159,9 @@ class AutoApprovalPolicy:
             "allowed_paths": list(self.policy.allowed_paths),
             "matched_allowed_paths": matched_allowed,
             "blocked_paths_matched": blocked_matches,
+            "policy_blocked_hint": task.metadata.get("policy_blocked_hint"),
+            "required_allowed_paths": task.metadata.get("required_allowed_paths"),
+            "planner_priority": task.metadata.get("planner_priority"),
             "risk_score": task.risk_score,
             "max_risk_score": self.policy.max_risk_score,
             "risk_level": task.risk_level.value,
@@ -182,6 +191,26 @@ class AutoApprovalPolicy:
         return task.task_type not in {TaskType.DOCS, TaskType.TESTS}
 
     @staticmethod
+    def _blocked_priority_task(tasks: list[AgentTask], rejected: list[dict[str, Any]]) -> dict[str, Any] | None:
+        rejected_by_id = {item.get("task_id"): item for item in rejected}
+        priority_tasks = [
+            task
+            for task in tasks
+            if not task.approved and isinstance(task.metadata.get("planner_priority"), int) and int(task.metadata["planner_priority"]) <= 0
+        ]
+        if not priority_tasks:
+            return None
+        task = sorted(priority_tasks, key=lambda item: (int(item.metadata.get("planner_priority") or 0), item.id))[0]
+        rejected_item = rejected_by_id.get(task.id) or {}
+        return {
+            "task_id": task.id,
+            "title": task.title,
+            "reasons": rejected_item.get("reasons", []),
+            "hint": task.metadata.get("policy_blocked_hint"),
+            "required_allowed_paths": task.metadata.get("required_allowed_paths"),
+        }
+
+    @staticmethod
     def _matches_any(path: str, patterns: list[str]) -> bool:
         normalized = path.replace("\\", "/")
         return any(fnmatchcase(normalized, pattern) for pattern in patterns)
@@ -193,3 +222,8 @@ class AutoApprovalPolicy:
             if fnmatchcase(normalized, pattern):
                 return pattern
         return None
+
+
+def _planner_priority(task: AgentTask) -> int:
+    value = task.metadata.get("planner_priority")
+    return int(value) if isinstance(value, int) else 100
