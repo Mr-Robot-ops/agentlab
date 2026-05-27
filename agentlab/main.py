@@ -99,9 +99,14 @@ def scheduler_watch(config: Path = typer.Option(..., "--config", exists=True, re
 
 
 @app.command("scheduler-plan")
-def scheduler_plan(config: Path = typer.Option(..., "--config", exists=True, readable=True)) -> None:
+def scheduler_plan(
+    config: Path = typer.Option(..., "--config", exists=True, readable=True),
+    focus: str | None = typer.Option(None, "--focus", help="One-off planning focus hint, for example 'rust smoke test'."),
+    prefer_task_type: list[str] | None = typer.Option(None, "--prefer-task-type", help="Prefer planned tasks of this type. Repeat to set priority hints."),
+    prefer_task_id: list[str] | None = typer.Option(None, "--prefer-task-id", help="Prefer this planned task ID. Repeat to set priority hints."),
+) -> None:
     cfg = load_config(config)
-    _json_echo(Scheduler(cfg).plan())
+    _json_echo(Scheduler(cfg).plan(focus=focus, prefer_task_types=prefer_task_type, prefer_task_ids=prefer_task_id))
 
 
 @app.command("scheduler-action")

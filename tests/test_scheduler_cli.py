@@ -112,3 +112,47 @@ def test_scheduler_action_passes_preference_flags(monkeypatch, tmp_path: Path) -
     assert '"task_selection_reason": "preferred_task_type:tests"' in result.output
     assert '"prefer_task_types": [\n    "tests",\n    "docs"\n  ]' in result.output
     assert '"prefer_task_ids": [\n    "tests-02-smoke-baseline"\n  ]' in result.output
+
+
+def test_scheduler_plan_passes_focus_and_preference_flags(monkeypatch, tmp_path: Path) -> None:
+    class CapturingScheduler:
+        def __init__(self, cfg: object) -> None:
+            self.cfg = cfg
+
+        def plan(
+            self,
+            *,
+            focus: str | None = None,
+            prefer_task_types: list[str] | None = None,
+            prefer_task_ids: list[str] | None = None,
+        ) -> dict[str, object]:
+            return {
+                "status": "passed",
+                "reason": "plan_completed",
+                "focus": focus,
+                "prefer_task_types": prefer_task_types,
+                "prefer_task_ids": prefer_task_ids,
+            }
+
+    monkeypatch.setattr(main, "load_config", lambda path: object())
+    monkeypatch.setattr(main, "Scheduler", CapturingScheduler)
+
+    result = runner.invoke(
+        main.app,
+        [
+            "scheduler-plan",
+            "--config",
+            str(_config_file(tmp_path)),
+            "--focus",
+            "rust smoke test",
+            "--prefer-task-type",
+            "tests",
+            "--prefer-task-id",
+            "rust-public-seam-smoke-test",
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert '"focus": "rust smoke test"' in result.output
+    assert '"prefer_task_types": [\n    "tests"\n  ]' in result.output
+    assert '"prefer_task_ids": [\n    "rust-public-seam-smoke-test"\n  ]' in result.output

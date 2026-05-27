@@ -154,7 +154,13 @@ class Scheduler:
             )
         )
 
-    def plan(self) -> dict[str, Any]:
+    def plan(
+        self,
+        *,
+        focus: str | None = None,
+        prefer_task_types: list[str] | None = None,
+        prefer_task_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
         if not self.config.schedule.enabled:
             return self._write_report(self._report("skipped", "schedule_disabled"))
         if not self.config.schedule.plan.enabled:
@@ -171,7 +177,18 @@ class Scheduler:
             and state.get("last_plan_run")
         ):
             return self._write_report(self._report("skipped", "default_branch_unchanged", default_branch_head=head))
-        plan = self.orchestrator.plan()
+        closed_feedback = list(state.get("closed_agent_mr_feedback") or [])
+        preferred_types = _normalize_preferred_types(prefer_task_types)
+        preferred_ids = _normalize_preferred_ids(prefer_task_ids)
+        if hasattr(self.orchestrator, "plan_with_hints"):
+            plan = self.orchestrator.plan_with_hints(
+                focus=focus,
+                preferred_task_types=preferred_types,
+                preferred_task_ids=preferred_ids,
+                closed_agent_mr_feedback=closed_feedback,
+            )
+        else:
+            plan = self.orchestrator.plan()
         approved_plan, auto_report = AutoApprovalPolicy(self.config).apply(plan)
         self.artifacts.write_json("auto_approval_report", auto_report)
         self.artifacts.write_json("approved_plan", approved_plan)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from agentlab.config import AppConfig
@@ -24,12 +25,20 @@ class PlanningAgent:
         *,
         repo_index: RepoIndex | None = None,
         architecture: ArchitectureSummary | None = None,
+        focus: str | None = None,
+        preferred_task_types: list[str] | None = None,
+        preferred_task_ids: list[str] | None = None,
+        closed_agent_mr_feedback: list[dict[str, object]] | None = None,
     ) -> None:
         self.config = config
         self.file_tool = file_tool
         self.ollama = ollama
         self.repo_index = repo_index
         self.architecture = architecture
+        self.focus = focus
+        self.preferred_task_types = preferred_task_types or []
+        self.preferred_task_ids = preferred_task_ids or []
+        self.closed_agent_mr_feedback = closed_agent_mr_feedback or []
 
     def plan(self) -> TaskPlan:
         context = self._repo_context()
@@ -87,6 +96,17 @@ class PlanningAgent:
             }
         if self.architecture is not None:
             context["architecture_summary"] = self.architecture.model_dump(mode="json")
+        hints: dict[str, object] = {}
+        if self.focus:
+            hints["focus"] = self.focus
+        if self.preferred_task_types:
+            hints["preferred_task_types"] = list(self.preferred_task_types)
+        if self.preferred_task_ids:
+            hints["preferred_task_ids"] = list(self.preferred_task_ids)
+        if self.closed_agent_mr_feedback:
+            hints["closed_agent_mr_feedback"] = list(self.closed_agent_mr_feedback)
+        if hints:
+            context["planning_hints"] = hints
         return context
 
     def _heuristic_plan(self, context: dict[str, object]) -> TaskPlan:
@@ -163,7 +183,19 @@ class PlanningAgent:
 
     def _normalize_plan(self, plan: TaskPlan, context: dict[str, object]) -> TaskPlan:
         tasks = [_normalize_rust_smoke_test_task(task, context, self.file_tool) for task in plan.tasks]
-        return plan.model_copy(update={"tasks": tasks})
+        tasks = _add_rust_public_seam_followup_task(tasks, context, self.file_tool)
+        tasks = _apply_planning_hint_priority(
+            tasks,
+            focus=self.focus,
+            preferred_task_types=self.preferred_task_types,
+            preferred_task_ids=self.preferred_task_ids,
+        )
+        source_signals = list(plan.source_signals)
+        if (context.get("planning_hints") or {}).get("closed_agent_mr_feedback") and "closed_agent_mr_feedback" not in source_signals:
+            source_signals.append("closed_agent_mr_feedback")
+        if self.focus and "planning_focus" not in source_signals:
+            source_signals.append("planning_focus")
+        return plan.model_copy(update={"tasks": tasks, "source_signals": source_signals})
 
 
 def _normalize_rust_smoke_test_task(task: AgentTask, context: dict[str, object], file_tool: FileTool) -> AgentTask:
@@ -249,12 +281,156 @@ def _normalize_rust_smoke_test_task(task: AgentTask, context: dict[str, object],
     return task.model_copy(
         update={
             "affected_files": preferred_files,
-            "risk_level": RiskLevel.MEDIUM if planned_production_files else RiskLevel.LOW,
-            "risk_score": max(task.risk_score, 10) if planned_production_files else min(task.risk_score or 3, 3),
+            "risk_level": _rust_smoke_risk_level(task, planned_production_files),
+            "risk_score": _rust_smoke_risk_score(task, planned_production_files),
             "forbidden_actions": forbidden_actions,
             "metadata": metadata,
         }
     )
+
+
+def _rust_smoke_risk_level(task: AgentTask, planned_production_files: list[str]) -> RiskLevel:
+    if not planned_production_files:
+        return RiskLevel.LOW
+    if _is_minimal_public_lib_seam(planned_production_files) and "public seam" in _task_text(task):
+        return RiskLevel.LOW
+    return RiskLevel.MEDIUM
+
+
+def _rust_smoke_risk_score(task: AgentTask, planned_production_files: list[str]) -> int:
+    if not planned_production_files:
+        return min(task.risk_score or 3, 3)
+    if _is_minimal_public_lib_seam(planned_production_files) and "public seam" in _task_text(task):
+        return min(task.risk_score or 3, 3)
+    return max(task.risk_score, 10)
+
+
+def _is_minimal_public_lib_seam(paths: list[str]) -> bool:
+    return len(paths) == 1 and paths[0].replace("\\", "/").endswith("src/lib.rs")
+
+
+def _add_rust_public_seam_followup_task(
+    tasks: list[AgentTask],
+    context: dict[str, object],
+    file_tool: FileTool,
+) -> list[AgentTask]:
+    hints = context.get("planning_hints") if isinstance(context.get("planning_hints"), dict) else {}
+    feedback = hints.get("closed_agent_mr_feedback") if isinstance(hints, dict) else None
+    feedback_items = [item for item in feedback or [] if isinstance(item, dict)]
+    focus = str(hints.get("focus") or "") if isinstance(hints, dict) else ""
+    smoke_feedback = _rust_smoke_closed_feedback(feedback_items)
+    if len(smoke_feedback) < 2 and not _focus_requests_rust_smoke(focus):
+        return tasks
+    layout = _primary_rust_layout(context, None, file_tool)
+    if layout is None or not layout.is_binary_only:
+        return tasks
+    task = _rust_public_seam_task(layout, smoke_feedback, focus=focus)
+    existing = [item for item in tasks if item.id != task.id]
+    return [task, *existing]
+
+
+def _rust_public_seam_task(layout: RustCrateLayout, feedback: list[dict[str, object]], *, focus: str) -> AgentTask:
+    base = f"{layout.root}/" if layout.root != "." else ""
+    lib_path = f"{base}src/lib.rs"
+    smoke_path = f"{base}tests/smoke.rs"
+    package = layout.package_name or "the Rust package"
+    return AgentTask(
+        id="rust-public-seam-smoke-test",
+        title="Add minimal Rust library seam and smoke test",
+        task_type=TaskType.TESTS,
+        risk_level=RiskLevel.LOW,
+        risk_score=3,
+        description=(
+            f"Add a minimal public library seam for {package} and an integration smoke test that imports that seam. "
+            "This is the follow-up to closed test-only Rust smoke MRs that could not compile for a binary-only crate."
+        ),
+        acceptance_criteria=[
+            f"Add {lib_path} if it is missing.",
+            "Expose only a minimal public seam needed for testing.",
+            f"Add {smoke_path} that imports the library crate and validates project-specific behavior.",
+            f"cd {layout.root} && cargo test --package {layout.package_name}" if layout.root != "." and layout.package_name else "cargo test passes.",
+            "Do not create placeholder tests.",
+        ],
+        affected_files=[lib_path, smoke_path],
+        forbidden_actions=[
+            "Do not touch Docker, CI, frontend, credentials, compose files, deployment files, or ZFS command execution paths.",
+            "Do not edit broad rust-backend/src/** paths; only the minimal src/lib.rs seam is allowed.",
+            "Do not create placeholder, arithmetic-only, framework-only, or CARGO_PKG_NAME-only tests.",
+        ],
+        test_requirements=[
+            f"cd {layout.root} && cargo test --package {layout.package_name}"
+            if layout.root != "." and layout.package_name
+            else "cargo test"
+        ],
+        metadata={
+            "planner_priority": 0,
+            "planning_reason": "closed_rust_smoke_mrs_require_public_library_seam",
+            "planning_focus": focus,
+            "closed_agent_mr_feedback_count": len(feedback),
+            "closed_agent_mr_feedback_iids": [item.get("iid") for item in feedback if item.get("iid") is not None],
+            "rust_crate_layout": _layout_metadata(layout),
+            "required_allowed_paths": [lib_path, smoke_path],
+            "policy_blocked_hint": f"Rust public seam task requires {lib_path} to be allowed.",
+        },
+    )
+
+
+def _rust_smoke_closed_feedback(feedback: list[dict[str, object]]) -> list[dict[str, object]]:
+    matches: list[dict[str, object]] = []
+    for item in feedback:
+        changed_files = item.get("changed_files")
+        if not isinstance(changed_files, list):
+            changed_files = []
+        paths = {str(path).replace("\\", "/") for path in changed_files if str(path).strip()}
+        text = " ".join(
+            str(value)
+            for value in (item.get("title"), item.get("source_branch"), item.get("reason"), item.get("labels"))
+            if value
+        ).lower()
+        changed_only_smoke = paths == {"rust-backend/tests/smoke.rs"}
+        mentions_smoke = "rust" in text and any(term in text for term in ("smoke", "baseline", "test"))
+        mentions_binary_seam = any(term in text for term in ("binary-only", "library seam", "public seam", "no lib", "src/lib.rs"))
+        if changed_only_smoke and (mentions_smoke or mentions_binary_seam):
+            matches.append(item)
+    return matches
+
+
+def _focus_requests_rust_smoke(focus: str) -> bool:
+    text = focus.lower()
+    return "rust" in text and any(term in text for term in ("smoke", "test", "baseline", "public seam", "library seam"))
+
+
+def _apply_planning_hint_priority(
+    tasks: list[AgentTask],
+    *,
+    focus: str | None,
+    preferred_task_types: list[str],
+    preferred_task_ids: list[str],
+) -> list[AgentTask]:
+    preferred_ids = [value.strip() for value in preferred_task_ids if value.strip()]
+    preferred_types = [value.strip().lower() for value in preferred_task_types if value.strip()]
+    focus_tokens = {token for token in _selection_tokens(focus or "") if token not in {"task", "agent", "please"}}
+    updated: list[AgentTask] = []
+    for task in tasks:
+        priorities: list[int] = []
+        if isinstance(task.metadata.get("planner_priority"), int):
+            priorities.append(int(task.metadata["planner_priority"]))
+        if task.id in preferred_ids:
+            priorities.append(preferred_ids.index(task.id))
+        if task.task_type.value in preferred_types:
+            priorities.append(20 + preferred_types.index(task.task_type.value))
+        if focus_tokens and len(focus_tokens.intersection(_selection_tokens(_task_text(task)))) >= min(2, len(focus_tokens)):
+            priorities.append(50)
+        if priorities:
+            priority = min(priorities)
+            updated.append(task.model_copy(update={"metadata": {**task.metadata, "planner_priority": priority}}))
+        else:
+            updated.append(task)
+    return updated
+
+
+def _selection_tokens(value: str) -> set[str]:
+    return {token for token in re.findall(r"[a-z0-9]+", value.lower()) if len(token) >= 3}
 
 
 def _is_rust_smoke_test_task(task: AgentTask, context: dict[str, object]) -> bool:

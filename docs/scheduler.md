@@ -34,6 +34,17 @@ kubectl apply -f deploy/kubernetes/generated/job-scheduler-plan.yaml
 kubectl -n agentlab logs job/agentlab-scheduler-plan -f
 ```
 
+One-off planning hints can steer the next plan without changing the ConfigMap:
+
+```bash
+agentlab scheduler-plan --config /etc/agentlab/config.yaml --focus "rust smoke test"
+agentlab scheduler-plan --config /etc/agentlab/config.yaml --prefer-task-type tests
+agentlab k8s run plan --focus "rust smoke test"
+agentlab k8s run plan --prefer-task-type tests
+```
+
+If closed Agent MRs show repeated failed Rust smoke-test attempts against `rust-backend/tests/smoke.rs` for a binary-only crate, the planner prefers a follow-up task named `Add minimal Rust library seam and smoke test` instead of falling back to unrelated docs work. If policy does not allow `rust-backend/src/lib.rs`, the plan/action report names that required path instead of silently selecting a docs task.
+
 Reset scheduler state without a helper pod:
 
 ```bash

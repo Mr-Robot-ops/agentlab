@@ -89,6 +89,37 @@ class AutoApproveOrchestrator(DummyOrchestrator):
         return ImplementationReport(task_id=task.id, branch="agent/docs-readme-run-1", status=ReportStatus.PASSED, pushed=True)
 
 
+class PriorityBlockedOrchestrator(DummyOrchestrator):
+    def plan(self) -> TaskPlan:
+        return TaskPlan(
+            tasks=[
+                AgentTask(
+                    id="docs-update-test-instructions",
+                    title="Update test instructions",
+                    task_type=TaskType.DOCS,
+                    risk_level=RiskLevel.LOW,
+                    risk_score=1,
+                    affected_files=["README.md"],
+                    approved=False,
+                ),
+                AgentTask(
+                    id="rust-public-seam-smoke-test",
+                    title="Add minimal Rust library seam and smoke test",
+                    task_type=TaskType.TESTS,
+                    risk_level=RiskLevel.LOW,
+                    risk_score=3,
+                    affected_files=["rust-backend/src/lib.rs", "rust-backend/tests/smoke.rs"],
+                    approved=False,
+                    metadata={
+                        "planner_priority": 0,
+                        "policy_blocked_hint": "Rust public seam task requires rust-backend/src/lib.rs to be allowed.",
+                        "required_allowed_paths": ["rust-backend/src/lib.rs", "rust-backend/tests/**"],
+                    },
+                ),
+            ]
+        )
+
+
 def test_full_flow_skips_auto_merge_when_no_mr_exists() -> None:
     config = AppConfig(
         gitlab_url="https://gitlab.example.com",
@@ -135,6 +166,35 @@ def test_full_flow_uses_auto_approved_task() -> None:
     report = orchestrator.artifacts.payloads["auto_approval_report"]
     assert isinstance(report, dict)
     assert report["selected_task_id"] == "docs-readme"
+
+
+def test_full_flow_blocks_priority_task_instead_of_falling_back_to_docs() -> None:
+    config = AppConfig(
+        gitlab_url="https://gitlab.example.com",
+        project_id=1,
+        target_repo_path=Path("."),
+        workspace_root=Path(".runs"),
+        push_agent_branches_enabled=False,
+        auto_approve={
+            "enabled": True,
+            "allowed_paths": ["README.md", "rust-backend/tests/**"],
+            "allowed_task_types": ["docs", "tests"],
+        },
+    )
+    orchestrator = PriorityBlockedOrchestrator(config)
+
+    result = orchestrator.full_flow()
+
+    assert result["status"] == "blocked"
+    assert result["reason"] == "prioritized task blocked by policy"
+    assert result["selected_task_id"] == "rust-public-seam-smoke-test"
+    assert result["task_selection_reason"] == "priority_task_blocked_by_policy"
+    assert result["policy_blocked_hint"] == "Rust public seam task requires rust-backend/src/lib.rs to be allowed."
+    assert "implementation_report" not in orchestrator.artifacts.payloads
+    report = orchestrator.artifacts.payloads["auto_approval_report"]
+    assert isinstance(report, dict)
+    assert report["selected_task_id"] is None
+    assert report["blocked_priority_task"]["task_id"] == "rust-public-seam-smoke-test"
 
 
 def test_full_flow_with_task_id_uses_matching_approved_task() -> None:

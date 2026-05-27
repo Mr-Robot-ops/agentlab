@@ -95,9 +95,28 @@ class FakeOrchestrator:
         self.full_flow_preferred_task_ids = None
         self.full_flow_preferred_task_types = None
         self.full_flow_closed_agent_mr_feedback = None
+        self.plan_focus = None
+        self.plan_preferred_task_ids = None
+        self.plan_preferred_task_types = None
+        self.plan_closed_agent_mr_feedback = None
 
     def plan(self) -> TaskPlan:
         self.plan_called = True
+        return self.plan_with_hints()
+
+    def plan_with_hints(
+        self,
+        *,
+        focus=None,
+        preferred_task_types=None,
+        preferred_task_ids=None,
+        closed_agent_mr_feedback=None,
+    ) -> TaskPlan:
+        self.plan_called = True
+        self.plan_focus = focus
+        self.plan_preferred_task_ids = preferred_task_ids
+        self.plan_preferred_task_types = preferred_task_types
+        self.plan_closed_agent_mr_feedback = closed_agent_mr_feedback
         return TaskPlan(
             tasks=[
                 AgentTask(
@@ -401,6 +420,27 @@ def test_scheduler_plan_applies_auto_approval(tmp_path: Path) -> None:
     assert auto["selected_task_id"] == "docs-readme"
     state, _ = scheduler.state_store.read()
     assert state["last_plan_run_id"] == "run-1"
+
+
+def test_scheduler_plan_passes_focus_preferences_and_closed_feedback(tmp_path: Path) -> None:
+    scheduler = HelperScheduler(config(tmp_path), gitlab=FakeGitLab(head="new"))
+    state, _ = scheduler.state_store.read()
+    state["closed_agent_mr_feedback"] = [{"iid": 21, "title": "Add Rust smoke baseline", "changed_files": ["rust-backend/tests/smoke.rs"]}]
+    scheduler.state_store.write(state)
+
+    report = scheduler.plan(
+        focus="rust smoke test",
+        prefer_task_types=["Tests", "docs"],
+        prefer_task_ids=[" rust-public-seam-smoke-test "],
+    )
+
+    assert report["status"] == "passed"
+    assert scheduler.orchestrator.plan_focus == "rust smoke test"
+    assert scheduler.orchestrator.plan_preferred_task_types == ["tests", "docs"]
+    assert scheduler.orchestrator.plan_preferred_task_ids == ["rust-public-seam-smoke-test"]
+    assert scheduler.orchestrator.plan_closed_agent_mr_feedback == [
+        {"iid": 21, "title": "Add Rust smoke baseline", "changed_files": ["rust-backend/tests/smoke.rs"]}
+    ]
 
 
 def test_scheduler_action_skips_limits_and_cooldown(tmp_path: Path) -> None:

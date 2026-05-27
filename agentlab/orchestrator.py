@@ -169,13 +169,33 @@ class Orchestrator:
         return git_tool, file_tool, test_tool, docker_tool
 
     def plan(self) -> TaskPlan:
+        return self.plan_with_hints()
+
+    def plan_with_hints(
+        self,
+        *,
+        focus: str | None = None,
+        preferred_task_types: list[str] | None = None,
+        preferred_task_ids: list[str] | None = None,
+        closed_agent_mr_feedback: list[dict[str, Any]] | None = None,
+    ) -> TaskPlan:
         self.preflight("plan", enforce=False)
         repo_index, architecture = self.index_repository()
         if self.config.supply_chain_enabled:
             self.supply_chain()
         _, file_tool, _, _ = self._tools()
         with self.audit.span(agent="planner", action="plan"):
-            result = PlanningAgent(self.config, file_tool, self.ollama, repo_index=repo_index, architecture=architecture).plan()
+            result = PlanningAgent(
+                self.config,
+                file_tool,
+                self.ollama,
+                repo_index=repo_index,
+                architecture=architecture,
+                focus=focus,
+                preferred_task_types=preferred_task_types,
+                preferred_task_ids=preferred_task_ids,
+                closed_agent_mr_feedback=closed_agent_mr_feedback,
+            ).plan()
         self.artifacts.write_json("plan", result)
         return result
 
@@ -321,13 +341,36 @@ class Orchestrator:
         self.audit.emit(agent="orchestrator", action="full_flow", status="started", metadata={"selected_task_id": task_id})
         try:
             if approved_plan is None:
-                plan = self.plan()
+                if type(self).plan is Orchestrator.plan:
+                    plan = self.plan_with_hints(closed_agent_mr_feedback=closed_agent_mr_feedback)
+                else:
+                    plan = self.plan()
                 approved_plan, auto_approval_report = AutoApprovalPolicy(self.config).apply(plan)
             else:
                 auto_approval_report = auto_approval_report or _auto_approval_report_from_approved_plan(approved_plan, task_id)
             self.artifacts.write_json("auto_approval_report", auto_approval_report)
             if self.config.auto_approve.enabled:
                 self.artifacts.write_json("approved_plan", approved_plan)
+            blocked_priority_task = (auto_approval_report or {}).get("blocked_priority_task")
+            if isinstance(blocked_priority_task, dict):
+                result = {
+                    "run_id": self.run_id,
+                    "status": "blocked",
+                    "reason": "prioritized task blocked by policy",
+                    "selected_task_id": blocked_priority_task.get("task_id"),
+                    "task_selection_reason": "priority_task_blocked_by_policy",
+                    "policy_blocked_hint": blocked_priority_task.get("hint"),
+                    "plan": approved_plan.model_dump(mode="json"),
+                    "auto_approval": auto_approval_report,
+                }
+                self.audit.emit(
+                    agent="orchestrator",
+                    action="full_flow",
+                    status="blocked",
+                    metadata={"reason": result["reason"], "selected_task_id": result["selected_task_id"]},
+                    output_payload=result,
+                )
+                return result
             if task_id is not None:
                 matching = [task for task in approved_plan.tasks if task.id == task_id]
                 if not matching:

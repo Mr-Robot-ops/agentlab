@@ -282,6 +282,9 @@ def run(
     manifest_dir: Path = typer.Option(DEFAULT_MANIFEST_DIR, "--manifest-dir"),
     follow: bool = typer.Option(True, "--follow/--no-follow"),
     task_id: str | None = typer.Option(None, "--task-id", help="Run a specific approved scheduler task ID. Only valid with action."),
+    focus: str | None = typer.Option(None, "--focus", help="One-off planning focus hint. Only valid with plan."),
+    prefer_task_type: list[str] | None = typer.Option(None, "--prefer-task-type", help="Prefer planned tasks of this type. Only valid with plan."),
+    prefer_task_id: list[str] | None = typer.Option(None, "--prefer-task-id", help="Prefer this planned task ID. Only valid with plan."),
 ) -> None:
     """Run a generated AgentLab Kubernetes Job manifest."""
     operator = _operator(namespace, manifest_dir)
@@ -292,11 +295,32 @@ def run(
         _fail(str(exc))
     typer.echo(f"Manifest: {manifest}")
     try:
-        operator.run_component(component, follow=False, task_id=task_id)
+        plan_args = _plan_hint_args(component, focus=focus, prefer_task_types=prefer_task_type, prefer_task_ids=prefer_task_id)
+        operator.run_component(component, follow=False, task_id=task_id, extra_args=plan_args)
         if follow:
             operator.job_logs(job_name, follow=True)
     except K8sOperatorError as exc:
         _fail(str(exc))
+
+
+def _plan_hint_args(
+    component: str,
+    *,
+    focus: str | None,
+    prefer_task_types: list[str] | None,
+    prefer_task_ids: list[str] | None,
+) -> list[str]:
+    has_hints = bool(focus or prefer_task_types or prefer_task_ids)
+    if has_hints and component != "plan":
+        _fail("--focus, --prefer-task-type, and --prefer-task-id are only valid with `agentlab k8s run plan`.")
+    args: list[str] = []
+    if focus:
+        args.extend(["--focus", focus])
+    for value in prefer_task_types or []:
+        args.extend(["--prefer-task-type", value])
+    for value in prefer_task_ids or []:
+        args.extend(["--prefer-task-id", value])
+    return args
 
 
 @k8s_app.command()

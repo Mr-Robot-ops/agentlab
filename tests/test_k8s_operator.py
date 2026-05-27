@@ -484,6 +484,52 @@ def test_run_component_action_task_id_patches_generated_job_command(tmp_path: Pa
     ]
 
 
+def test_run_component_plan_extra_args_patch_generated_job_command(tmp_path: Path) -> None:
+    manifest = tmp_path / "job-scheduler-plan.yaml"
+    manifest.write_text(
+        yaml.safe_dump(
+            {
+                "kind": "Job",
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "containers": [
+                                {
+                                    "name": "agentlab",
+                                    "args": ["scheduler-plan", "--config", "/etc/agentlab/config.yaml"],
+                                }
+                            ]
+                        }
+                    }
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    runner = FakeRunner()
+
+    used = K8sOperator(manifest_dir=tmp_path, runner=runner).run_component(
+        "plan",
+        follow=False,
+        extra_args=["--focus", "rust smoke test", "--prefer-task-type", "tests"],
+    )
+
+    assert used == str(manifest)
+    assert runner.calls[1][0] == ["-n", "agentlab", "apply", "-f", "-"]
+    applied = yaml.safe_load(runner.calls[1][1] or "")
+    args = applied["spec"]["template"]["spec"]["containers"][0]["args"]
+    assert args == [
+        "scheduler-plan",
+        "--config",
+        "/etc/agentlab/config.yaml",
+        "--focus",
+        "rust smoke test",
+        "--prefer-task-type",
+        "tests",
+    ]
+
+
 def test_run_component_task_id_is_action_only(tmp_path: Path) -> None:
     manifest = tmp_path / "job-scheduler-plan.yaml"
     manifest.write_text("kind: Job\n", encoding="utf-8")
@@ -493,6 +539,18 @@ def test_run_component_task_id_is_action_only(tmp_path: Path) -> None:
             "plan",
             follow=False,
             task_id="tests-02-smoke-baseline",
+        )
+
+
+def test_run_component_extra_args_are_plan_only(tmp_path: Path) -> None:
+    manifest = tmp_path / "job-scheduler-action.yaml"
+    manifest.write_text("kind: Job\n", encoding="utf-8")
+
+    with pytest.raises(K8sOperatorError, match="only supported for the plan component"):
+        K8sOperator(manifest_dir=tmp_path, runner=FakeRunner()).run_component(
+            "action",
+            follow=False,
+            extra_args=["--focus", "rust smoke test"],
         )
 
 
