@@ -7,8 +7,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     HOME=/home/agentlab \
     RUSTUP_HOME=/usr/local/rustup \
-    CARGO_HOME=/home/agentlab/.cargo \
-    PATH=/usr/local/cargo/bin:$PATH
+    CARGO_HOME=/home/agentlab/.cargo
 
 COPY --from=rust-toolchain /usr/local/rustup /usr/local/rustup
 COPY --from=rust-toolchain /usr/local/cargo/bin /usr/local/cargo/bin
@@ -21,11 +20,16 @@ RUN apt-get update \
       openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --create-home --uid 10001 --shell /usr/sbin/nologin agentlab \
+RUN /usr/sbin/useradd --create-home --uid 10001 --shell /usr/sbin/nologin agentlab \
     && mkdir -p /home/agentlab/.cargo \
     && chown -R agentlab:agentlab /home/agentlab/.cargo
 
-RUN cargo --version \
+ENV PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin
+
+RUN echo "$PATH" \
+    && command -v cargo \
+    && cargo --version \
+    && command -v rustc \
     && rustc --version
 
 WORKDIR /app
