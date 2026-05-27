@@ -484,8 +484,7 @@ cd rust-backend && cargo test --package zfs-manager
 Nach einem Runtime-Image-Build kann die Toolchain so geprueft werden:
 
 ```bash
-docker run --rm <image> cargo --version
-docker run --rm <image> rustc --version
+docker run --rm --entrypoint /bin/sh <image> -lc 'echo "$PATH"; command -v cargo; cargo --version; command -v rustc; rustc --version'
 ```
 
 Die Toolchain ist bewusst nicht das alte Debian-`cargo`-Paket, damit moderne Repositories mit Cargo.lock version 4 getestet werden koennen.

@@ -42,6 +42,8 @@ JOB_COMMANDS = {
     "scheduler-reset-state": ["scheduler-reset-state", "--config", "/etc/agentlab/config.yaml"],
 }
 
+RUNTIME_PATH = "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin"
+
 
 def generate_k8s(
     *,
@@ -345,6 +347,8 @@ spec:
                   key: GITLAB_TOKEN
             - name: GIT_TERMINAL_PROMPT
               value: "0"
+            - name: PATH
+              value: {yaml_string(RUNTIME_PATH)}
 {render_git_config_env(git_author_name, git_author_email)}
             - name: HOME
               value: /home/agentlab

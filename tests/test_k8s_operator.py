@@ -771,12 +771,16 @@ def test_upgrade_adds_missing_job_resource_safeguards(tmp_path: Path) -> None:
         "requests": {"cpu": "250m", "memory": "512Mi"},
         "limits": {"cpu": "1", "memory": "2Gi"},
     }
+    job_env = {item["name"]: item for item in container["env"]}
+    assert job_env["PATH"]["value"] == "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin"
     cronjob = yaml.safe_load((tmp_path / "cronjob-scheduler-watch.yaml").read_text(encoding="utf-8"))
     cronjob_container = cronjob["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
     assert cronjob["spec"]["concurrencyPolicy"] == "Forbid"
     assert cronjob["spec"]["jobTemplate"]["spec"]["backoffLimit"] == 0
     assert cronjob["spec"]["jobTemplate"]["spec"]["activeDeadlineSeconds"] == 3600
     assert cronjob_container["resources"] == container["resources"]
+    cronjob_env = {item["name"]: item for item in cronjob_container["env"]}
+    assert cronjob_env["PATH"]["value"] == "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin"
     assert "job-scheduler-action.yaml" in report.updated_manifests
     assert "cronjob-scheduler-watch.yaml" in report.updated_manifests
 

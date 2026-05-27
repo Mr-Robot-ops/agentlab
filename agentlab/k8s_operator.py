@@ -86,6 +86,7 @@ DEFAULT_JOB_RESOURCES = {
     "requests": {"cpu": "250m", "memory": "512Mi"},
     "limits": {"cpu": "1", "memory": "2Gi"},
 }
+RUNTIME_PATH = "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin"
 
 CONFIG_SETTING_SPECS: dict[str, tuple[type[bool] | type[int] | type[str], int | None]] = {
     "schedule.action.enabled": (bool, None),
@@ -1082,6 +1083,7 @@ def _ensure_generated_job_safeguards(document: dict[str, Any]) -> bool:
     if kind == "Job":
         changed = _ensure_job_spec_safeguards(document.setdefault("spec", {}))
         changed = _ensure_container_resources(_job_container_specs(document)) or changed
+        changed = _ensure_container_path_env(_job_container_specs(document)) or changed
         return changed
     if kind == "CronJob":
         changed = False
@@ -1092,6 +1094,7 @@ def _ensure_generated_job_safeguards(document: dict[str, Any]) -> bool:
         job_spec = spec.setdefault("jobTemplate", {}).setdefault("spec", {})
         changed = _ensure_job_spec_safeguards(job_spec, ttl=False) or changed
         changed = _ensure_container_resources(_cronjob_container_specs(document)) or changed
+        changed = _ensure_container_path_env(_cronjob_container_specs(document)) or changed
         return changed
     return False
 
@@ -1130,6 +1133,26 @@ def _ensure_container_resources(containers: list[dict[str, Any]]) -> bool:
                 if key not in values:
                     values[key] = value
                     changed = True
+    return changed
+
+
+def _ensure_container_path_env(containers: list[dict[str, Any]]) -> bool:
+    changed = False
+    for container in containers:
+        if not isinstance(container, dict):
+            continue
+        env = container.get("env")
+        if not isinstance(env, list):
+            env = []
+            container["env"] = env
+            changed = True
+        path_env = next((item for item in env if isinstance(item, dict) and item.get("name") == "PATH"), None)
+        if path_env is None:
+            env.append({"name": "PATH", "value": RUNTIME_PATH})
+            changed = True
+        elif path_env.get("value") != RUNTIME_PATH:
+            path_env["value"] = RUNTIME_PATH
+            changed = True
     return changed
 
 

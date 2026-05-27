@@ -165,6 +165,8 @@ def test_kubernetes_jobs_use_security_context_and_secret_env(tmp_path):
     assert container["args"] == ["doctor", "--config", "/etc/agentlab/config.yaml"]
     assert dry_run_job["spec"]["template"]["spec"]["containers"][0]["args"][0] == "dry-run"
     assert container["env"][0]["valueFrom"]["secretKeyRef"]["key"] == "GITLAB_TOKEN"
+    env = {item["name"]: item for item in container["env"]}
+    assert env["PATH"]["value"] == "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin"
 
 
 def test_kubernetes_jobs_configure_noninteractive_gitlab_https_auth(tmp_path):
@@ -183,6 +185,7 @@ def test_kubernetes_jobs_configure_noninteractive_gitlab_https_auth(tmp_path):
     env = {item["name"]: item for item in container["env"]}
 
     assert env["GIT_TERMINAL_PROMPT"]["value"] == "0"
+    assert env["PATH"]["value"] == "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin"
     assert env["GIT_CONFIG_COUNT"]["value"] == "3"
     assert env["GIT_CONFIG_KEY_0"]["value"] == "credential.helper"
     assert "$GITLAB_TOKEN" in env["GIT_CONFIG_VALUE_0"]["value"]
@@ -282,6 +285,8 @@ def test_kubernetes_bootstrap_generates_scheduler_cronjobs_when_enabled(tmp_path
         container = cronjob["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
         assert container["args"][0] == command
         assert container["resources"]["limits"]["cpu"] == "1"
+        env = {item["name"]: item for item in container["env"]}
+        assert env["PATH"]["value"] == "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin"
         volume_names = {volume["name"] for volume in cronjob["spec"]["jobTemplate"]["spec"]["template"]["spec"]["volumes"]}
         assert {"config", "git-netrc", "runs"}.issubset(volume_names)
 

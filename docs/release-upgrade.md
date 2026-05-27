@@ -29,8 +29,7 @@ cd rust-backend && cargo test --package zfs-manager
 After building a runtime image, verify the Rust toolchain with:
 
 ```bash
-docker run --rm <image> cargo --version
-docker run --rm <image> rustc --version
+docker run --rm --entrypoint /bin/sh <image> -lc 'echo "$PATH"; command -v cargo; cargo --version; command -v rustc; rustc --version'
 ```
 
 AgentLab intentionally does not use the older Debian `cargo` package in the runtime image, so modern repositories with Cargo.lock version 4 can be tested.
