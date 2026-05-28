@@ -1306,6 +1306,33 @@ def test_status_keeps_cluster_status_when_open_mr_api_fails_and_redacts_warning(
     assert "Warnings:" in rendered
 
 
+def test_status_reports_missing_gitlab_token_without_failing_cluster_status() -> None:
+    class MissingTokenGitLab:
+        def __init__(self, _config) -> None:
+            raise RuntimeError("GitLab token env var is not set: GITLAB_TOKEN")
+
+    runner = FakeRunner()
+    runner.respond(["-n", "agentlab", "get", "configmap", "agentlab-config", "-o", "json"], configmap_with_app_config())
+    runner.respond(["-n", "agentlab", "get", "cronjobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(["-n", "agentlab", "get", "jobs", "-o", "json"], json.dumps({"items": []}))
+    runner.respond(["-n", "agentlab", "get", "pods", "-o", "json"], json.dumps({"items": []}))
+
+    status = K8sOperator(runner=runner, gitlab_tool_factory=MissingTokenGitLab).status()
+    rendered = format_status(status)
+
+    assert status.configmap_image == "registry/agentlab:new"
+    assert status.open_agent_mrs == []
+    assert status.open_agent_mrs_count is None
+    assert status.open_agent_mrs_warning == "GitLab token env var GITLAB_TOKEN is not set"
+    assert "Open Agent MRs:\n- unknown" in rendered
+    assert "GitLab token env var GITLAB_TOKEN is not set" in rendered
+    assert (
+        "export GITLAB_TOKEN=\"$(kubectl -n agentlab get secret agentlab-secrets "
+        "-o jsonpath='{.data.GITLAB_TOKEN}' | base64 -d)\""
+    ) in rendered
+    assert "could not read open Agent MRs" not in rendered
+
+
 def test_health_summarizes_runtime_scheduler_gitlab_models_and_doctor() -> None:
     runner = FakeRunner()
     runner.respond(

@@ -425,7 +425,7 @@ class K8sOperator:
             configmap_version=configmap_version,
             image_annotation_warning=image_annotation_warning,
             open_agent_mrs=open_agent_mrs,
-            open_agent_mrs_count=len(open_agent_mrs),
+            open_agent_mrs_count=None if open_agent_mrs_warning else len(open_agent_mrs),
             open_agent_mrs_warning=open_agent_mrs_warning,
             cronjobs=cronjobs,
             recent_jobs=agentlab_jobs[:10],
@@ -800,12 +800,13 @@ class K8sOperator:
             return [], "could not read open Agent MRs: agentlab-config ConfigMap is unavailable"
         if not ((configmap.get("data") or {}).get("config.yaml")):
             return [], "could not read open Agent MRs: config.yaml is unavailable in agentlab-config"
+        config: AppConfig | None = None
         try:
             config = AppConfig.model_validate(_config_from_configmap_document(configmap))
             mrs = self.gitlab_tool_factory(config).list_open_agent_mrs()
             return _open_agent_mr_details(mrs), None
         except Exception as exc:
-            return [], f"could not read open Agent MRs: {_safe_error(exc)}"
+            return [], _open_agent_mrs_warning(config, exc)
 
     def _scheduler_state(self, *, pvc: str, shell_pod: str) -> tuple[dict[str, Any], dict[str, Any]]:
         path = f"{RUNS_ROOT}/scheduler/state.json"
@@ -1226,6 +1227,8 @@ def format_status(status: ClusterStatus) -> str:
             url = str(mr.get("web_url") or "no-url")
             prefix = f"!{iid}" if iid is not None else "!?"
             lines.append(f"- {prefix} [agent] {title} | branch={branch} | {url}")
+    elif status.open_agent_mrs_warning:
+        lines.append("- unknown")
     else:
         lines.append("- none")
 
@@ -1251,6 +1254,9 @@ def format_status(status: ClusterStatus) -> str:
     )
     if status.open_agent_mrs_warning:
         warnings.append(status.open_agent_mrs_warning)
+        export_command = _gitlab_token_export_command(status.open_agent_mrs_warning, status.namespace)
+        if export_command:
+            warnings.append(f"Load it from Kubernetes with: {export_command}")
     if status.image_annotation_warning:
         warnings.append(status.image_annotation_warning)
     if status.manifest_image_annotation_warning:
@@ -1652,6 +1658,46 @@ def _secret_value(secret: dict[str, Any], key: str) -> str:
 
 def _safe_error(exc: Exception) -> str:
     return str(redact_secrets(str(exc)))
+
+
+def _open_agent_mrs_warning(config: AppConfig | None, exc: Exception) -> str:
+    message = _safe_error(exc)
+    env_var = _gitlab_token_env_from_error(message) or (config.gitlab_token_env if config is not None else None)
+    if env_var and _is_missing_gitlab_token_error(message):
+        return f"GitLab token env var {env_var} is not set"
+    return f"could not read open Agent MRs: {message}"
+
+
+def _is_missing_gitlab_token_error(message: str) -> bool:
+    normalized = message.lower()
+    return "gitlab token env var" in normalized and "not set" in normalized
+
+
+def _gitlab_token_env_from_error(message: str) -> str | None:
+    marker = "GitLab token env var is not set:"
+    if marker not in message:
+        return None
+    remainder = message.split(marker, 1)[1].strip()
+    return remainder.split()[0] if remainder else None
+
+
+def _gitlab_token_env_from_warning(message: str) -> str | None:
+    prefix = "GitLab token env var "
+    suffix = " is not set"
+    if not message.startswith(prefix) or not message.endswith(suffix):
+        return None
+    env_var = message[len(prefix) : -len(suffix)].strip()
+    return env_var or None
+
+
+def _gitlab_token_export_command(warning: str, namespace: str) -> str | None:
+    env_var = _gitlab_token_env_from_warning(warning)
+    if not env_var:
+        return None
+    return (
+        f"export {env_var}=\"$(kubectl -n {namespace} get secret agentlab-secrets "
+        f"-o jsonpath='{{.data.{env_var}}}' | base64 -d)\""
+    )
 
 
 def _safe_message(message: object) -> str:

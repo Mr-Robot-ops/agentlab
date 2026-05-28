@@ -10,6 +10,7 @@ from agentlab.k8s_operator import (
     CleanupReport,
     ConfigSetReport,
     ConfigValueReport,
+    ClusterStatus,
     FailedResources,
     HealthReport,
     MergeRequestListReport,
@@ -27,6 +28,14 @@ class FakeOperator:
     def latest_job_name(self, component: str) -> str:
         self.calls.append(("latest_job_name", component))
         return f"agentlab-scheduler-{component}"
+
+    def status(self, *, manifest_dir: Path | None = None) -> ClusterStatus:
+        self.calls.append(("status", manifest_dir))
+        return ClusterStatus(
+            namespace="agentlab",
+            configmap_image="registry/agentlab:new",
+            open_agent_mrs_warning="GitLab token env var GITLAB_TOKEN is not set",
+        )
 
     def job_logs(self, job_name: str, *, follow: bool = True, tail: int | None = None) -> str:
         self.calls.append(("job_logs", (job_name, follow, tail)))
@@ -261,6 +270,23 @@ def test_k8s_command_invocation_still_works_with_completions(monkeypatch) -> Non
         ("latest_job_name", "action"),
         ("job_logs", ("agentlab-scheduler-action", False, None)),
     ]
+
+
+def test_k8s_status_prints_missing_gitlab_token_warning(monkeypatch) -> None:
+    fake = FakeOperator()
+    monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
+
+    result = runner.invoke(app, ["k8s", "status"])
+
+    assert result.exit_code == 0
+    assert "ConfigMap image: registry/agentlab:new" in result.output
+    assert "Open Agent MRs:\n- unknown" in result.output
+    assert "GitLab token env var GITLAB_TOKEN is not set" in result.output
+    assert (
+        "export GITLAB_TOKEN=\"$(kubectl -n agentlab get secret agentlab-secrets "
+        "-o jsonpath='{.data.GITLAB_TOKEN}' | base64 -d)\""
+    ) in result.output
+    assert fake.calls == [("status", None)]
 
 
 def test_k8s_run_action_passes_task_id(monkeypatch) -> None:
