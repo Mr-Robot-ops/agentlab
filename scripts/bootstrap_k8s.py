@@ -43,6 +43,30 @@ JOB_COMMANDS = {
 }
 
 RUNTIME_PATH = "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin"
+DEFAULT_RESOURCE_PROFILE = {
+    "cpu_request": "250m",
+    "memory_request": "512Mi",
+    "cpu_limit": "1",
+    "memory_limit": "2Gi",
+    "cargo_build_jobs": "1",
+}
+RESOURCE_PROFILES = {
+    "small": {
+        "cpu_request": "100m",
+        "memory_request": "256Mi",
+        "cpu_limit": "750m",
+        "memory_limit": "1Gi",
+        "cargo_build_jobs": "1",
+    },
+    "default": DEFAULT_RESOURCE_PROFILE,
+    "ci": {
+        "cpu_request": "500m",
+        "memory_request": "1Gi",
+        "cpu_limit": "2",
+        "memory_limit": "4Gi",
+        "cargo_build_jobs": "2",
+    },
+}
 
 
 def generate_k8s(
@@ -70,6 +94,7 @@ def generate_k8s(
     schedule_action_cron: str = "30 2 * * *",
     schedule_review_comments_enabled: bool = False,
     schedule_review_comments_cron: str = "*/15 * * * *",
+    k8s_resource_profile_preset: str = "default",
     job_cpu_request: str = "250m",
     job_memory_request: str = "512Mi",
     job_cpu_limit: str = "1",
@@ -78,6 +103,14 @@ def generate_k8s(
 ) -> Path:
     mode = validate_mode(mode, allow_dangerous_mode=allow_dangerous_mode)
     project_value = project_identifier(project=project, project_id=project_id, target_repo_url=target_repo_url)
+    resource_profile_preset = k8s_resource_profile_preset.strip().lower()
+    resource_profile = resolve_resource_profile(
+        resource_profile_preset,
+        cpu_request=job_cpu_request,
+        memory_request=job_memory_request,
+        cpu_limit=job_cpu_limit,
+        memory_limit=job_memory_limit,
+    )
     out = Path(output_dir)
     config_yaml = render_agentlab_config(
         gitlab_url=gitlab_url,
@@ -95,6 +128,8 @@ def generate_k8s(
         schedule_action_cron=schedule_action_cron,
         schedule_review_comments_enabled=schedule_review_comments_enabled,
         schedule_review_comments_cron=schedule_review_comments_cron,
+        k8s_resource_profile_preset=resource_profile_preset,
+        cargo_build_jobs=resource_profile["cargo_build_jobs"],
     )
 
     files = {
@@ -113,10 +148,10 @@ def generate_k8s(
             command=command,
             git_author_name=git_author_name,
             git_author_email=git_author_email,
-            cpu_request=job_cpu_request,
-            memory_request=job_memory_request,
-            cpu_limit=job_cpu_limit,
-            memory_limit=job_memory_limit,
+            cpu_request=resource_profile["cpu_request"],
+            memory_request=resource_profile["memory_request"],
+            cpu_limit=resource_profile["cpu_limit"],
+            memory_limit=resource_profile["memory_limit"],
             active_deadline_seconds=job_active_deadline_seconds,
         )
     cron_commands: dict[str, list[str]] = {}
@@ -148,10 +183,10 @@ def generate_k8s(
             cron=cron_schedules[name],
             git_author_name=git_author_name,
             git_author_email=git_author_email,
-            cpu_request=job_cpu_request,
-            memory_request=job_memory_request,
-            cpu_limit=job_cpu_limit,
-            memory_limit=job_memory_limit,
+            cpu_request=resource_profile["cpu_request"],
+            memory_request=resource_profile["memory_request"],
+            cpu_limit=resource_profile["cpu_limit"],
+            memory_limit=resource_profile["memory_limit"],
             active_deadline_seconds=job_active_deadline_seconds,
         )
     files["kustomization.yaml"] = render_kustomization(
@@ -168,6 +203,30 @@ def generate_k8s(
 
         generate_komodo(namespace=namespace, output_dir=Path("deploy/komodo/generated"))
     return out
+
+
+def resolve_resource_profile(
+    preset: str,
+    *,
+    cpu_request: str = "250m",
+    memory_request: str = "512Mi",
+    cpu_limit: str = "1",
+    memory_limit: str = "2Gi",
+) -> dict[str, str]:
+    normalized = preset.strip().lower()
+    if normalized not in RESOURCE_PROFILES:
+        raise ValueError("--k8s-resource-profile must be one of: small, default, ci")
+    resolved = dict(RESOURCE_PROFILES[normalized])
+    overrides = {
+        "cpu_request": cpu_request,
+        "memory_request": memory_request,
+        "cpu_limit": cpu_limit,
+        "memory_limit": memory_limit,
+    }
+    for key, value in overrides.items():
+        if value != DEFAULT_RESOURCE_PROFILE[key]:
+            resolved[key] = value
+    return resolved
 
 
 def render_namespace(namespace: str) -> str:
@@ -505,6 +564,9 @@ For `job-run-task.yaml`, create a ConfigMap named `agentlab-task` with `task.jso
 Manual `job-scheduler-*.yaml` manifests are always generated for testing. Watch, plan, and action CronJobs
 are generated when scheduling is enabled; the review-comment CronJob is generated when review-comment
 scheduling is enabled.
+
+For small homelab/control-plane VMs, regenerate with `--k8s-resource-profile small` to lower CPU/memory
+requests and limits while keeping Rust functional tests at `CARGO_BUILD_JOBS=1`.
 """
 
 
@@ -533,6 +595,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--schedule-action-cron", default="30 2 * * *")
     parser.add_argument("--schedule-review-comments-enabled", action="store_true")
     parser.add_argument("--schedule-review-comments-cron", default="*/15 * * * *")
+    parser.add_argument("--k8s-resource-profile", choices=sorted(RESOURCE_PROFILES), default="default")
     parser.add_argument("--job-cpu-request", default="250m")
     parser.add_argument("--job-memory-request", default="512Mi")
     parser.add_argument("--job-cpu-limit", default="1")
@@ -569,6 +632,7 @@ def main(argv: list[str] | None = None) -> int:
             schedule_action_cron=args.schedule_action_cron,
             schedule_review_comments_enabled=args.schedule_review_comments_enabled,
             schedule_review_comments_cron=args.schedule_review_comments_cron,
+            k8s_resource_profile_preset=args.k8s_resource_profile,
             job_cpu_request=args.job_cpu_request,
             job_memory_request=args.job_memory_request,
             job_cpu_limit=args.job_cpu_limit,

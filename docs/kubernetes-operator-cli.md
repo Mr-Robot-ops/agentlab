@@ -268,18 +268,28 @@ Supported CronJob shortcuts are `review-comments`, `action`, `plan`, and `watch`
 
 ## Job Resource Controls
 
-Generated AgentLab Jobs include CPU/memory requests and limits plus `activeDeadlineSeconds`; generated CronJobs also use `concurrencyPolicy: Forbid`. For small homelab clusters, keep review-comments at `*/15 * * * *` or slower and start with:
+Generated AgentLab Jobs include CPU/memory requests and limits plus `activeDeadlineSeconds`; generated CronJobs also use `concurrencyPolicy: Forbid`. Resource presets are stored in `config.yaml` under:
+
+```yaml
+k8s_resource_profile:
+  preset: small
+```
+
+Available presets:
+
+- `small`: `100m` CPU request, `750m` CPU limit, `256Mi` memory request, `1Gi` memory limit, `CARGO_BUILD_JOBS=1`.
+- `default`: the existing defaults, `250m` CPU request, `1` CPU limit, `512Mi` memory request, `2Gi` memory limit.
+- `ci`: higher limits for larger test runners.
+
+For homelab/control-plane VMs, prefer `small` and keep review-comments at `*/15 * * * *` or slower:
 
 ```bash
 python scripts/bootstrap_k8s.py \
-  --job-cpu-request 250m \
-  --job-memory-request 512Mi \
-  --job-cpu-limit 1 \
-  --job-memory-limit 2Gi \
+  --k8s-resource-profile small \
   --job-active-deadline-seconds 3600
 ```
 
-Rust functional tests default to `CARGO_BUILD_JOBS=1` via `functional_test_env` in `config.yaml`.
+Rust functional tests use `CARGO_BUILD_JOBS` via `functional_test_env` in `config.yaml`; the `small` preset pins it to `1`.
 
 ## TUI
 

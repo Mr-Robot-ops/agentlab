@@ -245,18 +245,21 @@ CronJobs are only generated when `schedule.enabled` is true. Manual `job-schedul
 
 Generated Kubernetes Jobs include `backoffLimit: 0`, `activeDeadlineSeconds`, and container resource requests/limits. CronJobs use `concurrencyPolicy: Forbid` so a slow watch, plan, action, or review-comments run is not overlapped by the next scheduled tick.
 
-Small homelab clusters should start with conservative bootstrap defaults:
+Resource presets are configured with `k8s_resource_profile.preset`:
+
+- `small`: `100m` CPU request, `750m` CPU limit, `256Mi` memory request, `1Gi` memory limit, and `CARGO_BUILD_JOBS=1`.
+- `default`: current defaults, `250m` CPU request, `1` CPU limit, `512Mi` memory request, `2Gi` memory limit.
+- `ci`: higher limits for larger CI runners.
+
+Small homelab/control-plane VMs should start with the `small` preset:
 
 ```bash
 python scripts/bootstrap_k8s.py \
-  --job-cpu-request 250m \
-  --job-memory-request 512Mi \
-  --job-cpu-limit 1 \
-  --job-memory-limit 2Gi \
+  --k8s-resource-profile small \
   --job-active-deadline-seconds 3600
 ```
 
-Rust functional tests default to `CARGO_BUILD_JOBS=1` through `functional_test_env` to keep Cargo compilation from saturating small nodes. Increase it only after observing stable CPU and memory headroom.
+Rust functional tests read `CARGO_BUILD_JOBS` from `functional_test_env`; keep it at `1` until CPU and memory headroom are stable.
 
 Keep `schedule.review_comments.cron` at `*/15 * * * *` or slower unless you explicitly need faster feedback. Avoid `*/1 * * * *` on homelab clusters because review polling can overlap with action jobs and functional tests even when CronJobs themselves are serialized.
 

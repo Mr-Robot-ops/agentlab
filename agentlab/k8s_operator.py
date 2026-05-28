@@ -86,6 +86,17 @@ DEFAULT_JOB_RESOURCES = {
     "requests": {"cpu": "250m", "memory": "512Mi"},
     "limits": {"cpu": "1", "memory": "2Gi"},
 }
+JOB_RESOURCE_PROFILES = {
+    "small": {
+        "requests": {"cpu": "100m", "memory": "256Mi"},
+        "limits": {"cpu": "750m", "memory": "1Gi"},
+    },
+    "default": DEFAULT_JOB_RESOURCES,
+    "ci": {
+        "requests": {"cpu": "500m", "memory": "1Gi"},
+        "limits": {"cpu": "2", "memory": "4Gi"},
+    },
+}
 RUNTIME_PATH = "/usr/local/cargo/bin:/usr/local/bin:/usr/bin:/bin"
 
 CONFIG_SETTING_SPECS: dict[str, tuple[type[bool] | type[int] | type[str], int | None]] = {
@@ -1061,6 +1072,7 @@ def update_generated_manifests(
         preserved_sections = _merge_preserved_config_sections(config, preserved_config)
     config["auto_merge_enabled"] = False
     config["direct_main_push_enabled"] = False
+    resource_profile = _resource_profile_from_config(config)
     enabled_cronjob_manifests = _enabled_cronjob_manifest_names(config)
     for manifest in _ensure_enabled_cronjob_manifests(manifest_dir, config):
         if manifest not in updated_manifests:
@@ -1073,7 +1085,7 @@ def update_generated_manifests(
     for path in sorted([*manifest_dir.glob("job-*.yaml"), *manifest_dir.glob("cronjob-*.yaml")]):
         document = _load_yaml_file(path)
         changed = _set_manifest_image(document, image)
-        changed = _ensure_generated_job_safeguards(document) or changed
+        changed = _ensure_generated_job_safeguards(document, resources=resource_profile) or changed
         if changed:
             _write_yaml_file(path, document)
             if path.name not in updated_manifests:
@@ -1088,11 +1100,11 @@ def update_generated_manifests(
     }
 
 
-def _ensure_generated_job_safeguards(document: dict[str, Any]) -> bool:
+def _ensure_generated_job_safeguards(document: dict[str, Any], *, resources: dict[str, dict[str, str]] | None = None) -> bool:
     kind = document.get("kind")
     if kind == "Job":
         changed = _ensure_job_spec_safeguards(document.setdefault("spec", {}))
-        changed = _ensure_container_resources(_job_container_specs(document)) or changed
+        changed = _ensure_container_resources(_job_container_specs(document), resources=resources) or changed
         changed = _ensure_container_path_env(_job_container_specs(document)) or changed
         return changed
     if kind == "CronJob":
@@ -1103,7 +1115,7 @@ def _ensure_generated_job_safeguards(document: dict[str, Any]) -> bool:
             changed = True
         job_spec = spec.setdefault("jobTemplate", {}).setdefault("spec", {})
         changed = _ensure_job_spec_safeguards(job_spec, ttl=False) or changed
-        changed = _ensure_container_resources(_cronjob_container_specs(document)) or changed
+        changed = _ensure_container_resources(_cronjob_container_specs(document), resources=resources) or changed
         changed = _ensure_container_path_env(_cronjob_container_specs(document)) or changed
         return changed
     return False
@@ -1123,27 +1135,43 @@ def _ensure_job_spec_safeguards(spec: dict[str, Any], *, ttl: bool = True) -> bo
     return changed
 
 
-def _ensure_container_resources(containers: list[dict[str, Any]]) -> bool:
+def _ensure_container_resources(
+    containers: list[dict[str, Any]],
+    *,
+    resources: dict[str, dict[str, str]] | None = None,
+) -> bool:
     changed = False
+    defaults = resources or DEFAULT_JOB_RESOURCES
+    force = resources is not None and resources != DEFAULT_JOB_RESOURCES
     for container in containers:
         if not isinstance(container, dict):
             continue
-        resources = container.get("resources")
-        if not isinstance(resources, dict):
-            resources = {}
-            container["resources"] = resources
+        container_resources = container.get("resources")
+        if not isinstance(container_resources, dict):
+            container_resources = {}
+            container["resources"] = container_resources
             changed = True
-        for section, defaults in DEFAULT_JOB_RESOURCES.items():
-            values = resources.get(section)
+        for section, section_defaults in defaults.items():
+            values = container_resources.get(section)
             if not isinstance(values, dict):
                 values = {}
-                resources[section] = values
+                container_resources[section] = values
                 changed = True
-            for key, value in defaults.items():
-                if key not in values:
+            for key, value in section_defaults.items():
+                if key not in values or force:
+                    if values.get(key) == value:
+                        continue
                     values[key] = value
                     changed = True
     return changed
+
+
+def _resource_profile_from_config(config: dict[str, Any]) -> dict[str, dict[str, str]]:
+    raw = config.get("k8s_resource_profile")
+    preset = "default"
+    if isinstance(raw, dict):
+        preset = str(raw.get("preset") or "default").strip().lower()
+    return JOB_RESOURCE_PROFILES.get(preset, DEFAULT_JOB_RESOURCES)
 
 
 def _ensure_container_path_env(containers: list[dict[str, Any]]) -> bool:
@@ -1864,7 +1892,7 @@ def _set_config_setting(config: dict[str, Any], path: str, value: Any) -> None:
 
 def _merge_preserved_config_sections(target: dict[str, Any], source: dict[str, Any]) -> list[str]:
     preserved: list[str] = []
-    for key in ("auto_approve", "required_test_commands"):
+    for key in ("auto_approve", "required_test_commands", "k8s_resource_profile"):
         if key in source:
             target[key] = source[key]
             preserved.append(key)

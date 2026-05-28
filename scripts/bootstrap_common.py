@@ -91,6 +91,8 @@ def render_agentlab_config(
     schedule_action_cron: str = "30 2 * * *",
     schedule_review_comments_enabled: bool = False,
     schedule_review_comments_cron: str = "*/15 * * * *",
+    k8s_resource_profile_preset: str = "default",
+    cargo_build_jobs: str = "1",
 ) -> str:
     flags = mode_flags(mode)
     require_repo_policy = "false"
@@ -151,8 +153,10 @@ def render_agentlab_config(
         "",
         "docker_build_enabled: false",
         "docker_compose_enabled: false",
+        "k8s_resource_profile:",
+        f"  preset: {yaml_string(k8s_resource_profile_preset)}",
         "functional_test_env:",
-        '  CARGO_BUILD_JOBS: "1"',
+        f"  CARGO_BUILD_JOBS: {yaml_string(cargo_build_jobs)}",
         f"require_repo_policy_for_write: {require_repo_policy}",
         "",
         "required_test_commands: []",
