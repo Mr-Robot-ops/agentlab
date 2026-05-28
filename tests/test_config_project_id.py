@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from agentlab.config import AppConfig, derive_project_path_from_repo_url, gitlab_project_api_id, normalize_project_id
 
 
@@ -30,6 +32,26 @@ def test_functional_test_env_defaults_to_single_cargo_build_job() -> None:
     config = AppConfig(gitlab_url="https://gitlab.example.com", project_id=123, target_repo_path=Path("."))
 
     assert config.functional_test_env == {"CARGO_BUILD_JOBS": "1"}
+
+
+def test_k8s_resource_profile_preset_defaults_and_validates() -> None:
+    config = AppConfig(gitlab_url="https://gitlab.example.com", project_id=123, target_repo_path=Path("."))
+    small = AppConfig(
+        gitlab_url="https://gitlab.example.com",
+        project_id=123,
+        target_repo_path=Path("."),
+        k8s_resource_profile={"preset": "SMALL"},
+    )
+
+    assert config.k8s_resource_profile.preset == "default"
+    assert small.k8s_resource_profile.preset == "small"
+    with pytest.raises(ValueError, match="small, default, ci"):
+        AppConfig(
+            gitlab_url="https://gitlab.example.com",
+            project_id=123,
+            target_repo_path=Path("."),
+            k8s_resource_profile={"preset": "tiny"},
+        )
 
 
 def test_url_encoded_project_path_is_normalized() -> None:

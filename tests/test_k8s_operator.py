@@ -843,6 +843,29 @@ def test_upgrade_adds_missing_job_resource_safeguards(tmp_path: Path) -> None:
     assert "cronjob-scheduler-watch.yaml" in report.updated_manifests
 
 
+def test_upgrade_applies_small_resource_profile_from_configmap(tmp_path: Path) -> None:
+    write_upgrade_manifests(tmp_path)
+    configmap = yaml.safe_load((tmp_path / "configmap.yaml").read_text(encoding="utf-8"))
+    config = yaml.safe_load(configmap["data"]["config.yaml"])
+    config["k8s_resource_profile"] = {"preset": "small"}
+    configmap["data"]["config.yaml"] = yaml.safe_dump(config, sort_keys=False)
+    (tmp_path / "configmap.yaml").write_text(yaml.safe_dump(configmap, sort_keys=False), encoding="utf-8")
+
+    report = K8sOperator(manifest_dir=tmp_path, runner=FakeRunner()).upgrade(image="registry/agentlab:old")
+
+    job = yaml.safe_load((tmp_path / "job-scheduler-action.yaml").read_text(encoding="utf-8"))
+    cronjob = yaml.safe_load((tmp_path / "cronjob-scheduler-watch.yaml").read_text(encoding="utf-8"))
+    container = job["spec"]["template"]["spec"]["containers"][0]
+    cronjob_container = cronjob["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
+    assert container["resources"] == {
+        "requests": {"cpu": "100m", "memory": "256Mi"},
+        "limits": {"cpu": "750m", "memory": "1Gi"},
+    }
+    assert cronjob_container["resources"] == container["resources"]
+    assert "job-scheduler-action.yaml" in report.updated_manifests
+    assert "cronjob-scheduler-watch.yaml" in report.updated_manifests
+
+
 def test_upgrade_migrates_deprecated_configmap_image_annotation(tmp_path: Path) -> None:
     write_upgrade_manifests(tmp_path)
     configmap = yaml.safe_load((tmp_path / "configmap.yaml").read_text(encoding="utf-8"))

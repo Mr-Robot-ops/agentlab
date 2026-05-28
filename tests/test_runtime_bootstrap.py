@@ -102,6 +102,7 @@ def test_kubernetes_configmap_safe_defaults_and_connection_values(tmp_path):
     assert config["auto_merge_enabled"] is False
     assert config["direct_main_push_enabled"] is False
     assert config["push_agent_branches_enabled"] is False
+    assert config["k8s_resource_profile"] == {"preset": "default"}
     assert config["functional_test_env"] == {"CARGO_BUILD_JOBS": "1"}
 
 
@@ -327,6 +328,52 @@ def test_kubernetes_bootstrap_job_resources_are_configurable(tmp_path):
         "limits": {"cpu": "750m", "memory": "1Gi"},
     }
     assert cron_container["resources"] == container["resources"]
+
+
+def test_kubernetes_bootstrap_small_resource_profile_sets_resources_and_cargo_jobs(tmp_path):
+    out = generate_k8s(
+        namespace="agentlab",
+        image="registry.local/agentlab:0.1.0",
+        gitlab_url="https://gitlab.local",
+        target_repo_url="https://gitlab.local/group/project.git",
+        ollama_url="http://ollama.local:11434",
+        output_dir=tmp_path,
+        schedule_enabled=True,
+        k8s_resource_profile_preset="small",
+    )
+
+    job = yaml.safe_load((out / "job-scheduler-action.yaml").read_text(encoding="utf-8"))
+    cronjob = yaml.safe_load((out / "cronjob-scheduler-action.yaml").read_text(encoding="utf-8"))
+    container = job["spec"]["template"]["spec"]["containers"][0]
+    cron_container = cronjob["spec"]["jobTemplate"]["spec"]["template"]["spec"]["containers"][0]
+    config = config_from_configmap(out)
+
+    assert container["resources"] == {
+        "requests": {"cpu": "100m", "memory": "256Mi"},
+        "limits": {"cpu": "750m", "memory": "1Gi"},
+    }
+    assert cron_container["resources"] == container["resources"]
+    assert config["k8s_resource_profile"] == {"preset": "small"}
+    assert config["functional_test_env"]["CARGO_BUILD_JOBS"] == "1"
+
+
+def test_kubernetes_bootstrap_default_resource_profile_keeps_existing_resources(tmp_path):
+    out = generate_k8s(
+        namespace="agentlab",
+        image="registry.local/agentlab:0.1.0",
+        gitlab_url="https://gitlab.local",
+        target_repo_url="https://gitlab.local/group/project.git",
+        ollama_url="http://ollama.local:11434",
+        output_dir=tmp_path,
+        schedule_enabled=True,
+        k8s_resource_profile_preset="default",
+    )
+
+    _pod, container = pod_parts_from_job(out, "job-scheduler-action.yaml")
+    assert container["resources"] == {
+        "requests": {"cpu": "250m", "memory": "512Mi"},
+        "limits": {"cpu": "1", "memory": "2Gi"},
+    }
 
 
 def test_kubernetes_bootstrap_generates_manual_scheduler_jobs(tmp_path):

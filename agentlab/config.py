@@ -209,6 +209,20 @@ class ScheduleConfig(BaseModel):
         return merged
 
 
+class K8sResourceProfileConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    preset: str = "default"
+
+    @field_validator("preset")
+    @classmethod
+    def validate_preset(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in {"small", "default", "ci"}:
+            raise ValueError("k8s_resource_profile.preset must be one of: small, default, ci")
+        return normalized
+
+
 class AppConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", arbitrary_types_allowed=True)
 
@@ -226,6 +240,7 @@ class AppConfig(BaseModel):
     ollama: OllamaConfig = Field(default_factory=OllamaConfig)
     auto_approve: AutoApproveConfig = Field(default_factory=AutoApproveConfig)
     schedule: ScheduleConfig = Field(default_factory=ScheduleConfig)
+    k8s_resource_profile: K8sResourceProfileConfig = Field(default_factory=K8sResourceProfileConfig)
     allowed_commands: list[str] = Field(default_factory=list)
     forbidden_commands: list[str] = Field(default_factory=list)
     protected_paths: list[str] = Field(default_factory=list)
