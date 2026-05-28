@@ -146,7 +146,7 @@ class ReviewScheduler(Scheduler):
         return self.fake_gitlab
 
 
-@pytest.mark.parametrize("command", ["revise", "fix", "propose", "apply", "dry-run", "status", "explain", "stop", "resume"])
+@pytest.mark.parametrize("command", ["revise", "fix", "propose", "apply", "dry-run", "status", "merge-status", "explain", "stop", "resume"])
 def test_parser_recognizes_agent_commands(command: str) -> None:
     parsed = parse_review_command(f"/agent {command}")
 
@@ -207,6 +207,16 @@ def test_unknown_author_is_rejected_and_deduped(tmp_path: Path) -> None:
     assert "not authorized" in gitlab.posted[0][1]
     state, _ = scheduler.state_store.read()
     assert "1:15:1" in state["processed_review_comments"]
+
+
+def test_merge_status_rejects_unauthorized_user(tmp_path: Path) -> None:
+    gitlab = FakeGitLab(notes=[note(1, "/agent merge-status", username="mallory")], allowed=False)
+    scheduler = ReviewScheduler(config(tmp_path, process_history=True), gitlab=gitlab)
+
+    report = scheduler.review_comments()
+
+    assert report["reason"] == "unauthorized_comment"
+    assert "not authorized" in gitlab.posted[0][1]
 
 
 def test_bot_author_is_ignored_without_response(tmp_path: Path) -> None:
@@ -277,6 +287,92 @@ def test_read_only_explain_does_not_call_revision(tmp_path: Path) -> None:
     assert report["status"] == "passed"
     assert orchestrator.calls == []
     assert "Changed files" in gitlab.posted[0][1]
+
+
+def write_merge_status_artifacts(
+    cfg: AppConfig,
+    *,
+    branch: str = "agent/docs",
+    gate: dict[str, object] | None = None,
+    functional: dict[str, object] | None = None,
+    quality: dict[str, object] | None = None,
+    security: dict[str, object] | None = None,
+) -> None:
+    artifacts = Path(cfg.workspace_root) / "gate-run" / "artifacts"
+    artifacts.mkdir(parents=True, exist_ok=True)
+    (artifacts / "implementation_report.json").write_text(
+        json.dumps({"task_id": "t1", "branch": branch, "status": "passed"}),
+        encoding="utf-8",
+    )
+    (artifacts / "gate_decision.json").write_text(
+        json.dumps(gate or {"allowed": True, "verdict": "allowed", "blockers": []}),
+        encoding="utf-8",
+    )
+    (artifacts / "functional_test_report.json").write_text(
+        json.dumps(functional or {"status": "passed", "passed": True}),
+        encoding="utf-8",
+    )
+    (artifacts / "quality_review.json").write_text(
+        json.dumps(quality or {"verdict": "approved", "summary": "ok"}),
+        encoding="utf-8",
+    )
+    (artifacts / "security_architecture_review.json").write_text(
+        json.dumps(security or {"verdict": "approved", "summary": "ok"}),
+        encoding="utf-8",
+    )
+
+
+def test_merge_status_reports_manual_merge_safe_when_only_auto_merge_disabled(tmp_path: Path) -> None:
+    cfg = config(tmp_path, process_history=True, auto_merge_enabled=False)
+    write_merge_status_artifacts(cfg)
+    gitlab = FakeGitLab(notes=[note(1, "/agent merge-status")])
+    scheduler = ReviewScheduler(cfg, gitlab=gitlab)
+
+    report = scheduler.review_comments()
+
+    assert report["status"] == "passed"
+    response = gitlab.posted[0][1]
+    assert "AgentLab merge status for this MR." in response
+    assert "- Gate verdict: `allowed`" in response
+    assert "- Blockers: `None`" in response
+    assert "- Functional tests: `passed`" in response
+    assert "- Quality review: `approved`" in response
+    assert "- Security review: `approved`" in response
+    assert "- Auto-merge: `disabled`" in response
+    assert "- Recommendation: Manual merge is safe" in response
+
+
+def test_merge_status_reports_do_not_merge_when_functional_tests_block(tmp_path: Path) -> None:
+    cfg = config(tmp_path, process_history=True, auto_merge_enabled=False)
+    write_merge_status_artifacts(
+        cfg,
+        gate={"allowed": False, "verdict": "blocked", "blockers": ["functional tests did not pass"]},
+        functional={"status": "failed", "passed": False},
+    )
+    gitlab = FakeGitLab(notes=[note(1, "/agent merge-status")])
+    scheduler = ReviewScheduler(cfg, gitlab=gitlab)
+
+    report = scheduler.review_comments()
+
+    assert report["status"] == "passed"
+    response = gitlab.posted[0][1]
+    assert "- Gate verdict: `blocked`" in response
+    assert "- Blockers: `functional tests did not pass`" in response
+    assert "- Functional tests: `failed`" in response
+    assert "- Recommendation: Do not merge yet" in response
+
+
+def test_merge_status_explains_missing_artifacts(tmp_path: Path) -> None:
+    gitlab = FakeGitLab(notes=[note(1, "/agent merge-status")])
+    scheduler = ReviewScheduler(config(tmp_path, process_history=True), gitlab=gitlab)
+
+    report = scheduler.review_comments()
+
+    assert report["status"] == "passed"
+    response = gitlab.posted[0][1]
+    assert "merge status for this MR is unavailable" in response
+    assert "No AgentLab gate report artifacts were found" in response
+    assert "Recommendation: Do not merge yet" in response
 
 
 def test_revision_command_uses_existing_source_branch(tmp_path: Path) -> None:

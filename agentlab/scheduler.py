@@ -518,6 +518,23 @@ class Scheduler:
                         state_warning=warning,
                     )
 
+                if parsed.command == "merge-status":
+                    response = self._merge_status_response(mr_info)
+                    return self._post_and_finish(
+                        gitlab,
+                        state,
+                        key,
+                        comment,
+                        parsed.command,
+                        response,
+                        status="passed",
+                        reason="comment_processed",
+                        mr_iid=mr_iid,
+                        note_id=note_id,
+                        source_branch=mr_info["source_branch"],
+                        state_warning=warning,
+                    )
+
                 if parsed.command == "explain":
                     response = self._explain_response(mr_info)
                     return self._post_and_finish(
@@ -809,6 +826,44 @@ class Scheduler:
             f"- Last policy status: `{policy_status}`"
         )
 
+    def _merge_status_response(self, mr_info: dict[str, Any]) -> str:
+        source_branch = str(mr_info["source_branch"])
+        artifacts = self._latest_artifacts_for_branch(
+            source_branch,
+            [
+                "gate_decision.json",
+                "functional_test_report.json",
+                "quality_review.json",
+                "security_architecture_review.json",
+            ],
+        )
+        if not any(artifacts.values()):
+            return (
+                "AgentLab merge status for this MR is unavailable.\n\n"
+                f"- Branch: `{source_branch}`\n"
+                "- No AgentLab gate report artifacts were found for this MR branch.\n"
+                "- Recommendation: Do not merge yet"
+            )
+
+        gate = artifacts.get("gate_decision.json")
+        functional = artifacts.get("functional_test_report.json")
+        quality = artifacts.get("quality_review.json")
+        security = artifacts.get("security_architecture_review.json")
+        blockers = gate.get("blockers") if isinstance(gate, dict) and isinstance(gate.get("blockers"), list) else []
+        merge_safe = _gate_allows_merge(gate)
+        recommendation = "Manual merge is safe" if merge_safe else "Do not merge yet"
+        return (
+            "AgentLab merge status for this MR.\n\n"
+            f"- Branch: `{source_branch}`\n"
+            f"- Gate verdict: `{_gate_status(gate)}`\n"
+            f"- Blockers: `{', '.join(str(item) for item in blockers) if blockers else 'None'}`\n"
+            f"- Functional tests: `{_report_status(functional)}`\n"
+            f"- Quality review: `{_review_status(quality)}`\n"
+            f"- Security review: `{_review_status(security)}`\n"
+            f"- Auto-merge: `{'enabled' if self.config.auto_merge_enabled else 'disabled'}`\n"
+            f"- Recommendation: {recommendation}"
+        )
+
     def _explain_response(self, mr_info: dict[str, Any]) -> str:
         latest_gate = self._latest_artifact("gate_decision.json")
         latest_policy = self._latest_artifact("auto_approval_report.json")
@@ -831,6 +886,19 @@ class Scheduler:
             except Exception:
                 continue
         return None
+
+    def _latest_artifacts_for_branch(self, source_branch: str, artifact_names: list[str]) -> dict[str, dict[str, Any] | None]:
+        root = Path(self.config.workspace_root)
+        artifact_dirs = sorted(
+            {path.parent for name in artifact_names for path in root.glob(f"*/artifacts/{name}") if path.is_file()},
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for artifacts_dir in artifact_dirs:
+            if not _artifacts_match_source_branch(artifacts_dir, source_branch):
+                continue
+            return {name: _read_artifact_json(artifacts_dir / name) for name in artifact_names}
+        return {name: None for name in artifact_names}
 
     def _artifact_changed_files(self) -> list[str] | None:
         for name in ("implementation_report.json", "diff_stats.json"):
@@ -1071,6 +1139,54 @@ def _gate_status(gate: Any) -> str:
     if gate.get("allowed") is False:
         return "blocked"
     return "unknown"
+
+
+def _gate_allows_merge(gate: Any) -> bool:
+    return isinstance(gate, dict) and gate.get("allowed") is True and not gate.get("blockers")
+
+
+def _report_status(report: Any) -> str:
+    if not isinstance(report, dict):
+        return "unknown"
+    status = report.get("status")
+    if status:
+        return str(status)
+    if report.get("passed") is True:
+        return "passed"
+    if report.get("passed") is False:
+        return "failed"
+    return "unknown"
+
+
+def _review_status(report: Any) -> str:
+    if not isinstance(report, dict):
+        return "unknown"
+    verdict = report.get("verdict")
+    if verdict:
+        return str(verdict)
+    status = report.get("status")
+    return str(status) if status else "unknown"
+
+
+def _read_artifact_json(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _artifacts_match_source_branch(artifacts_dir: Path, source_branch: str) -> bool:
+    implementation = _read_artifact_json(artifacts_dir / "implementation_report.json")
+    if isinstance(implementation, dict) and implementation.get("branch") == source_branch:
+        return True
+    finalization = _read_artifact_json(artifacts_dir / "mr_finalization_result.json")
+    mr = finalization.get("mr") if isinstance(finalization, dict) else None
+    if isinstance(mr, dict) and mr.get("source_branch") == source_branch:
+        return True
+    return False
 
 
 def _proposal_response(command: str, revision: dict[str, Any], run_id: str) -> str:
