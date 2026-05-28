@@ -149,7 +149,7 @@ class ScheduleReviewCommentsConfig(BaseModel):
     max_comments_per_run: int = Field(default=1, ge=1)
     cooldown_minutes: int = Field(default=10, ge=0)
     allowed_commands: list[str] = Field(
-        default_factory=lambda: ["revise", "fix", "propose", "dry-run", "status", "explain", "stop", "resume"]
+        default_factory=lambda: ["revise", "fix", "propose", "dry-run", "status", "merge-status", "explain", "stop", "resume"]
     )
     allowed_authors: list[str] = Field(default_factory=list)
     require_author_role: list[str] = Field(default_factory=lambda: ["owner", "maintainer"])
@@ -197,7 +197,18 @@ class ScheduleConfig(BaseModel):
                 "process_history": False,
                 "max_comments_per_run": 1,
                 "cooldown_minutes": 10,
-                "allowed_commands": ["revise", "fix", "propose", "apply", "dry-run", "status", "explain", "stop", "resume"],
+                "allowed_commands": [
+                    "revise",
+                    "fix",
+                    "propose",
+                    "apply",
+                    "dry-run",
+                    "status",
+                    "merge-status",
+                    "explain",
+                    "stop",
+                    "resume",
+                ],
                 "allowed_authors": [],
                 "require_author_role": ["owner", "maintainer"],
             },

@@ -141,6 +141,7 @@ def render_agentlab_config(
         "      - revise",
         "      - fix",
         "      - status",
+        "      - merge-status",
         "      - explain",
         "      - stop",
         "      - resume",

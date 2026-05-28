@@ -5,7 +5,18 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-ALLOWED_REVIEW_COMMANDS = {"revise", "fix", "propose", "apply", "dry-run", "status", "explain", "stop", "resume"}
+ALLOWED_REVIEW_COMMANDS = {
+    "revise",
+    "fix",
+    "propose",
+    "apply",
+    "dry-run",
+    "status",
+    "merge-status",
+    "explain",
+    "stop",
+    "resume",
+}
 DENIED_REVIEW_COMMANDS = {
     "run",
     "shell",

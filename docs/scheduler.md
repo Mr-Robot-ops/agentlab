@@ -115,6 +115,7 @@ schedule:
       - apply
       - dry-run
       - status
+      - merge-status
       - explain
       - stop
       - resume
@@ -151,6 +152,7 @@ Supported commands:
 /agent dry-run
 /agent revise --dry-run
 /agent status
+/agent merge-status
 /agent explain
 /agent stop
 /agent resume
@@ -161,6 +163,7 @@ Supported commands:
 @agentlab apply
 @agentlab dry-run
 @agentlab status
+@agentlab merge-status
 @agentlab explain
 @agentlab stop
 @agentlab resume
@@ -172,7 +175,9 @@ Supported commands:
 
 `/agent apply` applies the latest proposal artifact for the same MR/source branch without asking the model again. It uses `structured_proposal.json` when present, otherwise `proposed.diff`, rejects stale proposals when the source branch has moved or the artifact no longer applies cleanly, reruns policy and gate checks before commit/push, and records the proposal `run_id` in the apply report and commit message.
 
-`/agent status`, `/agent explain`, `/agent stop`, and `/agent resume` are read-only with respect to repository files. `stop` writes only the scheduler state marker for that MR; future `revise` and `fix` commands are skipped until an authorized user posts `/agent resume`.
+`/agent status`, `/agent merge-status`, `/agent explain`, `/agent stop`, and `/agent resume` are read-only with respect to repository files. `stop` writes only the scheduler state marker for that MR; future `revise` and `fix` commands are skipped until an authorized user posts `/agent resume`.
+
+`/agent merge-status` reads the latest AgentLab gate artifacts for the MR source branch and reports the gate verdict, blockers, functional test status, quality/security review status, auto-merge setting, and a human recommendation. It never merges or modifies files. If no gate artifacts exist for the branch, AgentLab says that no gate report is available and recommends not merging yet.
 
 Examples:
 
@@ -188,6 +193,10 @@ Die Aenderung an web/package.json bitte zuruecknehmen. Der MR soll nur README.md
 
 ```text
 /agent status
+```
+
+```text
+/agent merge-status
 ```
 
 ```text
