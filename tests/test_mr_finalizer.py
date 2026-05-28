@@ -304,6 +304,27 @@ def test_finalizer_comment_includes_test_quality_failure() -> None:
     assert "`test_quality_passed`" in comment
 
 
+def test_finalizer_comment_includes_test_quality_warning() -> None:
+    fake = FakeGitLabTool()
+    gate = GateDecision(
+        allowed=True,
+        mode="merge_request",
+        verdict="allowed",
+        risk_score=10,
+        policy_checks={
+            "test_quality_passed": True,
+            "functional_tests_passed": True,
+        },
+        check_statuses={"test_quality": "warning"},
+    )
+
+    MRFinalizer(config(auto_merge_enabled=False), fake).finalize(**inputs(gate))  # type: ignore[arg-type]
+
+    comment = fake.comments[-1][1]
+    assert "- Test quality: warning" in comment
+    assert "`test_quality_passed`" not in comment
+
+
 def test_finalizer_comment_mentions_when_no_policy_checks_failed() -> None:
     fake = FakeGitLabTool()
     gate = GateDecision(

@@ -132,6 +132,63 @@ def test_meaningful_rust_test_is_allowed(tmp_path: Path) -> None:
     assert report.findings == []
 
 
+def test_app_name_only_public_seam_creates_warning(tmp_path: Path) -> None:
+    (tmp_path / "rust-backend" / "tests").mkdir(parents=True)
+    (tmp_path / "rust-backend" / "src").mkdir(parents=True)
+    (tmp_path / "rust-backend" / "Cargo.toml").write_text(
+        '[package]\nname = "zfs-manager"\nversion = "0.1.0"\nedition = "2021"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "rust-backend" / "src" / "lib.rs").write_text(
+        'pub fn app_name() -> &\'static str { "zfs-manager" }\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "rust-backend" / "tests" / "smoke.rs").write_text(
+        'use zfs_manager::app_name;\n\n#[test]\nfn app_name_is_exposed() {\n    assert_eq!(app_name(), "zfs-manager");\n}\n',
+        encoding="utf-8",
+    )
+
+    report = QualityAgent(FileTool(tmp_path, config(tmp_path))).run(
+        ["rust-backend/src/lib.rs", "rust-backend/tests/smoke.rs"]
+    )
+
+    assert report.status == ReportStatus.PASSED
+    assert report.passed is True
+    assert report.reason == "weak_public_seam"
+    assert report.recommendation == "prefer existing route/config/error behavior"
+    assert report.findings[0].reason == "weak_public_seam"
+    assert report.findings[0].severity == "warning"
+
+
+def test_health_route_public_seam_passes_cleanly(tmp_path: Path) -> None:
+    (tmp_path / "rust-backend" / "tests").mkdir(parents=True)
+    (tmp_path / "rust-backend" / "src" / "routes").mkdir(parents=True)
+    (tmp_path / "rust-backend" / "Cargo.toml").write_text(
+        '[package]\nname = "zfs-manager"\nversion = "0.1.0"\nedition = "2021"\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "rust-backend" / "src" / "lib.rs").write_text("pub mod routes { pub mod health; }\n", encoding="utf-8")
+    (tmp_path / "rust-backend" / "src" / "routes" / "health.rs").write_text(
+        'pub fn health_path() -> &\'static str { "/health" }\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "rust-backend" / "tests" / "smoke.rs").write_text(
+        'use zfs_manager::routes::health::health_path;\n\n#[test]\nfn health_path_is_exposed() {\n    assert_eq!(health_path(), "/health");\n}\n',
+        encoding="utf-8",
+    )
+
+    report = QualityAgent(FileTool(tmp_path, config(tmp_path))).run(
+        [
+            "rust-backend/src/lib.rs",
+            "rust-backend/src/routes/health.rs",
+            "rust-backend/tests/smoke.rs",
+        ]
+    )
+
+    assert report.status == ReportStatus.PASSED
+    assert report.findings == []
+
+
 def test_binary_only_crate_integration_import_is_blocked(tmp_path: Path) -> None:
     test_content = (
         "use zfs_manager::routes::health_path;\n\n"

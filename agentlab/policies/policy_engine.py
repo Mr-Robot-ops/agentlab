@@ -151,12 +151,20 @@ class PolicyEngine:
 
         if test_quality is not None:
             if test_quality.status != ReportStatus.SKIPPED:
-                check_statuses["test_quality"] = test_quality.status.value
+                has_warning_findings = any(
+                    getattr(finding, "severity", "error") == "warning"
+                    for finding in test_quality.findings
+                )
                 checks["test_quality_passed"] = test_quality.status == ReportStatus.PASSED and test_quality.passed
+                check_statuses["test_quality"] = (
+                    "warning" if checks["test_quality_passed"] and has_warning_findings else test_quality.status.value
+                )
                 if not checks["test_quality_passed"]:
                     blockers.append("placeholder test detected")
                     if test_quality.reason:
                         reasons.append(test_quality.reason)
+                elif has_warning_findings and test_quality.reason:
+                    reasons.append(f"test quality warning: {test_quality.reason}")
 
         if self.config.require_two_testers:
             skip_functional_tests = readme_only and not self.config.required_test_commands
