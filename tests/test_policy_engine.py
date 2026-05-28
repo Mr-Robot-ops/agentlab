@@ -95,6 +95,34 @@ def test_placeholder_test_quality_blocks_gate_even_when_other_checks_pass() -> N
     assert "placeholder_test_detected" in decision.reasons
 
 
+def test_test_quality_warning_allows_gate_and_sets_warning_status() -> None:
+    report = QualityReport(
+        status=ReportStatus.PASSED,
+        passed=True,
+        reason="weak_public_seam",
+        recommendation="prefer existing route/config/error behavior",
+        findings=[
+            QualityFinding(
+                path="rust-backend/tests/smoke.rs",
+                line=4,
+                reason="weak_public_seam",
+                description="weak seam",
+                severity="warning",
+            )
+        ],
+    )
+
+    decision = PolicyEngine(config(auto_merge_enabled=True)).evaluate(
+        **inputs(test_quality=report)
+    )  # type: ignore[arg-type]
+
+    assert decision.allowed is True
+    assert decision.check_statuses["test_quality"] == "warning"
+    assert decision.policy_checks["test_quality_passed"] is True
+    assert "placeholder test detected" not in decision.blockers
+    assert "test quality warning: weak_public_seam" in decision.reasons
+
+
 def test_direct_main_push_disabled_by_default_blocks() -> None:
     decision = PolicyEngine(config(auto_merge_enabled=True)).evaluate(
         **inputs(),

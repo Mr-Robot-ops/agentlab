@@ -20,6 +20,11 @@ RUST_ASSERTION_RE = re.compile(r"\b(?:assert|assert_eq|assert_ne|debug_assert|de
 COMMENT_RE = re.compile(r"//.*?$|/\*.*?\*/", re.MULTILINE | re.DOTALL)
 RUST_TEST_MARKER_RE = re.compile(r"#\s*\[\s*(?:[A-Za-z_][A-Za-z0-9_]*::)*test(?:\s*\([^]]*\))?\s*\]")
 RUST_FN_RE = re.compile(r"\b(?:async\s+)?fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\([^)]*\)\s*(?:->[^{]+)?\{")
+RUST_STATIC_STRING_FN_RE = re.compile(
+    r"\bpub\s+fn\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(\s*\)\s*->\s*&\s*'static\s+str\s*\{\s*\"([^\"]+)\"\s*\}",
+    re.DOTALL,
+)
+MEANINGFUL_SEAM_RE = re.compile(r"(?:health|route|status|config|error|api|handler|endpoint|path|parse|validat)", re.IGNORECASE)
 
 
 class TestQualityError(RuntimeError):
@@ -73,14 +78,26 @@ class TestQualityAgent:
                 findings.extend(_rust_findings(path, content, all_files, self.file_tool))
             else:
                 findings.extend(_generic_placeholder_findings(path, content))
+        findings.extend(_rust_weak_public_seam_findings(changed_files, test_files, self.file_tool))
 
-        if findings:
+        blocking_findings = [finding for finding in findings if finding.severity != "warning"]
+        warning_findings = [finding for finding in findings if finding.severity == "warning"]
+        if blocking_findings:
             return TestQualityReport(
                 status=ReportStatus.FAILED,
                 passed=False,
                 findings=findings,
                 reason="placeholder_test_detected",
                 recommendation="Replace placeholder tests with assertions over project-specific behavior.",
+            )
+        if warning_findings:
+            reasons = _dedupe(finding.reason for finding in warning_findings)
+            return TestQualityReport(
+                status=ReportStatus.PASSED,
+                passed=True,
+                findings=findings,
+                reason=", ".join(reasons),
+                recommendation="prefer existing route/config/error behavior",
             )
         return TestQualityReport(
             status=ReportStatus.PASSED,
@@ -319,6 +336,89 @@ def _generic_placeholder_findings(path: str, content: str) -> list[TestQualityFi
                 )
             )
     return findings
+
+
+def _rust_weak_public_seam_findings(
+    changed_files: list[str],
+    test_files: list[str],
+    file_tool: FileTool,
+) -> list[TestQualityFinding]:
+    rust_tests = [path for path in test_files if path.endswith(".rs")]
+    if not rust_tests:
+        return []
+
+    test_contents: dict[str, str] = {}
+    for path in rust_tests:
+        try:
+            test_contents[path] = file_tool.read_file(path)
+        except Exception:
+            continue
+
+    findings: list[TestQualityFinding] = []
+    for source_path in changed_files:
+        normalized = source_path.replace("\\", "/")
+        if not normalized.endswith(".rs") or _is_test_quality_path(normalized):
+            continue
+        if "/src/" not in f"/{normalized}" and not normalized.startswith("src/"):
+            continue
+        try:
+            source = file_tool.read_file(source_path)
+        except Exception:
+            continue
+        for match in RUST_STATIC_STRING_FN_RE.finditer(source):
+            function_name = match.group(1)
+            literal = match.group(2)
+            if _looks_like_existing_project_behavior(normalized, function_name, literal):
+                continue
+            for test_path, test_content in test_contents.items():
+                if not _test_only_checks_static_string_seam(test_content, function_name, literal):
+                    continue
+                findings.append(
+                    TestQualityFinding(
+                        path=test_path,
+                        line=_line_for_offset(test_content, test_content.find(function_name)),
+                        reason="weak_public_seam",
+                        description=(
+                            "Rust smoke test validates a newly added trivial public seam that only returns a static string. "
+                            "Prefer existing route, config, or error behavior when a meaningful seam is available."
+                        ),
+                        severity="warning",
+                    )
+                )
+                break
+    return findings
+
+
+def _looks_like_existing_project_behavior(path: str, function_name: str, literal: str) -> bool:
+    if MEANINGFUL_SEAM_RE.search(path) or MEANINGFUL_SEAM_RE.search(function_name):
+        return True
+    return literal.startswith("/")
+
+
+def _test_only_checks_static_string_seam(content: str, function_name: str, literal: str) -> bool:
+    if not re.search(rf"(?<![A-Za-z0-9_]){re.escape(function_name)}\s*\(\s*\)", content):
+        return False
+    if literal not in content:
+        return False
+    if MEANINGFUL_SEAM_RE.search(content.replace(literal, "")):
+        return False
+    assertions = RUST_ASSERTION_RE.findall(content)
+    if len(assertions) != 1:
+        return False
+    function_call = rf"{re.escape(function_name)}\s*\(\s*\)"
+    return bool(
+        re.search(rf"assert_eq!\s*\(\s*{function_call}\s*,\s*\"{re.escape(literal)}\"\s*\)", content)
+        or re.search(rf"assert_eq!\s*\(\s*\"{re.escape(literal)}\"\s*,\s*{function_call}\s*\)", content)
+    )
+
+
+def _dedupe(values: object) -> list[str]:
+    unique: list[str] = []
+    for value in values:
+        text = str(value)
+        if text and text not in unique:
+            unique.append(text)
+    return unique
 
 
 def _line_for_offset(content: str, offset: int) -> int:

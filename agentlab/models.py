@@ -248,6 +248,7 @@ class TestQualityFinding(StrictModel):
     line: int | None = Field(default=None, ge=1)
     reason: str
     description: str = ""
+    severity: Literal["error", "warning"] = "error"
 
 
 class TestQualityReport(StrictModel):
