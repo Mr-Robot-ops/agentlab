@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict
 from pathlib import Path
 
@@ -26,6 +29,7 @@ from agentlab.k8s_operator import (
     format_runs,
     format_status,
     format_upgrade_report,
+    gitlab_token_export_command,
     manifest_for_component,
     run_job_name_for_component,
     run_tui,
@@ -101,6 +105,19 @@ def _fail(message: str, *, code: int = 1) -> None:
     raise typer.Exit(code=code)
 
 
+@contextmanager
+def _temporary_env(name: str, value: str) -> Iterator[None]:
+    previous = os.environ.get(name)
+    os.environ[name] = value
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = previous
+
+
 def _questionary_available() -> bool:
     return importlib.util.find_spec("questionary") is not None
 
@@ -130,6 +147,12 @@ def format_config_set_report(report: ConfigSetReport) -> str:
             f"Changed: {'yes' if report.changed else 'no'}",
         ]
     )
+
+
+def _append_warning(output: str, warning: str) -> str:
+    if "\nWarnings:\n" in f"\n{output}\n":
+        return f"{output}\n- {warning}"
+    return f"{output}\n\nWarnings:\n- {warning}"
 
 
 @k8s_app.command("help")
@@ -168,10 +191,36 @@ def tui_check(
 def status(
     namespace: str = typer.Option(DEFAULT_NAMESPACE, "--namespace"),
     manifest_dir: Path | None = typer.Option(None, "--manifest-dir"),
+    load_gitlab_token_from_secret: bool = typer.Option(
+        False,
+        "--load-gitlab-token-from-secret",
+        help="Load GITLAB_TOKEN from Kubernetes Secret agentlab-secrets for this status command only.",
+    ),
 ) -> None:
     """Show current AgentLab Kubernetes status."""
     operator = _operator(namespace, manifest_dir or DEFAULT_MANIFEST_DIR)
-    typer.echo(format_status(operator.status(manifest_dir=manifest_dir)))
+    token_warning: str | None = None
+    token = None
+    if load_gitlab_token_from_secret and not os.environ.get("GITLAB_TOKEN"):
+        try:
+            token = operator.gitlab_token_from_secret()
+        except K8sOperatorError as exc:
+            token_warning = f"Could not load GITLAB_TOKEN from Kubernetes Secret agentlab-secrets: {exc}"
+
+    if token:
+        with _temporary_env("GITLAB_TOKEN", token):
+            output = format_status(operator.status(manifest_dir=manifest_dir))
+    else:
+        output = format_status(operator.status(manifest_dir=manifest_dir))
+    if token_warning:
+        output = _append_warning(output, token_warning)
+    typer.echo(output)
+
+
+@k8s_app.command("print-token-export")
+def print_token_export(namespace: str = typer.Option(DEFAULT_NAMESPACE, "--namespace")) -> None:
+    """Print a shell command that loads GITLAB_TOKEN from the Kubernetes Secret."""
+    typer.echo(gitlab_token_export_command("GITLAB_TOKEN", namespace))
 
 
 @k8s_app.command()

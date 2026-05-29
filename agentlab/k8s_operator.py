@@ -614,6 +614,15 @@ class K8sOperator:
         mrs = _agent_mr_details(raw_mrs, state=state, label=label, default_branch=config.default_branch)
         return MergeRequestListReport(namespace=self.namespace, state=state, label=label, merge_requests=mrs)
 
+    def gitlab_token_from_secret(self, *, secret_name: str = "agentlab-secrets", key: str = "GITLAB_TOKEN") -> str:
+        secret = self._run_json(["get", "secret", secret_name, "-o", "json"], check=False)
+        if not secret:
+            raise K8sOperatorError(f"Kubernetes Secret {secret_name} is not available in namespace {self.namespace}")
+        try:
+            return _secret_value(secret, key)
+        except K8sOperatorError as exc:
+            raise K8sOperatorError(f"could not load {key} from Kubernetes Secret {secret_name}: {exc}") from exc
+
     def health(
         self,
         *,
@@ -1281,10 +1290,7 @@ def format_status(status: ClusterStatus) -> str:
         for drift in status.manifest_image_drifts
     )
     if status.open_agent_mrs_warning:
-        warnings.append(status.open_agent_mrs_warning)
-        export_command = _gitlab_token_export_command(status.open_agent_mrs_warning, status.namespace)
-        if export_command:
-            warnings.append(f"Load it from Kubernetes with: {export_command}")
+        warnings.extend(_open_agent_mrs_status_warnings(status.open_agent_mrs_warning, status.namespace))
     if status.image_annotation_warning:
         warnings.append(status.image_annotation_warning)
     if status.manifest_image_annotation_warning:
@@ -1718,14 +1724,30 @@ def _gitlab_token_env_from_warning(message: str) -> str | None:
     return env_var or None
 
 
+def gitlab_token_export_command(env_var: str, namespace: str, *, secret_name: str = "agentlab-secrets") -> str:
+    return (
+        f"export {env_var}=\"$(kubectl -n {namespace} get secret {secret_name} "
+        f"-o jsonpath='{{.data.{env_var}}}' | base64 -d)\""
+    )
+
+
 def _gitlab_token_export_command(warning: str, namespace: str) -> str | None:
     env_var = _gitlab_token_env_from_warning(warning)
     if not env_var:
         return None
-    return (
-        f"export {env_var}=\"$(kubectl -n {namespace} get secret agentlab-secrets "
-        f"-o jsonpath='{{.data.{env_var}}}' | base64 -d)\""
-    )
+    return gitlab_token_export_command(env_var, namespace)
+
+
+def _open_agent_mrs_status_warnings(warning: str, namespace: str) -> list[str]:
+    env_var = _gitlab_token_env_from_warning(warning)
+    if not env_var:
+        return [warning]
+    return [
+        f"GitLab MR lookup is unavailable locally because GitLab token env var {env_var} is not set.",
+        "Kubernetes jobs are not necessarily affected because they read the token from Kubernetes Secret agentlab-secrets.",
+        f"Fix the local shell with: {gitlab_token_export_command(env_var, namespace)}",
+        "Or run status once with --load-gitlab-token-from-secret.",
+    ]
 
 
 def _safe_message(message: object) -> str:

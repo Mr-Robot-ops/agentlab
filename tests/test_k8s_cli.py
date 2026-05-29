@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from typer.testing import CliRunner
@@ -13,6 +14,7 @@ from agentlab.k8s_operator import (
     ClusterStatus,
     FailedResources,
     HealthReport,
+    K8sOperatorError,
     MergeRequestListReport,
 )
 from agentlab.main import app
@@ -31,11 +33,28 @@ class FakeOperator:
 
     def status(self, *, manifest_dir: Path | None = None) -> ClusterStatus:
         self.calls.append(("status", manifest_dir))
+        if os.environ.get("GITLAB_TOKEN"):
+            return ClusterStatus(
+                namespace="agentlab",
+                configmap_image="registry/agentlab:new",
+                open_agent_mrs=[
+                    {
+                        "iid": 18,
+                        "title": "Add smoke baseline",
+                        "source_branch": "agent/tests-02-smoke-baseline",
+                        "web_url": "https://gitlab.example.com/group/project/-/merge_requests/18",
+                    }
+                ],
+            )
         return ClusterStatus(
             namespace="agentlab",
             configmap_image="registry/agentlab:new",
             open_agent_mrs_warning="GitLab token env var GITLAB_TOKEN is not set",
         )
+
+    def gitlab_token_from_secret(self, *, secret_name: str = "agentlab-secrets", key: str = "GITLAB_TOKEN") -> str:
+        self.calls.append(("gitlab_token_from_secret", (secret_name, key)))
+        return "super-secret-token"
 
     def job_logs(self, job_name: str, *, follow: bool = True, tail: int | None = None) -> str:
         self.calls.append(("job_logs", (job_name, follow, tail)))
@@ -183,6 +202,12 @@ class EmptyCleanupOperator(FakeOperator):
         return FailedResources()
 
 
+class MissingTokenSecretOperator(FakeOperator):
+    def gitlab_token_from_secret(self, *, secret_name: str = "agentlab-secrets", key: str = "GITLAB_TOKEN") -> str:
+        self.calls.append(("gitlab_token_from_secret", (secret_name, key)))
+        raise K8sOperatorError("Kubernetes Secret agentlab-secrets is not available in namespace agentlab")
+
+
 def test_static_completion_candidates() -> None:
     assert k8s_cli.complete_log_component() == ["latest", "watch", "plan", "action", "review-comments", "doctor"]
     assert k8s_cli.complete_log_component("re") == ["review-comments"]
@@ -203,7 +228,19 @@ def test_k8s_help_alias_lists_key_commands() -> None:
     result = runner.invoke(app, ["k8s", "help"])
 
     assert result.exit_code == 0
-    for command in ("status", "mrs", "health", "logs", "run", "artifact", "upgrade", "config", "tui", "tui-check"):
+    for command in (
+        "status",
+        "print-token-export",
+        "mrs",
+        "health",
+        "logs",
+        "run",
+        "artifact",
+        "upgrade",
+        "config",
+        "tui",
+        "tui-check",
+    ):
         assert command in result.output
 
 
@@ -274,6 +311,7 @@ def test_k8s_command_invocation_still_works_with_completions(monkeypatch) -> Non
 
 def test_k8s_status_prints_missing_gitlab_token_warning(monkeypatch) -> None:
     fake = FakeOperator()
+    monkeypatch.delenv("GITLAB_TOKEN", raising=False)
     monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
 
     result = runner.invoke(app, ["k8s", "status"])
@@ -281,12 +319,72 @@ def test_k8s_status_prints_missing_gitlab_token_warning(monkeypatch) -> None:
     assert result.exit_code == 0
     assert "ConfigMap image: registry/agentlab:new" in result.output
     assert "Open Agent MRs:\n- unknown" in result.output
-    assert "GitLab token env var GITLAB_TOKEN is not set" in result.output
+    assert "GitLab MR lookup is unavailable locally because GitLab token env var GITLAB_TOKEN is not set." in result.output
+    assert "Kubernetes jobs are not necessarily affected because they read the token from Kubernetes Secret agentlab-secrets." in result.output
     assert (
-        "export GITLAB_TOKEN=\"$(kubectl -n agentlab get secret agentlab-secrets "
+        "Fix the local shell with: export GITLAB_TOKEN=\"$(kubectl -n agentlab get secret agentlab-secrets "
         "-o jsonpath='{.data.GITLAB_TOKEN}' | base64 -d)\""
     ) in result.output
     assert fake.calls == [("status", None)]
+
+
+def test_k8s_status_loads_missing_gitlab_token_from_secret(monkeypatch) -> None:
+    fake = FakeOperator()
+    monkeypatch.delenv("GITLAB_TOKEN", raising=False)
+    monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
+
+    result = runner.invoke(app, ["k8s", "status", "--load-gitlab-token-from-secret"])
+
+    assert result.exit_code == 0
+    assert "!18 [agent] Add smoke baseline" in result.output
+    assert "super-secret-token" not in result.output
+    assert "GITLAB_TOKEN" not in os.environ
+    assert fake.calls == [
+        ("gitlab_token_from_secret", ("agentlab-secrets", "GITLAB_TOKEN")),
+        ("status", None),
+    ]
+
+
+def test_k8s_status_env_token_wins_over_secret(monkeypatch) -> None:
+    fake = FakeOperator()
+    monkeypatch.setenv("GITLAB_TOKEN", "env-secret-token")
+    monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
+
+    result = runner.invoke(app, ["k8s", "status", "--load-gitlab-token-from-secret"])
+
+    assert result.exit_code == 0
+    assert "!18 [agent] Add smoke baseline" in result.output
+    assert "env-secret-token" not in result.output
+    assert fake.calls == [("status", None)]
+
+
+def test_k8s_status_missing_secret_warns_without_crashing(monkeypatch) -> None:
+    fake = MissingTokenSecretOperator()
+    monkeypatch.delenv("GITLAB_TOKEN", raising=False)
+    monkeypatch.setattr(k8s_cli, "_operator", lambda namespace, manifest_dir=Path("deploy/kubernetes/generated"): fake)
+
+    result = runner.invoke(app, ["k8s", "status", "--load-gitlab-token-from-secret"])
+
+    assert result.exit_code == 0
+    assert "ConfigMap image: registry/agentlab:new" in result.output
+    assert "Open Agent MRs:\n- unknown" in result.output
+    assert "Could not load GITLAB_TOKEN from Kubernetes Secret agentlab-secrets" in result.output
+    assert "super-secret-token" not in result.output
+    assert fake.calls == [
+        ("gitlab_token_from_secret", ("agentlab-secrets", "GITLAB_TOKEN")),
+        ("status", None),
+    ]
+
+
+def test_k8s_print_token_export_prints_command_not_token() -> None:
+    result = runner.invoke(app, ["k8s", "print-token-export", "--namespace", "agentlab"])
+
+    assert result.exit_code == 0
+    assert result.output.strip() == (
+        "export GITLAB_TOKEN=\"$(kubectl -n agentlab get secret agentlab-secrets "
+        "-o jsonpath='{.data.GITLAB_TOKEN}' | base64 -d)\""
+    )
+    assert "super-secret" not in result.output
 
 
 def test_k8s_run_action_passes_task_id(monkeypatch) -> None:

@@ -39,6 +39,31 @@ agentlab k8s status --manifest-dir deploy/kubernetes/generated
 
 The status command is read-only. It shows the ConfigMap image annotation, open Agent merge requests, AgentLab CronJobs, recent scheduler jobs, failed jobs/pods, and image drift warnings. If GitLab is unavailable, cluster status still renders and includes a warning for the open-MR section.
 
+### Local GitLab Token For Status
+
+The local CLI needs `GITLAB_TOKEN` only for the GitLab open-MR lookup in `agentlab k8s status`. Kubernetes-only status still works without it, and scheduler pods are not necessarily affected because they read the token from the `agentlab-secrets` Kubernetes Secret.
+
+Recommended shell one-liner:
+
+```bash
+export GITLAB_TOKEN="$(kubectl -n agentlab get secret agentlab-secrets -o jsonpath='{.data.GITLAB_TOKEN}' | base64 -d)"
+```
+
+To print the one-liner without printing the token:
+
+```bash
+agentlab k8s print-token-export --namespace agentlab
+```
+
+To load the token from the Kubernetes Secret for one local status command without persisting it:
+
+```bash
+agentlab k8s status \
+  --namespace agentlab \
+  --manifest-dir deploy/kubernetes/generated \
+  --load-gitlab-token-from-secret
+```
+
 ## Health
 
 Show one compact health summary for runtime, scheduler, GitLab, models, doctor, and open Agent merge requests:
